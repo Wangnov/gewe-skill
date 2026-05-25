@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +42,12 @@ struct IngestResponse {
     message_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawCallbackRequest {
+    received_at: String,
+    body: Value,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
@@ -60,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/write/events", post(write_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
+        .route("/write/raw-events", post(write_raw_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
         .route("/api/messages/recent", get(recent_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/conversations", get(conversations).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/snapshots", get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
@@ -123,7 +131,22 @@ async fn authorize(headers: HeaderMap, expected: Option<&str>, request: axum::ex
 }
 
 async fn write_event(State(state): State<SharedState>, Json(request): Json<IngestEventRequest>) -> Result<Json<IngestResponse>, ApiError> {
-    let mut tx = state.db.begin().await?;
+    write_ingest_request(&state.db, request).await
+}
+
+async fn write_raw_event(State(state): State<SharedState>, Json(request): Json<RawCallbackRequest>) -> Result<Json<IngestResponse>, ApiError> {
+    let normalized = normalize_callback(&request.body, request.received_at)?;
+    let mut ingest = normalized.into_ingest_request();
+    if let Some(current) = &ingest.chatroom_snapshot {
+        if let Some(previous) = latest_chatroom_snapshot(&state.db, &current.chatroom_id).await? {
+            ingest.chatroom_member_events = diff_chatroom_snapshots(&previous, current);
+        }
+    }
+    write_ingest_request(&state.db, ingest).await
+}
+
+async fn write_ingest_request(db: &SqlitePool, request: IngestEventRequest) -> Result<Json<IngestResponse>, ApiError> {
+    let mut tx = db.begin().await?;
     insert_raw_event(&mut tx, &request).await?;
     insert_message(&mut tx, &request.message).await?;
     if let Some(snapshot) = &request.chatroom_snapshot {
@@ -138,6 +161,24 @@ async fn write_event(State(state): State<SharedState>, Json(request): Json<Inges
     tx.commit().await?;
 
     Ok(Json(IngestResponse { ok: true, message_key: request.message.message_key }))
+}
+
+async fn latest_chatroom_snapshot(db: &SqlitePool, chatroom_id: &str) -> Result<Option<ChatroomSnapshot>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT snapshot_json
+        FROM chatroom_snapshots
+        WHERE chatroom_id = ?
+        ORDER BY received_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(chatroom_id)
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| serde_json::from_str(row.get::<&str, _>("snapshot_json")))
+        .transpose()
+        .map_err(ApiError::from)
 }
 
 async fn recent_messages(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
@@ -430,6 +471,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
 enum ApiError {
     Sqlx(sqlx::Error),
     Serde(serde_json::Error),
+    Core(gewe_skill_core::CoreError),
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -444,11 +486,18 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
+impl From<gewe_skill_core::CoreError> for ApiError {
+    fn from(error: gewe_skill_core::CoreError) -> Self {
+        Self::Core(error)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = match self {
             Self::Sqlx(error) => error.to_string(),
             Self::Serde(error) => error.to_string(),
+            Self::Core(error) => error.to_string(),
         };
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "ok": false, "error": message }))).into_response()
     }

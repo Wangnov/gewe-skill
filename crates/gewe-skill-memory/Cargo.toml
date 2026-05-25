@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 axum.workspace = true
+gewe-skill-core = { path = "../gewe-skill-core" }
 gewe-skill-types = { path = "../gewe-skill-types" }
 serde.workspace = true
 serde_json.workspace = true
