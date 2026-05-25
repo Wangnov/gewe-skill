@@ -41,7 +41,10 @@ impl NormalizedCallback {
     }
 }
 
-pub fn normalize_callback(body: &Value, received_at: impl Into<String>) -> Result<NormalizedCallback, CoreError> {
+pub fn normalize_callback(
+    body: &Value,
+    received_at: impl Into<String>,
+) -> Result<NormalizedCallback, CoreError> {
     let received_at = received_at.into();
     if body.get("Appid").is_some() || body.get("TypeName").is_some() {
         normalize_v1(body, received_at)
@@ -52,9 +55,20 @@ pub fn normalize_callback(body: &Value, received_at: impl Into<String>) -> Resul
     }
 }
 
-pub fn diff_chatroom_snapshots(previous: &ChatroomSnapshot, current: &ChatroomSnapshot) -> Vec<ChatroomMemberEvent> {
-    let previous_members: BTreeMap<_, _> = previous.members.iter().map(|member| (&member.wxid, member)).collect();
-    let current_members: BTreeMap<_, _> = current.members.iter().map(|member| (&member.wxid, member)).collect();
+pub fn diff_chatroom_snapshots(
+    previous: &ChatroomSnapshot,
+    current: &ChatroomSnapshot,
+) -> Vec<ChatroomMemberEvent> {
+    let previous_members: BTreeMap<_, _> = previous
+        .members
+        .iter()
+        .map(|member| (&member.wxid, member))
+        .collect();
+    let current_members: BTreeMap<_, _> = current
+        .members
+        .iter()
+        .map(|member| (&member.wxid, member))
+        .collect();
     let mut events = Vec::new();
 
     for member in &current.members {
@@ -142,8 +156,15 @@ fn normalize_v1(body: &Value, received_at: String) -> Result<NormalizedCallback,
     let create_time = int_path(data, &["CreateTime"]);
     let appmsg_type = raw_content.as_deref().and_then(parse_appmsg_type);
     let stripped_content = raw_content.as_deref().map(strip_group_speaker_prefix);
-    let is_outgoing = account_wxid.as_deref().is_some_and(|wxid| to_user.as_deref() != Some(wxid) && from_user.as_deref() == Some(wxid));
-    let conversation_id = choose_conversation_id(from_user.as_deref(), to_user.as_deref(), account_wxid.as_deref(), is_outgoing);
+    let is_outgoing = account_wxid
+        .as_deref()
+        .is_some_and(|wxid| to_user.as_deref() != Some(wxid) && from_user.as_deref() == Some(wxid));
+    let conversation_id = choose_conversation_id(
+        from_user.as_deref(),
+        to_user.as_deref(),
+        account_wxid.as_deref(),
+        is_outgoing,
+    );
     let sender_wxid = if is_group_conversation(from_user.as_deref()) {
         raw_content.as_deref().and_then(extract_group_sender)
     } else if is_outgoing {
@@ -151,10 +172,20 @@ fn normalize_v1(body: &Value, received_at: String) -> Result<NormalizedCallback,
     } else {
         from_user.clone()
     };
-    let kind = classify_v1(&type_name, msg_type, appmsg_type, stripped_content.as_deref());
-    let identity = new_msg_id.clone().or(msg_id.clone()).unwrap_or_else(|| sha256_short(body));
+    let kind = classify_v1(
+        &type_name,
+        msg_type,
+        appmsg_type,
+        stripped_content.as_deref(),
+    );
+    let identity = new_msg_id
+        .clone()
+        .or(msg_id.clone())
+        .unwrap_or_else(|| sha256_short(body));
     let dedupe_key = stable_dedupe_key("v1", &appid, &identity);
-    let content_xml = if matches!(kind, NormalizedKind::System) || stripped_content.as_deref().is_some_and(is_likely_xml) {
+    let content_xml = if matches!(kind, NormalizedKind::System)
+        || stripped_content.as_deref().is_some_and(is_likely_xml)
+    {
         stripped_content.clone()
     } else {
         None
@@ -176,7 +207,8 @@ fn normalize_v1(body: &Value, received_at: String) -> Result<NormalizedCallback,
         to_user,
         conversation_id: conversation_id.clone(),
         sender_wxid,
-        is_group: is_group_conversation(conversation_id.as_deref()) || is_group_conversation(from_user.as_deref()),
+        is_group: is_group_conversation(conversation_id.as_deref())
+            || is_group_conversation(from_user.as_deref()),
         is_outgoing,
         wechat_created_at: create_time,
         received_at: received_at.clone(),
@@ -187,9 +219,21 @@ fn normalize_v1(body: &Value, received_at: String) -> Result<NormalizedCallback,
         raw_content,
     };
     let chatroom_system_event = parse_chatroom_system_event(&message);
-    let raw_event = raw_event(body, SchemaVersion::V1, appid, account_wxid, dedupe_key, received_at);
+    let raw_event = raw_event(
+        body,
+        SchemaVersion::V1,
+        appid,
+        account_wxid,
+        dedupe_key,
+        received_at,
+    );
 
-    Ok(NormalizedCallback { raw_event, message, chatroom_snapshot, chatroom_system_event })
+    Ok(NormalizedCallback {
+        raw_event,
+        message,
+        chatroom_snapshot,
+        chatroom_system_event,
+    })
 }
 
 fn normalize_v2(body: &Value, received_at: String) -> Result<NormalizedCallback, CoreError> {
@@ -204,9 +248,19 @@ fn normalize_v2(body: &Value, received_at: String) -> Result<NormalizedCallback,
     let raw_content = scalar(body.get("content"));
     let is_outgoing = body.get("isSelf").and_then(Value::as_bool).unwrap_or(false);
     let appmsg_type = raw_content.as_deref().and_then(parse_appmsg_type);
-    let conversation_id = from_group.clone().or_else(|| choose_conversation_id(from_user.as_deref(), to_user.as_deref(), account_wxid.as_deref(), is_outgoing));
+    let conversation_id = from_group.clone().or_else(|| {
+        choose_conversation_id(
+            from_user.as_deref(),
+            to_user.as_deref(),
+            account_wxid.as_deref(),
+            is_outgoing,
+        )
+    });
     let kind = classify_message(msg_type, appmsg_type, raw_content.as_deref());
-    let identity = new_msg_id.clone().or(msg_id.clone()).unwrap_or_else(|| sha256_short(body));
+    let identity = new_msg_id
+        .clone()
+        .or(msg_id.clone())
+        .unwrap_or_else(|| sha256_short(body));
     let dedupe_key = stable_dedupe_key("v2", &appid, &identity);
 
     let message = NormalizedMessage {
@@ -223,8 +277,13 @@ fn normalize_v2(body: &Value, received_at: String) -> Result<NormalizedCallback,
         from_user: from_user.clone(),
         to_user,
         conversation_id: conversation_id.clone(),
-        sender_wxid: if is_group_conversation(from_group.as_deref()) { from_user } else { None },
-        is_group: is_group_conversation(conversation_id.as_deref()) || body.get("eventCode").and_then(Value::as_str) == Some("group_msg_event"),
+        sender_wxid: if is_group_conversation(from_group.as_deref()) {
+            from_user
+        } else {
+            None
+        },
+        is_group: is_group_conversation(conversation_id.as_deref())
+            || body.get("eventCode").and_then(Value::as_str) == Some("group_msg_event"),
         is_outgoing,
         wechat_created_at: int_scalar(body.get("createTime")),
         received_at: received_at.clone(),
@@ -235,12 +294,31 @@ fn normalize_v2(body: &Value, received_at: String) -> Result<NormalizedCallback,
         raw_content,
     };
     let chatroom_system_event = parse_chatroom_system_event(&message);
-    let raw_event = raw_event(body, SchemaVersion::V2, appid, account_wxid, dedupe_key, received_at);
+    let raw_event = raw_event(
+        body,
+        SchemaVersion::V2,
+        appid,
+        account_wxid,
+        dedupe_key,
+        received_at,
+    );
 
-    Ok(NormalizedCallback { raw_event, message, chatroom_snapshot: None, chatroom_system_event })
+    Ok(NormalizedCallback {
+        raw_event,
+        message,
+        chatroom_snapshot: None,
+        chatroom_system_event,
+    })
 }
 
-fn raw_event(body: &Value, schema_version: SchemaVersion, appid: String, account_wxid: Option<String>, dedupe_key: String, received_at: String) -> RawEventEnvelope {
+fn raw_event(
+    body: &Value,
+    schema_version: SchemaVersion,
+    appid: String,
+    account_wxid: Option<String>,
+    dedupe_key: String,
+    received_at: String,
+) -> RawEventEnvelope {
     RawEventEnvelope {
         id: None,
         event_id: Uuid::now_v7(),
@@ -259,7 +337,9 @@ fn parse_v1_chatroom_snapshot(data: &Value, received_at: &str) -> Option<Chatroo
     if !is_group_conversation(Some(&chatroom_id)) {
         return None;
     }
-    let member_values = data.pointer("/NewChatroomData/ChatRoomMember")?.as_array()?;
+    let member_values = data
+        .pointer("/NewChatroomData/ChatRoomMember")?
+        .as_array()?;
     let mut members: Vec<_> = member_values
         .iter()
         .filter_map(|member| {
@@ -278,7 +358,8 @@ fn parse_v1_chatroom_snapshot(data: &Value, received_at: &str) -> Option<Chatroo
         chatroom_id,
         chatroom_name: scalar_unwrapped(data.get("NickName")),
         chatroom_version: int_path(data, &["ChatroomVersion"]),
-        member_count: int_path(data, &["NewChatroomData", "MemberCount"]).unwrap_or(members.len() as i64),
+        member_count: int_path(data, &["NewChatroomData", "MemberCount"])
+            .unwrap_or(members.len() as i64),
         member_hash: sha256_hex(&member_json),
         members,
         received_at: received_at.to_string(),
@@ -293,7 +374,10 @@ fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSy
     if !is_group_conversation(Some(&chatroom_id)) {
         return None;
     }
-    let xml = message.content_xml.as_deref().or(message.raw_content.as_deref())?;
+    let xml = message
+        .content_xml
+        .as_deref()
+        .or(message.raw_content.as_deref())?;
     if !xml.contains("<sysmsg") {
         return None;
     }
@@ -305,23 +389,57 @@ fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSy
     let links = extract_links(xml);
     let names = links.get("names").cloned().unwrap_or_default();
     let kickout_names = links.get("kickoutname").cloned().unwrap_or_default();
-    let username = links.get("username").and_then(|members| members.first()).cloned();
-    let remark = links.get("remark").and_then(|members| members.first()).cloned();
-    let (event_type, target_members): (ChatroomEventType, Vec<ChatroomMember>) = if (template.contains("加入了群聊") || template.contains("邀请")) && !names.is_empty() {
-        (ChatroomEventType::MemberInvited, names)
-    } else if template.contains("移出") {
-        (ChatroomEventType::MemberRemoved, if kickout_names.is_empty() { names } else { kickout_names })
-    } else if template.contains("退出群聊") {
-        (ChatroomEventType::MemberLeft, Vec::new())
-    } else if template.contains("修改群名") || template.contains("群名") {
-        (ChatroomEventType::ChatroomNameChanged, Vec::new())
-    } else {
-        (ChatroomEventType::SystemUnknown, Vec::new())
-    };
-    let target_wxids: Vec<_> = target_members.iter().map(|member| member.wxid.clone()).filter(|value| !value.is_empty()).collect();
-    let target_names: Vec<_> = target_members.iter().map(|member| member.display_name.clone().unwrap_or_else(|| member.wxid.clone())).filter(|value| !value.is_empty()).collect();
-    let mut actor_wxid = username.as_ref().map(|member| member.wxid.clone()).filter(|value| !value.is_empty());
-    let mut actor_name = username.as_ref().and_then(|member| member.display_name.clone()).or_else(|| actor_wxid.clone());
+    let username = links
+        .get("username")
+        .and_then(|members| members.first())
+        .cloned();
+    let remark = links
+        .get("remark")
+        .and_then(|members| members.first())
+        .cloned();
+    let (event_type, target_members): (ChatroomEventType, Vec<ChatroomMember>) =
+        if (template.contains("加入了群聊") || template.contains("邀请")) && !names.is_empty()
+        {
+            (ChatroomEventType::MemberInvited, names)
+        } else if template.contains("移出") {
+            (
+                ChatroomEventType::MemberRemoved,
+                if kickout_names.is_empty() {
+                    names
+                } else {
+                    kickout_names
+                },
+            )
+        } else if template.contains("退出群聊") {
+            (ChatroomEventType::MemberLeft, Vec::new())
+        } else if template.contains("修改群名") || template.contains("群名") {
+            (ChatroomEventType::ChatroomNameChanged, Vec::new())
+        } else {
+            (ChatroomEventType::SystemUnknown, Vec::new())
+        };
+    let target_wxids: Vec<_> = target_members
+        .iter()
+        .map(|member| member.wxid.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let target_names: Vec<_> = target_members
+        .iter()
+        .map(|member| {
+            member
+                .display_name
+                .clone()
+                .unwrap_or_else(|| member.wxid.clone())
+        })
+        .filter(|value| !value.is_empty())
+        .collect();
+    let mut actor_wxid = username
+        .as_ref()
+        .map(|member| member.wxid.clone())
+        .filter(|value| !value.is_empty());
+    let mut actor_name = username
+        .as_ref()
+        .and_then(|member| member.display_name.clone())
+        .or_else(|| actor_wxid.clone());
     if actor_wxid.is_none() && template.starts_with('你') {
         actor_wxid = message.account_wxid.clone();
         actor_name = Some("你".to_string());
@@ -337,7 +455,9 @@ fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSy
         target_wxids,
         target_names,
         previous_value: None,
-        current_value: remark.and_then(|member| member.display_name.or(Some(member.wxid))).filter(|value| !value.is_empty()),
+        current_value: remark
+            .and_then(|member| member.display_name.or(Some(member.wxid)))
+            .filter(|value| !value.is_empty()),
         template_text: (!template.is_empty()).then_some(template.clone()),
         content_text: Some(render_template(&template, &links)),
         received_at: message.received_at.clone(),
@@ -345,14 +465,23 @@ fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSy
     })
 }
 
-fn classify_v1(type_name: &str, msg_type: Option<i64>, appmsg_type: Option<i64>, content: Option<&str>) -> NormalizedKind {
+fn classify_v1(
+    type_name: &str,
+    msg_type: Option<i64>,
+    appmsg_type: Option<i64>,
+    content: Option<&str>,
+) -> NormalizedKind {
     if type_name.eq_ignore_ascii_case("ModContacts") {
         return NormalizedKind::ChatroomContactsUpdate;
     }
     classify_message(msg_type, appmsg_type, content)
 }
 
-fn classify_message(msg_type: Option<i64>, appmsg_type: Option<i64>, content: Option<&str>) -> NormalizedKind {
+fn classify_message(
+    msg_type: Option<i64>,
+    appmsg_type: Option<i64>,
+    content: Option<&str>,
+) -> NormalizedKind {
     match msg_type.unwrap_or_default() {
         1 => NormalizedKind::Text,
         3 => NormalizedKind::Image,
@@ -386,7 +515,12 @@ fn classify_appmsg(appmsg_type: Option<i64>, content: Option<&str>) -> Normalize
     }
 }
 
-fn choose_conversation_id(from_user: Option<&str>, to_user: Option<&str>, account_wxid: Option<&str>, is_outgoing: bool) -> Option<String> {
+fn choose_conversation_id(
+    from_user: Option<&str>,
+    to_user: Option<&str>,
+    account_wxid: Option<&str>,
+    is_outgoing: bool,
+) -> Option<String> {
     if is_group_conversation(from_user) {
         return from_user.map(ToOwned::to_owned);
     }
@@ -413,15 +547,21 @@ fn scalar(value: Option<&Value>) -> Option<String> {
 
 fn scalar_unwrapped(value: Option<&Value>) -> Option<String> {
     let value = value?;
-    scalar(Some(value)).or_else(|| scalar(value.get("string"))).or_else(|| scalar(value.get("String")))
+    scalar(Some(value))
+        .or_else(|| scalar(value.get("string")))
+        .or_else(|| scalar(value.get("String")))
 }
 
 fn scalar_path(value: &Value, path: &[&str]) -> Option<String> {
-    path.iter().try_fold(value, |current, key| current.get(*key)).and_then(|value| scalar(Some(value)).or_else(|| scalar_unwrapped(Some(value))))
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(|value| scalar(Some(value)).or_else(|| scalar_unwrapped(Some(value))))
 }
 
 fn int_path(value: &Value, path: &[&str]) -> Option<i64> {
-    path.iter().try_fold(value, |current, key| current.get(*key)).and_then(|value| int_scalar(Some(value)))
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(|value| int_scalar(Some(value)))
 }
 
 fn int_scalar(value: Option<&Value>) -> Option<i64> {
@@ -438,11 +578,14 @@ fn is_group_conversation(value: Option<&str>) -> bool {
 }
 
 fn strip_group_speaker_prefix(text: &str) -> String {
-    text.split_once(":\n").map_or_else(|| text.to_string(), |(_, content)| content.to_string())
+    text.split_once(":\n")
+        .map_or_else(|| text.to_string(), |(_, content)| content.to_string())
 }
 
 fn extract_group_sender(text: &str) -> Option<String> {
-    text.split_once(":\n").map(|(sender, _)| sender.to_string()).filter(|sender| !sender.is_empty())
+    text.split_once(":\n")
+        .map(|(sender, _)| sender.to_string())
+        .filter(|sender| !sender.is_empty())
 }
 
 fn is_likely_xml(text: &str) -> bool {
@@ -471,23 +614,36 @@ fn sha256_hex(text: &str) -> String {
 fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let pattern = format!(r"(?is)<{tag}>(.*?)</{tag}>");
     let re = Regex::new(&pattern).ok()?;
-    Some(strip_cdata(re.captures(xml)?.get(1)?.as_str()).trim().to_string())
+    Some(
+        strip_cdata(re.captures(xml)?.get(1)?.as_str())
+            .trim()
+            .to_string(),
+    )
 }
 
 fn extract_links(xml: &str) -> BTreeMap<String, Vec<ChatroomMember>> {
-    let link_re = Regex::new(r#"(?is)<link\b[^>]*\bname=["']([^"']+)["'][^>]*>(.*?)</link>"#).expect("valid link regex");
+    let link_re = Regex::new(r#"(?is)<link\b[^>]*\bname=["']([^"']+)["'][^>]*>(.*?)</link>"#)
+        .expect("valid link regex");
     let member_re = Regex::new(r"(?is)<member>(.*?)</member>").expect("valid member regex");
     let mut links = BTreeMap::new();
     for link in link_re.captures_iter(xml) {
-        let name = link.get(1).map(|m| m.as_str()).unwrap_or_default().to_string();
+        let name = link
+            .get(1)
+            .map(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
         let body = link.get(2).map(|m| m.as_str()).unwrap_or_default();
         let members = member_re
             .captures_iter(body)
             .map(|member| {
                 let member_body = member.get(1).map(|m| m.as_str()).unwrap_or_default();
                 ChatroomMember {
-                    wxid: extract_tag(member_body, "username").map(|value| decode_xml_text(&value)).unwrap_or_default(),
-                    display_name: extract_tag(member_body, "nickname").map(|value| decode_xml_text(&value)).filter(|value| !value.is_empty()),
+                    wxid: extract_tag(member_body, "username")
+                        .map(|value| decode_xml_text(&value))
+                        .unwrap_or_default(),
+                    display_name: extract_tag(member_body, "nickname")
+                        .map(|value| decode_xml_text(&value))
+                        .filter(|value| !value.is_empty()),
                     flag: None,
                 }
             })
@@ -502,7 +658,12 @@ fn render_template(template: &str, links: &BTreeMap<String, Vec<ChatroomMember>>
     for (name, members) in links {
         let label = members
             .iter()
-            .map(|member| member.display_name.clone().unwrap_or_else(|| member.wxid.clone()))
+            .map(|member| {
+                member
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| member.wxid.clone())
+            })
             .collect::<Vec<_>>()
             .join(", ");
         output = output.replace(&format!("${name}$"), &label);
@@ -511,7 +672,10 @@ fn render_template(template: &str, links: &BTreeMap<String, Vec<ChatroomMember>>
 }
 
 fn strip_cdata(text: &str) -> String {
-    text.trim().trim_start_matches("<![CDATA[").trim_end_matches("]]>").to_string()
+    text.trim()
+        .trim_start_matches("<![CDATA[")
+        .trim_end_matches("]]>")
+        .to_string()
 }
 
 fn decode_xml_text(text: &str) -> String {
@@ -523,5 +687,9 @@ fn decode_xml_text(text: &str) -> String {
 }
 
 fn _member_set(snapshot: &ChatroomSnapshot) -> BTreeSet<String> {
-    snapshot.members.iter().map(|member| member.wxid.clone()).collect()
+    snapshot
+        .members
+        .iter()
+        .map(|member| member.wxid.clone())
+        .collect()
 }
