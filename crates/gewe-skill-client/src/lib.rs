@@ -1,7 +1,7 @@
 //! Rust SDK for the `gewe-skill-memory` API.
 
 use gewe_skill_types::{
-    ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
+    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
     IngestEventRequest, NormalizedMessage, RawCallbackRequest,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
@@ -63,6 +63,10 @@ impl GeweSkillClient {
         self.post_write_json("write/raw-events", request).await
     }
 
+    pub async fn write_attachment(&self, request: &AttachmentRecord) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json("write/attachments", request).await
+    }
+
     async fn post_write_json<T: serde::Serialize + ?Sized>(&self, path: &str, request: &T) -> Result<serde_json::Value, ClientError> {
         let response = self
             .http
@@ -93,6 +97,10 @@ impl GeweSkillClient {
 
     pub async fn conversations(&self, limit: Option<u32>) -> Result<ApiPage<ConversationSummary>, ClientError> {
         self.get_json("api/conversations", limit).await
+    }
+
+    pub async fn recent_attachments(&self, limit: Option<u32>) -> Result<ApiPage<AttachmentRecord>, ClientError> {
+        self.get_json("api/attachments/recent", limit).await
     }
 
     pub async fn chatroom_snapshots(&self, chatroom_id: &str, limit: Option<u32>) -> Result<ApiPage<ChatroomSnapshot>, ClientError> {
