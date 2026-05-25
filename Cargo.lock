@@ -574,9 +574,11 @@ dependencies = [
  "gewe-skill-client",
  "gewe-skill-core",
  "gewe-skill-types",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
