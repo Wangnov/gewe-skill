@@ -10,7 +10,7 @@ use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomS
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, net::SocketAddr, path::Path, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -42,11 +42,12 @@ struct IngestResponse {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
 
     let database_url = env::var("GEWE_SKILL_DATABASE_URL").unwrap_or_else(|_| "sqlite:/opt/gewe-skill-memory/data/gewe-skill-memory.sqlite?mode=rwc".to_string());
     let listen = env::var("GEWE_SKILL_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
+    ensure_sqlite_parent(&database_url)?;
     let db = SqlitePoolOptions::new().max_connections(8).connect(&database_url).await?;
     init_db(&db).await?;
 
@@ -72,6 +73,20 @@ async fn main() -> anyhow::Result<()> {
     info!(%addr, "starting gewe-skill-memory");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    Ok(())
+}
+
+fn ensure_sqlite_parent(database_url: &str) -> std::io::Result<()> {
+    let Some(path) = database_url.strip_prefix("sqlite:") else {
+        return Ok(());
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    if path == ":memory:" {
+        return Ok(());
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     Ok(())
 }
 
