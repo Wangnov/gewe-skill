@@ -30,6 +30,12 @@ struct LimitQuery {
     cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+    limit: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -63,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/write/events", post(write_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
         .route("/write/raw-events", post(write_raw_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
         .route("/api/messages/recent", get(recent_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/messages/search", get(search_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/conversations", get(conversations).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/snapshots", get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/events", get(chatroom_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
@@ -188,6 +195,30 @@ async fn recent_messages(State(state): State<SharedState>, Query(query): Query<L
         "#,
     )
     .bind(cursor)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    let items = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok())
+        .collect::<Vec<_>>();
+    let next_cursor = items.last().map(|message| message.received_at.clone());
+    Ok(Json(ApiPage { items, next_cursor }))
+}
+
+async fn search_messages(State(state): State<SharedState>, Query(query): Query<SearchQuery>) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let pattern = format!("%{}%", query.q);
+    let rows = sqlx::query(
+        r#"
+        SELECT message_json
+        FROM messages
+        WHERE content_text LIKE ?
+        ORDER BY received_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(pattern)
     .bind(limit)
     .fetch_all(&state.db)
     .await?;
