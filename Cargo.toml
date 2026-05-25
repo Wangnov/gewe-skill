@@ -5,6 +5,7 @@ members = [
   "crates/gewe-skill-core",
   "crates/gewe-skill-memory",
   "crates/gewe-skill-client",
+  "crates/gewe-skill-cli",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
+clap = { version = "4", features = ["derive", "env"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
