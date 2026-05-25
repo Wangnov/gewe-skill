@@ -6,6 +6,8 @@
 
 ```text
 POST /write/events
+POST /write/raw-events
+POST /write/attachments
 ```
 
 This endpoint is for `gewe-skill-edge` or trusted repair tools only.
@@ -14,7 +16,10 @@ This endpoint is for `gewe-skill-edge` or trusted repair tools only.
 
 ```text
 GET /api/messages/recent
+GET /api/messages/search
 GET /api/conversations
+GET /api/attachments/recent
+GET /api/attachments/{sha256}/download
 GET /api/chatrooms/{chatroom_id}/snapshots
 GET /api/chatrooms/{chatroom_id}/events
 GET /api/chatrooms/{chatroom_id}/system-events

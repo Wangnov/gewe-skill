@@ -25,6 +25,7 @@ gewe-skill health
 gewe-skill recent --limit 20
 gewe-skill search --q '<keyword>' --limit 20
 gewe-skill conversations --limit 50
+gewe-skill attachments --limit 20
 gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 50
 gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 50
 ```
@@ -68,6 +69,12 @@ gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.00
 1. Run `gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 100`.
 2. Run `gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 100`.
 3. Correlate snapshot diff events with SYSTEM XML events before making claims about who joined, left, was invited, or was removed.
+
+### Attachments
+
+1. Run `gewe-skill attachments --limit 20`.
+2. Use `kind`, `mime_type`, `size_bytes`, `message_key`, and `sha256` when referencing attachment evidence.
+3. Download bytes only through the read-authenticated memory API when the user asks to inspect actual media or file content.
 
 ## Interpretation rules
 
