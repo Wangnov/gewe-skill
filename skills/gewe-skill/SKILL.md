@@ -23,6 +23,7 @@ Use the CLI first:
 ```bash
 gewe-skill health
 gewe-skill recent --limit 20
+gewe-skill search --q '<keyword>' --limit 20
 gewe-skill conversations --limit 50
 gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 50
 gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 50
@@ -55,6 +56,12 @@ gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.00
 
 1. Run `gewe-skill conversations --limit 100`.
 2. Use the returned `conversation_id` values for follow-up message/event queries.
+
+### Keyword search
+
+1. Run `gewe-skill search --q '<keyword>' --limit 50`.
+2. Use exact timestamps, `conversation_id`, `sender_wxid`, and message text in the answer.
+3. If the result set is sparse, say that this is a keyword search over normalized text and may not include attachment-only content.
 
 ### Chatroom member changes
 
