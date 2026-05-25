@@ -31,6 +31,13 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Search messages by keyword.
+    Search {
+        #[arg(long)]
+        q: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
     /// List conversations ordered by last message time.
     Conversations {
         #[arg(long, default_value_t = 50)]
@@ -100,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Health => print_json(client.healthz().await?)?,
         Command::Recent { limit } => print_json(client.recent_messages(Some(limit)).await?)?,
+        Command::Search { q, limit } => print_json(client.search_messages(&q, Some(limit)).await?)?,
         Command::Conversations { limit } => print_json(client.conversations(Some(limit)).await?)?,
         Command::ChatroomEvents { chatroom_id, limit } => print_json(client.chatroom_events(&chatroom_id, Some(limit)).await?)?,
         Command::ChatroomSystemEvents { chatroom_id, limit } => print_json(client.chatroom_system_events(&chatroom_id, Some(limit)).await?)?,
