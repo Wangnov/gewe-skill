@@ -16,6 +16,14 @@ The project is designed as a Rust-first monorepo with an edge ingest layer, a pe
 | gewe-skill-cli | `crates/gewe-skill-cli` | Operations CLI for sync, backfill, and inspection |
 | gewe-skill | `skills/gewe-skill` | Universal Agent Skill instructions |
 
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Deployment](docs/deployment.md)
+- [API](docs/api.md)
+- [Privacy](docs/privacy.md)
+- [GeWe callback notes](docs/gewe-callbacks.md)
+
 ## License
 
 MIT
