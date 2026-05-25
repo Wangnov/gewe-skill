@@ -70,10 +70,12 @@ enum Command {
         edge_url: String,
         #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN")]
         admin_token: String,
-        #[arg(long, default_value_t = 0)]
-        after_raw_event_id: i64,
+        #[arg(long)]
+        after_raw_event_id: Option<i64>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
+        #[arg(long, env = "GEWE_SKILL_SYNC_CURSOR_FILE", default_value = "/opt/gewe-skill-memory/data/edge-sync.cursor")]
+        cursor_file: PathBuf,
     },
 }
 
@@ -109,8 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let payload = normalize_file(file, received_at)?;
             print_json(client.write_event(&payload).await?)?;
         }
-        Command::SyncEdge { edge_url, admin_token, after_raw_event_id, limit } => {
-            let result = sync_edge(&client, &edge_url, &admin_token, after_raw_event_id, limit).await?;
+        Command::SyncEdge { edge_url, admin_token, after_raw_event_id, limit, cursor_file } => {
+            let result = sync_edge(&client, &edge_url, &admin_token, after_raw_event_id, limit, cursor_file).await?;
             print_json(result)?;
         }
     }
@@ -140,9 +142,11 @@ async fn sync_edge(
     client: &GeweSkillClient,
     edge_url: &str,
     admin_token: &str,
-    after_raw_event_id: i64,
+    after_raw_event_id: Option<i64>,
     limit: u32,
+    cursor_file: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    let after_raw_event_id = after_raw_event_id.unwrap_or_else(|| read_cursor(&cursor_file).unwrap_or(0));
     let edge_url = edge_url.trim_end_matches('/');
     let export_url = format!("{edge_url}/admin/export?after_raw_event_id={after_raw_event_id}&limit={limit}");
     let export: EdgeExportResponse = reqwest::Client::new()
@@ -181,6 +185,8 @@ async fn sync_edge(
         }
     }
 
+    write_cursor(&cursor_file, export.next_after_raw_event_id)?;
+
     Ok(serde_json::json!({
         "ok": true,
         "scanned": export.events.len(),
@@ -191,6 +197,17 @@ async fn sync_edge(
         "last_raw_event_id": last_raw_event_id,
         "next_after_raw_event_id": export.next_after_raw_event_id
     }))
+}
+
+fn read_cursor(path: &PathBuf) -> Option<i64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn write_cursor(path: &PathBuf, value: i64) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{value}\n"))
 }
 
 fn print_json(value: impl serde::Serialize) -> Result<(), serde_json::Error> {
