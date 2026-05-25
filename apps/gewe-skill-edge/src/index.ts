@@ -169,6 +169,37 @@ async function handleAdmin(request, env, url) {
     return json({ ok: true, samples: result.results || [] });
   }
 
+  if (url.pathname === "/admin/export") {
+    const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
+    const afterRawEventId = clampInt(url.searchParams.get("after_raw_event_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const rows = await env.DB.prepare(`
+      SELECT id, received_at, schema_version, appid, account_wxid, type_name, msg_id, new_msg_id,
+             msg_type, dedupe_key, event_json
+      FROM raw_events
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT ?
+    `).bind(afterRawEventId, limit).all();
+    const events = (rows.results || []).map((row) => ({
+      raw_event_id: row.id,
+      received_at: row.received_at,
+      schema_version: row.schema_version,
+      appid: row.appid,
+      account_wxid: row.account_wxid,
+      type_name: row.type_name,
+      msg_id: row.msg_id,
+      new_msg_id: row.new_msg_id,
+      msg_type: row.msg_type,
+      dedupe_key: row.dedupe_key,
+      body: parseStoredEventBody(row.event_json)
+    }));
+    return json({
+      ok: true,
+      events,
+      next_after_raw_event_id: events.length ? events[events.length - 1].raw_event_id : afterRawEventId
+    });
+  }
+
   if (url.pathname === "/admin/chatroom-snapshots") {
     const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
     const chatroomId = url.searchParams.get("chatroom_id");
