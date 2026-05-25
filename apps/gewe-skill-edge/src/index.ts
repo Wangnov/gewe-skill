@@ -200,6 +200,74 @@ async function handleAdmin(request, env, url) {
     });
   }
 
+  if (url.pathname === "/admin/attachments") {
+    const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
+    const afterJobId = clampInt(url.searchParams.get("after_job_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const rows = await env.DB.prepare(`
+      SELECT d.id AS job_id, d.job_key, m.message_key, r.dedupe_key AS raw_event_dedupe_key,
+             d.message_id, d.raw_event_id, d.appid, d.account_wxid, d.asset_type, d.variant,
+             COALESCE(d.r2_object_key, d.local_path) AS object_key,
+             d.size_bytes, d.mime_type, d.completed_at, d.created_at, d.updated_at
+      FROM download_jobs d
+      LEFT JOIN messages m ON m.id = d.message_id
+      LEFT JOIN raw_events r ON r.id = d.raw_event_id
+      WHERE d.id > ?
+        AND d.status = 'completed'
+        AND COALESCE(d.r2_object_key, d.local_path) IS NOT NULL
+      ORDER BY d.id ASC
+      LIMIT ?
+    `).bind(afterJobId, limit).all();
+    const attachments = (rows.results || []).map((row) => ({
+      job_id: row.job_id,
+      job_key: row.job_key,
+      message_key: row.message_key,
+      raw_event_dedupe_key: row.raw_event_dedupe_key,
+      message_id: row.message_id,
+      raw_event_id: row.raw_event_id,
+      appid: row.appid,
+      account_wxid: row.account_wxid,
+      asset_type: row.asset_type,
+      variant: row.variant,
+      object_key: row.object_key,
+      size_bytes: row.size_bytes,
+      mime_type: row.mime_type,
+      completed_at: row.completed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      download_path: `/admin/attachment?job_id=${encodeURIComponent(row.job_id)}`
+    }));
+    return json({
+      ok: true,
+      attachments,
+      next_after_job_id: attachments.length ? attachments[attachments.length - 1].job_id : afterJobId
+    });
+  }
+
+  if (url.pathname === "/admin/attachment") {
+    const jobId = Number(url.searchParams.get("job_id"));
+    if (!Number.isInteger(jobId) || jobId <= 0) return json({ ok: false, error: "missing_job_id" }, 400);
+    const row = await env.DB.prepare(`
+      SELECT id, job_key, asset_type, mime_type, size_bytes, COALESCE(r2_object_key, local_path) AS object_key
+      FROM download_jobs
+      WHERE id = ? AND status = 'completed'
+      LIMIT 1
+    `).bind(jobId).first();
+    if (!row?.object_key) return json({ ok: false, error: "attachment_not_found" }, 404);
+
+    const object = await env.RAW_BUCKET.get(row.object_key);
+    if (!object?.body) return json({ ok: false, error: "r2_object_not_found" }, 404);
+
+    return new Response(object.body, {
+      headers: compactHeaders({
+        "content-type": row.mime_type || object.httpMetadata?.contentType || "application/octet-stream",
+        "content-length": row.size_bytes ? String(row.size_bytes) : null,
+        "x-gewe-skill-job-id": String(row.id),
+        "x-gewe-skill-job-key": row.job_key || null,
+        "x-gewe-skill-asset-type": row.asset_type || null
+      })
+    });
+  }
+
   if (url.pathname === "/admin/chatroom-snapshots") {
     const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
     const chatroomId = url.searchParams.get("chatroom_id");
@@ -1565,6 +1633,14 @@ function compactMetadata(metadata) {
   const output = {};
   for (const [key, value] of Object.entries(metadata)) {
     if (value !== null && value !== undefined && String(value)) output[key] = String(value).slice(0, 256);
+  }
+  return output;
+}
+
+function compactHeaders(headers) {
+  const output = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value !== null && value !== undefined && String(value)) output[key] = String(value);
   }
   return output;
 }
