@@ -79,6 +79,18 @@ GeWe -> gewe-skill-edge -> Cloudflare D1/R2/Queue -> gewe-skill-memory -> Agent 
 
 Install or reference `skills/gewe-skill/SKILL.md` from any Agent runtime that supports Markdown skills/instructions. The skill is intentionally CLI-first and read-only by default.
 
+Install the Markdown skill to a generic local skill directory:
+
+```bash
+./scripts/install-skill.sh
+```
+
+Install it into a specific Agent runtime directory:
+
+```bash
+./scripts/install-skill.sh "$HOME/.codex/skills/gewe-skill"
+```
+
 Common commands:
 
 ```bash
