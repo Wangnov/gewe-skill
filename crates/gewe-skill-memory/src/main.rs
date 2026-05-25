@@ -1,0 +1,440 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use std::{env, net::SocketAddr, sync::Arc};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::{info, warn};
+
+#[derive(Clone)]
+struct AppState {
+    db: SqlitePool,
+    read_token: Option<String>,
+    write_token: Option<String>,
+}
+
+type SharedState = Arc<AppState>;
+
+#[derive(Debug, Deserialize)]
+struct LimitQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
+    service: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct IngestResponse {
+    ok: bool,
+    message_key: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+
+    let database_url = env::var("GEWE_SKILL_DATABASE_URL").unwrap_or_else(|_| "sqlite:/opt/gewe-skill-memory/data/gewe-skill-memory.sqlite?mode=rwc".to_string());
+    let listen = env::var("GEWE_SKILL_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
+    let db = SqlitePoolOptions::new().max_connections(8).connect(&database_url).await?;
+    init_db(&db).await?;
+
+    let state = Arc::new(AppState {
+        db,
+        read_token: env::var("GEWE_SKILL_READ_TOKEN").ok(),
+        write_token: env::var("GEWE_SKILL_WRITE_TOKEN").ok(),
+    });
+
+    let app = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/write/events", post(write_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
+        .route("/api/messages/recent", get(recent_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/conversations", get(conversations).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/chatrooms/{chatroom_id}/snapshots", get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/chatrooms/{chatroom_id}/events", get(chatroom_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/chatrooms/{chatroom_id}/system-events", get(chatroom_system_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let addr: SocketAddr = listen.parse()?;
+    info!(%addr, "starting gewe-skill-memory");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        warn!(%error, "failed to listen for shutdown signal");
+    }
+}
+
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse { ok: true, service: "gewe-skill-memory" })
+}
+
+async fn require_write_token(State(state): State<SharedState>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
+    authorize(headers, state.write_token.as_deref(), request, next).await
+}
+
+async fn require_read_token(State(state): State<SharedState>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
+    authorize(headers, state.read_token.as_deref().or(state.write_token.as_deref()), request, next).await
+}
+
+async fn authorize(headers: HeaderMap, expected: Option<&str>, request: axum::extract::Request, next: Next) -> Response {
+    let Some(expected) = expected else {
+        return next.run(request).await;
+    };
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if token == Some(expected) {
+        return next.run(request).await;
+    }
+    (StatusCode::UNAUTHORIZED, Json(json!({ "ok": false, "error": "unauthorized" }))).into_response()
+}
+
+async fn write_event(State(state): State<SharedState>, Json(request): Json<IngestEventRequest>) -> Result<Json<IngestResponse>, ApiError> {
+    let mut tx = state.db.begin().await?;
+    insert_raw_event(&mut tx, &request).await?;
+    insert_message(&mut tx, &request.message).await?;
+    if let Some(snapshot) = &request.chatroom_snapshot {
+        insert_chatroom_snapshot(&mut tx, &request.message.message_key, snapshot).await?;
+    }
+    for event in &request.chatroom_member_events {
+        insert_chatroom_member_event(&mut tx, event).await?;
+    }
+    for event in &request.chatroom_system_events {
+        insert_chatroom_system_event(&mut tx, event).await?;
+    }
+    tx.commit().await?;
+
+    Ok(Json(IngestResponse { ok: true, message_key: request.message.message_key }))
+}
+
+async fn recent_messages(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let cursor = query.cursor.unwrap_or_else(|| "9999-12-31T23:59:59.999Z".to_string());
+    let rows = sqlx::query(
+        r#"
+        SELECT message_json
+        FROM messages
+        WHERE received_at < ?
+        ORDER BY received_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(cursor)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    let items = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok())
+        .collect::<Vec<_>>();
+    let next_cursor = items.last().map(|message| message.received_at.clone());
+    Ok(Json(ApiPage { items, next_cursor }))
+}
+
+async fn conversations(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ConversationSummary>>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let rows = sqlx::query(
+        r#"
+        SELECT conversation_id, MAX(is_group) AS is_group, MAX(received_at) AS last_message_at,
+               COUNT(*) AS message_count,
+               SUBSTR((SELECT content_text FROM messages m2 WHERE m2.conversation_id = messages.conversation_id ORDER BY received_at DESC, id DESC LIMIT 1), 1, 160) AS preview
+        FROM messages
+        WHERE conversation_id IS NOT NULL
+        GROUP BY conversation_id
+        ORDER BY last_message_at DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    let items = rows
+        .iter()
+        .map(|row| ConversationSummary {
+            conversation_id: row.get("conversation_id"),
+            display_name: None,
+            is_group: row.get::<i64, _>("is_group") != 0,
+            last_message_at: row.get("last_message_at"),
+            last_message_preview: row.get("preview"),
+            message_count: row.get("message_count"),
+        })
+        .collect();
+    Ok(Json(ApiPage { items, next_cursor: None }))
+}
+
+async fn chatroom_snapshots(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomSnapshot>>, ApiError> {
+    let rows = query_json_rows(&state.db, "chatroom_snapshots", "snapshot_json", &chatroom_id, clamp_limit(query.limit)).await?;
+    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+}
+
+async fn chatroom_events(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomMemberEvent>>, ApiError> {
+    let rows = query_json_rows(&state.db, "chatroom_member_events", "event_json", &chatroom_id, clamp_limit(query.limit)).await?;
+    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+}
+
+async fn chatroom_system_events(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomSystemEvent>>, ApiError> {
+    let rows = query_json_rows(&state.db, "chatroom_system_events", "event_json", &chatroom_id, clamp_limit(query.limit)).await?;
+    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+}
+
+async fn query_json_rows<T: serde::de::DeserializeOwned>(db: &SqlitePool, table: &str, json_column: &str, chatroom_id: &str, limit: i64) -> Result<Vec<T>, ApiError> {
+    let sql = format!("SELECT {json_column} AS payload FROM {table} WHERE chatroom_id = ? ORDER BY received_at DESC, id DESC LIMIT ?");
+    let rows = sqlx::query(&sql).bind(chatroom_id).bind(limit).fetch_all(db).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<T>(row.get::<&str, _>("payload")).ok())
+        .collect())
+}
+
+async fn insert_raw_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, request: &IngestEventRequest) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO raw_events (dedupe_key, schema_version, appid, account_wxid, received_at, body_sha256, body_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dedupe_key) DO UPDATE SET duplicate_count = duplicate_count + 1, last_seen_at = excluded.received_at
+        "#,
+    )
+    .bind(&request.raw_event.dedupe_key)
+    .bind(format!("{:?}", request.raw_event.schema_version))
+    .bind(&request.raw_event.appid)
+    .bind(&request.raw_event.account_wxid)
+    .bind(&request.raw_event.received_at)
+    .bind(&request.raw_event.body_sha256)
+    .bind(serde_json::to_string(&request.raw_event)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_message(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, message: &NormalizedMessage) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO messages (message_key, appid, account_wxid, conversation_id, sender_wxid, kind, is_group, is_outgoing, received_at, content_text, message_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_key) DO UPDATE SET duplicate_count = duplicate_count + 1, last_seen_at = excluded.received_at
+        "#,
+    )
+    .bind(&message.message_key)
+    .bind(&message.appid)
+    .bind(&message.account_wxid)
+    .bind(&message.conversation_id)
+    .bind(&message.sender_wxid)
+    .bind(format!("{:?}", message.kind))
+    .bind(i64::from(message.is_group))
+    .bind(i64::from(message.is_outgoing))
+    .bind(&message.received_at)
+    .bind(&message.content_text)
+    .bind(serde_json::to_string(message)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_chatroom_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, message_key: &str, snapshot: &ChatroomSnapshot) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chatroom_snapshots (message_key, chatroom_id, chatroom_name, member_count, member_hash, received_at, snapshot_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_key) DO UPDATE SET snapshot_json = excluded.snapshot_json
+        "#,
+    )
+    .bind(message_key)
+    .bind(&snapshot.chatroom_id)
+    .bind(&snapshot.chatroom_name)
+    .bind(snapshot.member_count)
+    .bind(&snapshot.member_hash)
+    .bind(&snapshot.received_at)
+    .bind(serde_json::to_string(snapshot)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_chatroom_member_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, event: &ChatroomMemberEvent) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chatroom_member_events (event_key, event_type, chatroom_id, member_wxid, received_at, event_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_key) DO UPDATE SET event_json = excluded.event_json
+        "#,
+    )
+    .bind(format!("{}:{}:{}", event.chatroom_id, event.received_at, event.member_wxid.as_deref().unwrap_or("chatroom")))
+    .bind(format!("{:?}", event.event_type))
+    .bind(&event.chatroom_id)
+    .bind(&event.member_wxid)
+    .bind(&event.received_at)
+    .bind(serde_json::to_string(event)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_chatroom_system_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, event: &ChatroomSystemEvent) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chatroom_system_events (event_key, event_type, chatroom_id, actor_wxid, target_wxid, received_at, event_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_key) DO UPDATE SET event_json = excluded.event_json
+        "#,
+    )
+    .bind(format!("{}:{}:{}", event.chatroom_id, event.received_at, event.content_text.as_deref().unwrap_or("system")))
+    .bind(format!("{:?}", event.event_type))
+    .bind(&event.chatroom_id)
+    .bind(&event.actor_wxid)
+    .bind(&event.target_wxid)
+    .bind(&event.received_at)
+    .bind(serde_json::to_string(event)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA journal_mode = WAL").execute(db).await?;
+    sqlx::query("PRAGMA foreign_keys = ON").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS raw_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          dedupe_key TEXT NOT NULL UNIQUE,
+          schema_version TEXT NOT NULL,
+          appid TEXT NOT NULL,
+          account_wxid TEXT,
+          received_at TEXT NOT NULL,
+          body_sha256 TEXT NOT NULL,
+          body_json TEXT NOT NULL,
+          duplicate_count INTEGER NOT NULL DEFAULT 0,
+          last_seen_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_key TEXT NOT NULL UNIQUE,
+          appid TEXT NOT NULL,
+          account_wxid TEXT,
+          conversation_id TEXT,
+          sender_wxid TEXT,
+          kind TEXT NOT NULL,
+          is_group INTEGER NOT NULL DEFAULT 0,
+          is_outgoing INTEGER NOT NULL DEFAULT 0,
+          received_at TEXT NOT NULL,
+          content_text TEXT,
+          message_json TEXT NOT NULL,
+          duplicate_count INTEGER NOT NULL DEFAULT 0,
+          last_seen_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_conversation_received ON messages(conversation_id, received_at DESC)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at DESC)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chatroom_snapshots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_key TEXT NOT NULL UNIQUE,
+          chatroom_id TEXT NOT NULL,
+          chatroom_name TEXT,
+          member_count INTEGER NOT NULL,
+          member_hash TEXT NOT NULL,
+          received_at TEXT NOT NULL,
+          snapshot_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_chatroom_snapshots_chatroom_received ON chatroom_snapshots(chatroom_id, received_at DESC)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chatroom_member_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_key TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          chatroom_id TEXT NOT NULL,
+          member_wxid TEXT,
+          received_at TEXT NOT NULL,
+          event_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_chatroom_member_events_chatroom_received ON chatroom_member_events(chatroom_id, received_at DESC)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS chatroom_system_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_key TEXT NOT NULL UNIQUE,
+          event_type TEXT NOT NULL,
+          chatroom_id TEXT NOT NULL,
+          actor_wxid TEXT,
+          target_wxid TEXT,
+          received_at TEXT NOT NULL,
+          event_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_chatroom_system_events_chatroom_received ON chatroom_system_events(chatroom_id, received_at DESC)").execute(db).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+enum ApiError {
+    Sqlx(sqlx::Error),
+    Serde(serde_json::Error),
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Sqlx(error)
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serde(error)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let message = match self {
+            Self::Sqlx(error) => error.to_string(),
+            Self::Serde(error) => error.to_string(),
+        };
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "ok": false, "error": message }))).into_response()
+    }
+}

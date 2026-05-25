@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/gewe-skill-types",
   "crates/gewe-skill-core",
+  "crates/gewe-skill-memory",
 ]
 
 [workspace.package]
@@ -19,6 +20,12 @@ uuid = { version = "1", features = ["v7", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
