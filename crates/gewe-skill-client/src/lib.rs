@@ -2,7 +2,7 @@
 
 use gewe_skill_types::{
     ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
-    IngestEventRequest, NormalizedMessage,
+    IngestEventRequest, NormalizedMessage, RawCallbackRequest,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -56,9 +56,17 @@ impl GeweSkillClient {
     }
 
     pub async fn write_event(&self, request: &IngestEventRequest) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json("write/events", request).await
+    }
+
+    pub async fn write_raw_event(&self, request: &RawCallbackRequest) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json("write/raw-events", request).await
+    }
+
+    async fn post_write_json<T: serde::Serialize + ?Sized>(&self, path: &str, request: &T) -> Result<serde_json::Value, ClientError> {
         let response = self
             .http
-            .post(self.url("write/events")?)
+            .post(self.url(path)?)
             .bearer_auth(self.write_token.as_deref().unwrap_or_default())
             .json(request)
             .send()
