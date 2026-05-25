@@ -9,7 +9,7 @@ use axum::{
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{env, net::SocketAddr, path::Path as FsPath, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
