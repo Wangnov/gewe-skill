@@ -298,13 +298,16 @@ fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSy
         return None;
     }
 
-    let template = extract_tag(xml, "template").map(decode_xml_text).unwrap_or_default();
+    let template = extract_tag(xml, "template")
+        .as_deref()
+        .map(decode_xml_text)
+        .unwrap_or_default();
     let links = extract_links(xml);
     let names = links.get("names").cloned().unwrap_or_default();
     let kickout_names = links.get("kickoutname").cloned().unwrap_or_default();
     let username = links.get("username").and_then(|members| members.first()).cloned();
     let remark = links.get("remark").and_then(|members| members.first()).cloned();
-    let (event_type, target_members) = if (template.contains("加入了群聊") || template.contains("邀请")) && !names.is_empty() {
+    let (event_type, target_members): (ChatroomEventType, Vec<ChatroomMember>) = if (template.contains("加入了群聊") || template.contains("邀请")) && !names.is_empty() {
         (ChatroomEventType::MemberInvited, names)
     } else if template.contains("移出") {
         (ChatroomEventType::MemberRemoved, if kickout_names.is_empty() { names } else { kickout_names })
@@ -418,7 +421,7 @@ fn scalar_path(value: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn int_path(value: &Value, path: &[&str]) -> Option<i64> {
-    path.iter().try_fold(value, |current, key| current.get(*key)).and_then(int_scalar)
+    path.iter().try_fold(value, |current, key| current.get(*key)).and_then(|value| int_scalar(Some(value)))
 }
 
 fn int_scalar(value: Option<&Value>) -> Option<i64> {
