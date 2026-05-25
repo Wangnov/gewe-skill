@@ -8,7 +8,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: "gewe-wechat-ingest", now: new Date().toISOString() });
+      return json({ ok: true, service: "gewe-skill-edge", now: new Date().toISOString() });
     }
 
     if (request.method === "POST" && url.pathname === `/callback/${env.CALLBACK_SECRET}`) {

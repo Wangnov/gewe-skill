@@ -1,4 +1,8 @@
 GEWE_TOKEN=replace-with-your-gewe-token
 CALLBACK_SECRET=replace-with-random-callback-path-secret
 ADMIN_API_KEY=replace-with-random-admin-token
-MEMORY_WRITE_TOKEN=replace-with-gewe-skill-memory-write-token
+
+# Optional push-to-memory mode. The recommended production path is pull sync
+# from gewe-skill-memory, so these are intentionally not required.
+# MEMORY_API_URL=https://replace-with-your-gewe-skill-memory-origin
+# MEMORY_WRITE_TOKEN=replace-with-gewe-skill-memory-write-token
