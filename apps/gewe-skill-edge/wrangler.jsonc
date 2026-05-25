@@ -17,7 +17,8 @@
     "RAW_EVENT_TTL_DAYS": "30",
     "R2_ATTACHMENT_TTL_DAYS": "7",
     "MAX_ATTACHMENT_BYTES": "209715200",
-    "IMAGE_DOWNLOAD_TYPE": "2"
+    "IMAGE_DOWNLOAD_TYPE": "2",
+    "MEMORY_API_URL": "https://replace-with-your-gewe-skill-memory-origin"
   },
   "d1_databases": [
     {
@@ -52,6 +53,6 @@
     "crons": ["37 18 * * *"]
   },
   "secrets": {
-    "required": ["GEWE_TOKEN", "CALLBACK_SECRET", "ADMIN_API_KEY"]
+    "required": ["GEWE_TOKEN", "CALLBACK_SECRET", "ADMIN_API_KEY", "MEMORY_WRITE_TOKEN"]
   }
 }

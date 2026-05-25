@@ -17,5 +17,6 @@ Create local `.dev.vars` from `.dev.vars.example` and set Cloudflare secrets for
 - `GEWE_TOKEN`
 - `CALLBACK_SECRET`
 - `ADMIN_API_KEY`
+- `MEMORY_WRITE_TOKEN`
 
 Never commit real tokens or app identifiers.

@@ -80,6 +80,7 @@ async function handleCallback(request, env, ctx) {
 
   const rawEvent = await upsertRawEvent(env, normalized, storageBodyText, bodySha256, rawObjectKey, sourceIp, userAgent, receivedAt);
   const message = await upsertMessage(env, normalized, rawEvent.id, receivedAt);
+  ctx.waitUntil(forwardRawEventToMemory(env, body, receivedAt));
 
   if (rawEvent.duplicate_count === 0) {
     await processChatroomSnapshot(env, normalized, rawEvent.id, message.id, receivedAt);
@@ -92,6 +93,29 @@ async function handleCallback(request, env, ctx) {
   }
 
   return json({ ok: true, schema: normalized.schemaVersion, raw_event_id: rawEvent.id, message_id: message.id });
+}
+
+async function forwardRawEventToMemory(env, body, receivedAt) {
+  if (!env.MEMORY_API_URL || !env.MEMORY_WRITE_TOKEN) return;
+
+  try {
+    const response = await fetch(`${String(env.MEMORY_API_URL).replace(/\/+$/, "")}/write/raw-events`, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${env.MEMORY_WRITE_TOKEN}`,
+        "content-type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify({
+        received_at: receivedAt,
+        body: redactSensitiveValue(body)
+      })
+    });
+    if (!response.ok) {
+      console.error("memory forward failed", response.status, (await response.text()).slice(0, 500));
+    }
+  } catch (error) {
+    console.error("memory forward failed", safeError(error));
+  }
 }
 
 async function handleAdmin(request, env, url) {
