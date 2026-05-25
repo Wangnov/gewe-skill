@@ -693,3 +693,223 @@ fn _member_set(snapshot: &ChatroomSnapshot) -> BTreeSet<String> {
         .map(|member| member.wxid.clone())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gewe_skill_types::{ChatroomEventType, NormalizedKind, SchemaVersion};
+    use serde_json::json;
+
+    const APPID: &str = "wx_test_app";
+    const ACCOUNT: &str = "wxid_account";
+    const RECEIVED_AT: &str = "2026-05-26T00:00:00.000Z";
+
+    #[test]
+    fn normalizes_v1_group_text_with_sender_prefix() {
+        let body = json!({
+            "Appid": APPID,
+            "Wxid": ACCOUNT,
+            "TypeName": "AddMsg",
+            "Data": {
+                "MsgId": 101,
+                "NewMsgId": 10001,
+                "MsgType": 1,
+                "FromUserName": { "string": "12345@chatroom" },
+                "ToUserName": { "string": ACCOUNT },
+                "Content": { "string": "wxid_sender:\n你好，测试" },
+                "PushContent": { "string": "sender: 你好，测试" },
+                "CreateTime": 1770000000
+            }
+        });
+
+        let normalized = normalize_callback(&body, RECEIVED_AT).expect("v1 group text");
+
+        assert_eq!(normalized.message.schema_version, SchemaVersion::V1);
+        assert_eq!(normalized.message.kind, NormalizedKind::Text);
+        assert_eq!(normalized.message.message_key, "v1:wx_test_app:10001");
+        assert_eq!(
+            normalized.message.conversation_id.as_deref(),
+            Some("12345@chatroom")
+        );
+        assert_eq!(
+            normalized.message.sender_wxid.as_deref(),
+            Some("wxid_sender")
+        );
+        assert_eq!(
+            normalized.message.content_text.as_deref(),
+            Some("你好，测试")
+        );
+        assert!(normalized.message.is_group);
+        assert!(!normalized.message.is_outgoing);
+    }
+
+    #[test]
+    fn normalizes_v2_group_message_using_from_group_mapping() {
+        let body = json!({
+            "appid": APPID,
+            "wxid": ACCOUNT,
+            "msgId": "202",
+            "newMsgId": "20002",
+            "msgType": 1,
+            "fromUser": "wxid_sender",
+            "toUser": ACCOUNT,
+            "fromGroup": "67890@chatroom",
+            "isSelf": false,
+            "eventCode": "group_msg_event",
+            "content": "V2 群消息",
+            "createTime": 1770000001
+        });
+
+        let normalized = normalize_callback(&body, RECEIVED_AT).expect("v2 group text");
+
+        assert_eq!(normalized.message.schema_version, SchemaVersion::V2);
+        assert_eq!(normalized.message.kind, NormalizedKind::Text);
+        assert_eq!(normalized.message.message_key, "v2:wx_test_app:20002");
+        assert_eq!(
+            normalized.message.conversation_id.as_deref(),
+            Some("67890@chatroom")
+        );
+        assert_eq!(
+            normalized.message.sender_wxid.as_deref(),
+            Some("wxid_sender")
+        );
+        assert!(normalized.message.is_group);
+    }
+
+    #[test]
+    fn classifies_appmsg_file_only_when_appattach_exists() {
+        let file_body = json!({
+            "appid": APPID,
+            "wxid": ACCOUNT,
+            "msgId": "303",
+            "newMsgId": "30003",
+            "msgType": 49,
+            "fromUser": "friend",
+            "toUser": ACCOUNT,
+            "content": "<msg><appmsg><type>6</type><appattach><totallen>42</totallen></appattach></appmsg></msg>"
+        });
+        let notice_body = json!({
+            "appid": APPID,
+            "wxid": ACCOUNT,
+            "msgId": "304",
+            "newMsgId": "30004",
+            "msgType": 49,
+            "fromUser": "friend",
+            "toUser": ACCOUNT,
+            "content": "<msg><appmsg><type>6</type></appmsg></msg>"
+        });
+
+        let file = normalize_callback(&file_body, RECEIVED_AT).expect("file appmsg");
+        let notice = normalize_callback(&notice_body, RECEIVED_AT).expect("file notice appmsg");
+
+        assert_eq!(file.message.appmsg_type, Some(6));
+        assert_eq!(file.message.kind, NormalizedKind::File);
+        assert_eq!(notice.message.appmsg_type, Some(6));
+        assert_eq!(notice.message.kind, NormalizedKind::FileNotice);
+    }
+
+    #[test]
+    fn parses_chatroom_invite_system_xml() {
+        let system_xml = r#"
+            <sysmsg type="sysmsgtemplate">
+              <sysmsgtemplate>
+                <content_template>
+                  <template><![CDATA[$username$邀请$names$加入了群聊]]></template>
+                  <link_list>
+                    <link name="username">
+                      <member>
+                        <username><![CDATA[wxid_actor]]></username>
+                        <nickname><![CDATA[Alice]]></nickname>
+                      </member>
+                    </link>
+                    <link name="names">
+                      <member>
+                        <username><![CDATA[wxid_target]]></username>
+                        <nickname><![CDATA[Bob]]></nickname>
+                      </member>
+                    </link>
+                  </link_list>
+                </content_template>
+              </sysmsgtemplate>
+            </sysmsg>
+        "#;
+        let body = json!({
+            "Appid": APPID,
+            "Wxid": ACCOUNT,
+            "TypeName": "AddMsg",
+            "Data": {
+                "MsgId": 401,
+                "NewMsgId": 40001,
+                "MsgType": 10000,
+                "FromUserName": { "string": "12345@chatroom" },
+                "ToUserName": { "string": ACCOUNT },
+                "Content": { "string": system_xml },
+                "CreateTime": 1770000002
+            }
+        });
+
+        let normalized = normalize_callback(&body, RECEIVED_AT).expect("system xml");
+        let event = normalized
+            .chatroom_system_event
+            .expect("chatroom system event");
+
+        assert_eq!(normalized.message.kind, NormalizedKind::System);
+        assert_eq!(event.event_type, ChatroomEventType::MemberInvited);
+        assert_eq!(event.chatroom_id, "12345@chatroom");
+        assert_eq!(event.actor_wxid.as_deref(), Some("wxid_actor"));
+        assert_eq!(event.actor_name.as_deref(), Some("Alice"));
+        assert_eq!(event.target_wxid.as_deref(), Some("wxid_target"));
+        assert_eq!(event.target_name.as_deref(), Some("Bob"));
+        assert_eq!(
+            event.content_text.as_deref(),
+            Some("Alice邀请Bob加入了群聊")
+        );
+    }
+
+    #[test]
+    fn diffs_chatroom_snapshots_for_member_and_name_changes() {
+        let previous = ChatroomSnapshot {
+            chatroom_id: "12345@chatroom".to_string(),
+            chatroom_name: Some("旧群名".to_string()),
+            chatroom_version: Some(1),
+            member_count: 2,
+            member_hash: "previous".to_string(),
+            received_at: "2026-05-26T00:00:00.000Z".to_string(),
+            members: vec![member("wxid_a", "Alice"), member("wxid_b", "Bob")],
+        };
+        let current = ChatroomSnapshot {
+            chatroom_id: "12345@chatroom".to_string(),
+            chatroom_name: Some("新群名".to_string()),
+            chatroom_version: Some(2),
+            member_count: 2,
+            member_hash: "current".to_string(),
+            received_at: "2026-05-26T00:01:00.000Z".to_string(),
+            members: vec![member("wxid_b", "Bob"), member("wxid_c", "Carol")],
+        };
+
+        let events = diff_chatroom_snapshots(&previous, &current);
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(events.len(), 3);
+        assert!(event_types.contains(&ChatroomEventType::MemberJoined));
+        assert!(event_types.contains(&ChatroomEventType::MemberLeft));
+        assert!(event_types.contains(&ChatroomEventType::ChatroomNameChanged));
+        assert!(events
+            .iter()
+            .any(|event| event.member_wxid.as_deref() == Some("wxid_c")));
+        assert!(events
+            .iter()
+            .any(|event| event.member_wxid.as_deref() == Some("wxid_a")));
+    }
+
+    fn member(wxid: &str, display_name: &str) -> ChatroomMember {
+        ChatroomMember {
+            wxid: wxid.to_string(),
+            display_name: Some(display_name.to_string()),
+            flag: None,
+        }
+    }
+}

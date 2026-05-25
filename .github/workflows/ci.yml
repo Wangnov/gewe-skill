@@ -25,8 +25,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
+      - name: Test workspace
+        run: cargo test --workspace --all-targets
 
   edge:
     name: Cloudflare edge
