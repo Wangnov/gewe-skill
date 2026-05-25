@@ -7,11 +7,19 @@ use axum::{
     Json, Router,
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
-use gewe_skill_types::{ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest};
+use gewe_skill_types::{
+    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
+    ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::{env, net::SocketAddr, path::{Path as FsPath, PathBuf}, sync::Arc};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -51,14 +59,24 @@ struct IngestResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
-    let database_url = env::var("GEWE_SKILL_DATABASE_URL").unwrap_or_else(|_| "sqlite:/opt/gewe-skill-memory/data/gewe-skill-memory.sqlite?mode=rwc".to_string());
+    let database_url = env::var("GEWE_SKILL_DATABASE_URL").unwrap_or_else(|_| {
+        "sqlite:/opt/gewe-skill-memory/data/gewe-skill-memory.sqlite?mode=rwc".to_string()
+    });
     let listen = env::var("GEWE_SKILL_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
-    let attachment_dir = PathBuf::from(env::var("GEWE_SKILL_ATTACHMENT_DIR").unwrap_or_else(|_| "/opt/gewe-skill-memory/data/attachments".to_string()));
+    let attachment_dir = PathBuf::from(
+        env::var("GEWE_SKILL_ATTACHMENT_DIR")
+            .unwrap_or_else(|_| "/opt/gewe-skill-memory/data/attachments".to_string()),
+    );
     ensure_sqlite_parent(&database_url)?;
     std::fs::create_dir_all(&attachment_dir)?;
-    let db = SqlitePoolOptions::new().max_connections(8).connect(&database_url).await?;
+    let db = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
     init_db(&db).await?;
 
     let state = Arc::new(AppState {
@@ -70,17 +88,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/write/events", post(write_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
-        .route("/write/raw-events", post(write_raw_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
-        .route("/write/attachments", post(write_attachment).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
-        .route("/api/messages/recent", get(recent_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/messages/search", get(search_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/conversations", get(conversations).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/attachments/recent", get(recent_attachments).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/attachments/{sha256}/download", get(download_attachment).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/chatrooms/{chatroom_id}/snapshots", get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/chatrooms/{chatroom_id}/events", get(chatroom_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
-        .route("/api/chatrooms/{chatroom_id}/system-events", get(chatroom_system_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route(
+            "/write/events",
+            post(write_event).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/write/raw-events",
+            post(write_raw_event).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/write/attachments",
+            post(write_attachment).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/api/messages/recent",
+            get(recent_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/messages/search",
+            get(search_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/conversations",
+            get(conversations).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/attachments/recent",
+            get(recent_attachments).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/attachments/{sha256}/download",
+            get(download_attachment).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/chatrooms/{chatroom_id}/snapshots",
+            get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/chatrooms/{chatroom_id}/events",
+            get(chatroom_events).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/chatrooms/{chatroom_id}/system-events",
+            get(chatroom_system_events).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -88,7 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = listen.parse()?;
     info!(%addr, "starting gewe-skill-memory");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 
@@ -113,18 +199,42 @@ async fn shutdown_signal() {
 }
 
 async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse { ok: true, service: "gewe-skill-memory" })
+    Json(HealthResponse {
+        ok: true,
+        service: "gewe-skill-memory",
+    })
 }
 
-async fn require_write_token(State(state): State<SharedState>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
+async fn require_write_token(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
     authorize(headers, state.write_token.as_deref(), request, next).await
 }
 
-async fn require_read_token(State(state): State<SharedState>, headers: HeaderMap, request: axum::extract::Request, next: Next) -> Response {
-    authorize(headers, state.read_token.as_deref().or(state.write_token.as_deref()), request, next).await
+async fn require_read_token(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    authorize(
+        headers,
+        state.read_token.as_deref().or(state.write_token.as_deref()),
+        request,
+        next,
+    )
+    .await
 }
 
-async fn authorize(headers: HeaderMap, expected: Option<&str>, request: axum::extract::Request, next: Next) -> Response {
+async fn authorize(
+    headers: HeaderMap,
+    expected: Option<&str>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
     let Some(expected) = expected else {
         return next.run(request).await;
     };
@@ -135,14 +245,24 @@ async fn authorize(headers: HeaderMap, expected: Option<&str>, request: axum::ex
     if token == Some(expected) {
         return next.run(request).await;
     }
-    (StatusCode::UNAUTHORIZED, Json(json!({ "ok": false, "error": "unauthorized" }))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "ok": false, "error": "unauthorized" })),
+    )
+        .into_response()
 }
 
-async fn write_event(State(state): State<SharedState>, Json(request): Json<IngestEventRequest>) -> Result<Json<IngestResponse>, ApiError> {
+async fn write_event(
+    State(state): State<SharedState>,
+    Json(request): Json<IngestEventRequest>,
+) -> Result<Json<IngestResponse>, ApiError> {
     write_ingest_request(&state.db, request).await
 }
 
-async fn write_raw_event(State(state): State<SharedState>, Json(request): Json<RawCallbackRequest>) -> Result<Json<IngestResponse>, ApiError> {
+async fn write_raw_event(
+    State(state): State<SharedState>,
+    Json(request): Json<RawCallbackRequest>,
+) -> Result<Json<IngestResponse>, ApiError> {
     let normalized = normalize_callback(&request.body, request.received_at)?;
     let mut ingest = normalized.into_ingest_request();
     if let Some(current) = &ingest.chatroom_snapshot {
@@ -153,12 +273,18 @@ async fn write_raw_event(State(state): State<SharedState>, Json(request): Json<R
     write_ingest_request(&state.db, ingest).await
 }
 
-async fn write_attachment(State(state): State<SharedState>, Json(record): Json<AttachmentRecord>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn write_attachment(
+    State(state): State<SharedState>,
+    Json(record): Json<AttachmentRecord>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     insert_attachment(&state.db, &record).await?;
     Ok(Json(json!({ "ok": true, "sha256": record.sha256 })))
 }
 
-async fn write_ingest_request(db: &SqlitePool, request: IngestEventRequest) -> Result<Json<IngestResponse>, ApiError> {
+async fn write_ingest_request(
+    db: &SqlitePool,
+    request: IngestEventRequest,
+) -> Result<Json<IngestResponse>, ApiError> {
     let mut tx = db.begin().await?;
     insert_raw_event(&mut tx, &request).await?;
     insert_message(&mut tx, &request.message).await?;
@@ -173,10 +299,16 @@ async fn write_ingest_request(db: &SqlitePool, request: IngestEventRequest) -> R
     }
     tx.commit().await?;
 
-    Ok(Json(IngestResponse { ok: true, message_key: request.message.message_key }))
+    Ok(Json(IngestResponse {
+        ok: true,
+        message_key: request.message.message_key,
+    }))
 }
 
-async fn latest_chatroom_snapshot(db: &SqlitePool, chatroom_id: &str) -> Result<Option<ChatroomSnapshot>, ApiError> {
+async fn latest_chatroom_snapshot(
+    db: &SqlitePool,
+    chatroom_id: &str,
+) -> Result<Option<ChatroomSnapshot>, ApiError> {
     let row = sqlx::query(
         r#"
         SELECT snapshot_json
@@ -194,9 +326,14 @@ async fn latest_chatroom_snapshot(db: &SqlitePool, chatroom_id: &str) -> Result<
         .map_err(ApiError::from)
 }
 
-async fn recent_messages(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+async fn recent_messages(
+    State(state): State<SharedState>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
     let limit = clamp_limit(query.limit);
-    let cursor = query.cursor.unwrap_or_else(|| "9999-12-31T23:59:59.999Z".to_string());
+    let cursor = query
+        .cursor
+        .unwrap_or_else(|| "9999-12-31T23:59:59.999Z".to_string());
     let rows = sqlx::query(
         r#"
         SELECT message_json
@@ -212,13 +349,18 @@ async fn recent_messages(State(state): State<SharedState>, Query(query): Query<L
     .await?;
     let items = rows
         .iter()
-        .filter_map(|row| serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok())
+        .filter_map(|row| {
+            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok()
+        })
         .collect::<Vec<_>>();
     let next_cursor = items.last().map(|message| message.received_at.clone());
     Ok(Json(ApiPage { items, next_cursor }))
 }
 
-async fn search_messages(State(state): State<SharedState>, Query(query): Query<SearchQuery>) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+async fn search_messages(
+    State(state): State<SharedState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
     let limit = clamp_limit(query.limit);
     let pattern = format!("%{}%", query.q);
     let rows = sqlx::query(
@@ -236,13 +378,18 @@ async fn search_messages(State(state): State<SharedState>, Query(query): Query<S
     .await?;
     let items = rows
         .iter()
-        .filter_map(|row| serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok())
+        .filter_map(|row| {
+            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok()
+        })
         .collect::<Vec<_>>();
     let next_cursor = items.last().map(|message| message.received_at.clone());
     Ok(Json(ApiPage { items, next_cursor }))
 }
 
-async fn conversations(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ConversationSummary>>, ApiError> {
+async fn conversations(
+    State(state): State<SharedState>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<ConversationSummary>>, ApiError> {
     let limit = clamp_limit(query.limit);
     let rows = sqlx::query(
         r#"
@@ -270,14 +417,20 @@ async fn conversations(State(state): State<SharedState>, Query(query): Query<Lim
             message_count: row.get("message_count"),
         })
         .collect();
-    Ok(Json(ApiPage { items, next_cursor: None }))
+    Ok(Json(ApiPage {
+        items,
+        next_cursor: None,
+    }))
 }
 
-async fn recent_attachments(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<AttachmentRecord>>, ApiError> {
+async fn recent_attachments(
+    State(state): State<SharedState>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<AttachmentRecord>>, ApiError> {
     let limit = clamp_limit(query.limit);
     let rows = sqlx::query(
         r#"
-        SELECT attachment_json
+        SELECT id, attachment_json
         FROM attachments
         ORDER BY created_at DESC, id DESC
         LIMIT ?
@@ -288,14 +441,30 @@ async fn recent_attachments(State(state): State<SharedState>, Query(query): Quer
     .await?;
     let items = rows
         .iter()
-        .filter_map(|row| serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json")).ok())
+        .filter_map(|row| {
+            let mut record =
+                serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))
+                    .ok()?;
+            record.id = Some(row.get("id"));
+            Some(record)
+        })
         .collect::<Vec<_>>();
-    Ok(Json(ApiPage { items, next_cursor: None }))
+    Ok(Json(ApiPage {
+        items,
+        next_cursor: None,
+    }))
 }
 
-async fn download_attachment(State(state): State<SharedState>, Path(sha256): Path<String>) -> Result<Response, ApiError> {
+async fn download_attachment(
+    State(state): State<SharedState>,
+    Path(sha256): Path<String>,
+) -> Result<Response, ApiError> {
     if !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) || sha256.len() != 64 {
-        return Ok((StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": "invalid_sha256" }))).into_response());
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_sha256" })),
+        )
+            .into_response());
     }
     let row = sqlx::query(
         r#"
@@ -310,46 +479,113 @@ async fn download_attachment(State(state): State<SharedState>, Path(sha256): Pat
     .fetch_optional(&state.db)
     .await?;
     let Some(row) = row else {
-        return Ok((StatusCode::NOT_FOUND, Json(json!({ "ok": false, "error": "attachment_not_found" }))).into_response());
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "attachment_not_found" })),
+        )
+            .into_response());
     };
     let object_key: String = row.get("object_key");
     let path = safe_attachment_path(&state.attachment_dir, &object_key);
     let Some(path) = path else {
-        return Ok((StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": "invalid_object_key" }))).into_response());
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "invalid_object_key" })),
+        )
+            .into_response());
     };
     let bytes = tokio::fs::read(path).await.map_err(ApiError::Io)?;
     let mime_type: Option<String> = row.get("mime_type");
     Ok((
-        [("content-type", mime_type.unwrap_or_else(|| "application/octet-stream".to_string()))],
+        [(
+            "content-type",
+            mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        )],
         bytes,
-    ).into_response())
+    )
+        .into_response())
 }
 
-async fn chatroom_snapshots(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomSnapshot>>, ApiError> {
-    let rows = query_json_rows(&state.db, "chatroom_snapshots", "snapshot_json", &chatroom_id, clamp_limit(query.limit)).await?;
-    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+async fn chatroom_snapshots(
+    State(state): State<SharedState>,
+    Path(chatroom_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<ChatroomSnapshot>>, ApiError> {
+    let rows = query_json_rows(
+        &state.db,
+        "chatroom_snapshots",
+        "snapshot_json",
+        &chatroom_id,
+        clamp_limit(query.limit),
+    )
+    .await?;
+    Ok(Json(ApiPage {
+        items: rows,
+        next_cursor: None,
+    }))
 }
 
-async fn chatroom_events(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomMemberEvent>>, ApiError> {
-    let rows = query_json_rows(&state.db, "chatroom_member_events", "event_json", &chatroom_id, clamp_limit(query.limit)).await?;
-    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+async fn chatroom_events(
+    State(state): State<SharedState>,
+    Path(chatroom_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<ChatroomMemberEvent>>, ApiError> {
+    let rows = query_json_rows(
+        &state.db,
+        "chatroom_member_events",
+        "event_json",
+        &chatroom_id,
+        clamp_limit(query.limit),
+    )
+    .await?;
+    Ok(Json(ApiPage {
+        items: rows,
+        next_cursor: None,
+    }))
 }
 
-async fn chatroom_system_events(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomSystemEvent>>, ApiError> {
-    let rows = query_json_rows(&state.db, "chatroom_system_events", "event_json", &chatroom_id, clamp_limit(query.limit)).await?;
-    Ok(Json(ApiPage { items: rows, next_cursor: None }))
+async fn chatroom_system_events(
+    State(state): State<SharedState>,
+    Path(chatroom_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<ApiPage<ChatroomSystemEvent>>, ApiError> {
+    let rows = query_json_rows(
+        &state.db,
+        "chatroom_system_events",
+        "event_json",
+        &chatroom_id,
+        clamp_limit(query.limit),
+    )
+    .await?;
+    Ok(Json(ApiPage {
+        items: rows,
+        next_cursor: None,
+    }))
 }
 
-async fn query_json_rows<T: serde::de::DeserializeOwned>(db: &SqlitePool, table: &str, json_column: &str, chatroom_id: &str, limit: i64) -> Result<Vec<T>, ApiError> {
+async fn query_json_rows<T: serde::de::DeserializeOwned>(
+    db: &SqlitePool,
+    table: &str,
+    json_column: &str,
+    chatroom_id: &str,
+    limit: i64,
+) -> Result<Vec<T>, ApiError> {
     let sql = format!("SELECT {json_column} AS payload FROM {table} WHERE chatroom_id = ? ORDER BY received_at DESC, id DESC LIMIT ?");
-    let rows = sqlx::query(&sql).bind(chatroom_id).bind(limit).fetch_all(db).await?;
+    let rows = sqlx::query(&sql)
+        .bind(chatroom_id)
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
     Ok(rows
         .iter()
         .filter_map(|row| serde_json::from_str::<T>(row.get::<&str, _>("payload")).ok())
         .collect())
 }
 
-async fn insert_raw_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, request: &IngestEventRequest) -> Result<(), ApiError> {
+async fn insert_raw_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request: &IngestEventRequest,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO raw_events (dedupe_key, schema_version, appid, account_wxid, received_at, body_sha256, body_json)
@@ -369,7 +605,10 @@ async fn insert_raw_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, request:
     Ok(())
 }
 
-async fn insert_message(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, message: &NormalizedMessage) -> Result<(), ApiError> {
+async fn insert_message(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &NormalizedMessage,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO messages (message_key, appid, account_wxid, conversation_id, sender_wxid, kind, is_group, is_outgoing, received_at, content_text, message_json)
@@ -393,7 +632,11 @@ async fn insert_message(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, message: &
     Ok(())
 }
 
-async fn insert_chatroom_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, message_key: &str, snapshot: &ChatroomSnapshot) -> Result<(), ApiError> {
+async fn insert_chatroom_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_key: &str,
+    snapshot: &ChatroomSnapshot,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO chatroom_snapshots (message_key, chatroom_id, chatroom_name, member_count, member_hash, received_at, snapshot_json)
@@ -413,7 +656,10 @@ async fn insert_chatroom_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, 
     Ok(())
 }
 
-async fn insert_chatroom_member_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, event: &ChatroomMemberEvent) -> Result<(), ApiError> {
+async fn insert_chatroom_member_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &ChatroomMemberEvent,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO chatroom_member_events (event_key, event_type, chatroom_id, member_wxid, received_at, event_json)
@@ -432,7 +678,10 @@ async fn insert_chatroom_member_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlit
     Ok(())
 }
 
-async fn insert_chatroom_system_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, event: &ChatroomSystemEvent) -> Result<(), ApiError> {
+async fn insert_chatroom_system_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &ChatroomSystemEvent,
+) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         INSERT INTO chatroom_system_events (event_key, event_type, chatroom_id, actor_wxid, target_wxid, received_at, event_json)
@@ -538,7 +787,9 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_conversation_received ON messages(conversation_id, received_at DESC)").execute(db).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at DESC)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at DESC)")
+        .execute(db)
+        .await?;
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS chatroom_snapshots (
@@ -613,8 +864,14 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(db)
     .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_key)").execute(db).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_created ON attachments(created_at DESC)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_key)")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_created ON attachments(created_at DESC)",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -666,6 +923,10 @@ impl IntoResponse for ApiError {
             Self::Core(error) => error.to_string(),
             Self::Io(error) => error.to_string(),
         };
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "ok": false, "error": message }))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": message })),
+        )
+            .into_response()
     }
 }

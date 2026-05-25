@@ -5,12 +5,23 @@ use gewe_skill_types::{AttachmentKind, AttachmentRecord, RawCallbackRequest};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
-#[command(name = "gewe-skill", version, about = "Operate and query gewe-skill memory")]
+#[command(
+    name = "gewe-skill",
+    version,
+    about = "Operate and query gewe-skill memory"
+)]
 struct Cli {
-    #[arg(long, env = "GEWE_SKILL_BASE_URL", default_value = "http://127.0.0.1:8788")]
+    #[arg(
+        long,
+        env = "GEWE_SKILL_BASE_URL",
+        default_value = "http://127.0.0.1:8788"
+    )]
     base_url: String,
 
     #[arg(long, env = "GEWE_SKILL_READ_TOKEN")]
@@ -49,6 +60,13 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Download one synced attachment from memory by sha256.
+    AttachmentDownload {
+        #[arg(long)]
+        sha256: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// List chatroom member diff events.
     ChatroomEvents {
         #[arg(long)]
@@ -79,7 +97,11 @@ enum Command {
     },
     /// Pull raw events from gewe-skill-edge admin export and write them to memory.
     SyncEdge {
-        #[arg(long, env = "GEWE_SKILL_EDGE_URL", default_value = "https://gewe-agent.wangnov-ai.com")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
         edge_url: String,
         #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN")]
         admin_token: String,
@@ -87,12 +109,20 @@ enum Command {
         after_raw_event_id: Option<i64>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
-        #[arg(long, env = "GEWE_SKILL_SYNC_CURSOR_FILE", default_value = "/opt/gewe-skill-memory/data/edge-sync.cursor")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_SYNC_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-sync.cursor"
+        )]
         cursor_file: PathBuf,
     },
     /// Pull completed attachments from gewe-skill-edge and store them locally.
     SyncEdgeAttachments {
-        #[arg(long, env = "GEWE_SKILL_EDGE_URL", default_value = "https://gewe-agent.wangnov-ai.com")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
         edge_url: String,
         #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN")]
         admin_token: String,
@@ -100,9 +130,17 @@ enum Command {
         after_job_id: Option<i64>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
-        #[arg(long, env = "GEWE_SKILL_ATTACHMENT_CURSOR_FILE", default_value = "/opt/gewe-skill-memory/data/edge-attachment-sync.cursor")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-attachment-sync.cursor"
+        )]
         cursor_file: PathBuf,
-        #[arg(long, env = "GEWE_SKILL_ATTACHMENT_DIR", default_value = "/opt/gewe-skill-memory/data/attachments")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_DIR",
+            default_value = "/opt/gewe-skill-memory/data/attachments"
+        )]
         attachment_dir: PathBuf,
     },
 }
@@ -153,9 +191,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Recent { limit } => print_json(client.recent_messages(Some(limit)).await?)?,
         Command::Search { q, limit } => print_json(client.search_messages(&q, Some(limit)).await?)?,
         Command::Conversations { limit } => print_json(client.conversations(Some(limit)).await?)?,
-        Command::Attachments { limit } => print_json(client.recent_attachments(Some(limit)).await?)?,
-        Command::ChatroomEvents { chatroom_id, limit } => print_json(client.chatroom_events(&chatroom_id, Some(limit)).await?)?,
-        Command::ChatroomSystemEvents { chatroom_id, limit } => print_json(client.chatroom_system_events(&chatroom_id, Some(limit)).await?)?,
+        Command::Attachments { limit } => {
+            print_json(client.recent_attachments(Some(limit)).await?)?
+        }
+        Command::AttachmentDownload { sha256, output } => {
+            let bytes = client.download_attachment(&sha256).await?;
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&output, &bytes)?;
+            print_json(serde_json::json!({
+                "ok": true,
+                "sha256": sha256,
+                "output": output,
+                "size_bytes": bytes.len()
+            }))?;
+        }
+        Command::ChatroomEvents { chatroom_id, limit } => {
+            print_json(client.chatroom_events(&chatroom_id, Some(limit)).await?)?
+        }
+        Command::ChatroomSystemEvents { chatroom_id, limit } => print_json(
+            client
+                .chatroom_system_events(&chatroom_id, Some(limit))
+                .await?,
+        )?,
         Command::Normalize { file, received_at } => {
             let payload = normalize_file(file, received_at)?;
             print_json(payload)?;
@@ -164,12 +223,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let payload = normalize_file(file, received_at)?;
             print_json(client.write_event(&payload).await?)?;
         }
-        Command::SyncEdge { edge_url, admin_token, after_raw_event_id, limit, cursor_file } => {
-            let result = sync_edge(&client, &edge_url, &admin_token, after_raw_event_id, limit, cursor_file).await?;
+        Command::SyncEdge {
+            edge_url,
+            admin_token,
+            after_raw_event_id,
+            limit,
+            cursor_file,
+        } => {
+            let result = sync_edge(
+                &client,
+                &edge_url,
+                &admin_token,
+                after_raw_event_id,
+                limit,
+                cursor_file,
+            )
+            .await?;
             print_json(result)?;
         }
-        Command::SyncEdgeAttachments { edge_url, admin_token, after_job_id, limit, cursor_file, attachment_dir } => {
-            let result = sync_edge_attachments(&client, &edge_url, &admin_token, after_job_id, limit, cursor_file, attachment_dir).await?;
+        Command::SyncEdgeAttachments {
+            edge_url,
+            admin_token,
+            after_job_id,
+            limit,
+            cursor_file,
+            attachment_dir,
+        } => {
+            let result = sync_edge_attachments(
+                &client,
+                &edge_url,
+                &admin_token,
+                after_job_id,
+                limit,
+                cursor_file,
+                attachment_dir,
+            )
+            .await?;
             print_json(result)?;
         }
     }
@@ -188,7 +277,10 @@ fn build_client(cli: &Cli) -> Result<GeweSkillClient, Box<dyn std::error::Error>
     Ok(client)
 }
 
-fn normalize_file(path: PathBuf, received_at: Option<String>) -> Result<gewe_skill_types::IngestEventRequest, Box<dyn std::error::Error>> {
+fn normalize_file(
+    path: PathBuf,
+    received_at: Option<String>,
+) -> Result<gewe_skill_types::IngestEventRequest, Box<dyn std::error::Error>> {
     let text = fs::read_to_string(path)?;
     let json: Value = serde_json::from_str(&text)?;
     let received_at = received_at.unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
@@ -203,9 +295,11 @@ async fn sync_edge(
     limit: u32,
     cursor_file: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let after_raw_event_id = after_raw_event_id.unwrap_or_else(|| read_cursor(&cursor_file).unwrap_or(0));
+    let after_raw_event_id =
+        after_raw_event_id.unwrap_or_else(|| read_cursor(&cursor_file).unwrap_or(0));
     let edge_url = edge_url.trim_end_matches('/');
-    let export_url = format!("{edge_url}/admin/export?after_raw_event_id={after_raw_event_id}&limit={limit}");
+    let export_url =
+        format!("{edge_url}/admin/export?after_raw_event_id={after_raw_event_id}&limit={limit}");
     let export: EdgeExportResponse = reqwest::Client::new()
         .get(export_url)
         .bearer_auth(admin_token)
@@ -278,7 +372,8 @@ async fn sync_edge_attachments(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let after_job_id = after_job_id.unwrap_or_else(|| read_cursor(&cursor_file).unwrap_or(0));
     let edge_url = edge_url.trim_end_matches('/');
-    let manifest_url = format!("{edge_url}/admin/attachments?after_job_id={after_job_id}&limit={limit}");
+    let manifest_url =
+        format!("{edge_url}/admin/attachments?after_job_id={after_job_id}&limit={limit}");
     let http = reqwest::Client::new();
     let manifest: EdgeAttachmentResponse = http
         .get(manifest_url)
@@ -294,7 +389,8 @@ async fn sync_edge_attachments(
     let mut last_job_id = after_job_id;
     for item in &manifest.attachments {
         last_job_id = item.job_id;
-        match sync_one_attachment(client, &http, edge_url, admin_token, item, &attachment_dir).await {
+        match sync_one_attachment(client, &http, edge_url, admin_token, item, &attachment_dir).await
+        {
             Ok(_) => written += 1,
             Err(error) => failed.push(serde_json::json!({
                 "job_id": item.job_id,
@@ -343,8 +439,15 @@ async fn sync_one_attachment(
     }
 
     let kind = parse_attachment_kind(&item.asset_type);
-    let message_key = item.message_key.clone().unwrap_or_else(|| item.job_key.clone().unwrap_or_else(|| format!("edge-job:{}", item.job_id)));
-    let raw_event_dedupe_key = item.raw_event_dedupe_key.clone().unwrap_or_else(|| message_key.clone());
+    let message_key = item.message_key.clone().unwrap_or_else(|| {
+        item.job_key
+            .clone()
+            .unwrap_or_else(|| format!("edge-job:{}", item.job_id))
+    });
+    let raw_event_dedupe_key = item
+        .raw_event_dedupe_key
+        .clone()
+        .unwrap_or_else(|| message_key.clone());
     let record = AttachmentRecord {
         id: None,
         edge_job_id: Some(item.job_id),
@@ -360,7 +463,11 @@ async fn sync_one_attachment(
         sha256: Some(sha256),
         size_bytes: Some(item.size_bytes.unwrap_or(bytes.len() as i64)),
         mime_type: item.mime_type.clone(),
-        created_at: item.completed_at.clone().or_else(|| item.created_at.clone()).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string()),
+        created_at: item
+            .completed_at
+            .clone()
+            .or_else(|| item.created_at.clone())
+            .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string()),
     };
     client.write_attachment(&record).await?;
     Ok(())

@@ -1,8 +1,8 @@
 //! Rust SDK for the `gewe-skill-memory` API.
 
 use gewe_skill_types::{
-    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
-    IngestEventRequest, NormalizedMessage, RawCallbackRequest,
+    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
+    ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -55,19 +55,32 @@ impl GeweSkillClient {
         self.get_json("healthz", None).await
     }
 
-    pub async fn write_event(&self, request: &IngestEventRequest) -> Result<serde_json::Value, ClientError> {
+    pub async fn write_event(
+        &self,
+        request: &IngestEventRequest,
+    ) -> Result<serde_json::Value, ClientError> {
         self.post_write_json("write/events", request).await
     }
 
-    pub async fn write_raw_event(&self, request: &RawCallbackRequest) -> Result<serde_json::Value, ClientError> {
+    pub async fn write_raw_event(
+        &self,
+        request: &RawCallbackRequest,
+    ) -> Result<serde_json::Value, ClientError> {
         self.post_write_json("write/raw-events", request).await
     }
 
-    pub async fn write_attachment(&self, request: &AttachmentRecord) -> Result<serde_json::Value, ClientError> {
+    pub async fn write_attachment(
+        &self,
+        request: &AttachmentRecord,
+    ) -> Result<serde_json::Value, ClientError> {
         self.post_write_json("write/attachments", request).await
     }
 
-    async fn post_write_json<T: serde::Serialize + ?Sized>(&self, path: &str, request: &T) -> Result<serde_json::Value, ClientError> {
+    async fn post_write_json<T: serde::Serialize + ?Sized>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<serde_json::Value, ClientError> {
         let response = self
             .http
             .post(self.url(path)?)
@@ -78,15 +91,23 @@ impl GeweSkillClient {
         Self::decode_response(response).await
     }
 
-    pub async fn recent_messages(&self, limit: Option<u32>) -> Result<ApiPage<NormalizedMessage>, ClientError> {
+    pub async fn recent_messages(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<NormalizedMessage>, ClientError> {
         self.get_json("api/messages/recent", limit).await
     }
 
-    pub async fn search_messages(&self, query: &str, limit: Option<u32>) -> Result<ApiPage<NormalizedMessage>, ClientError> {
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<NormalizedMessage>, ClientError> {
         let mut url = self.url("api/messages/search")?;
         url.query_pairs_mut().append_pair("q", query);
         if let Some(limit) = limit {
-            url.query_pairs_mut().append_pair("limit", &limit.to_string());
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
         }
         let mut request = self.http.get(url);
         if let Some(token) = &self.read_token {
@@ -95,30 +116,71 @@ impl GeweSkillClient {
         Self::decode_response(request.send().await?).await
     }
 
-    pub async fn conversations(&self, limit: Option<u32>) -> Result<ApiPage<ConversationSummary>, ClientError> {
+    pub async fn conversations(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<ConversationSummary>, ClientError> {
         self.get_json("api/conversations", limit).await
     }
 
-    pub async fn recent_attachments(&self, limit: Option<u32>) -> Result<ApiPage<AttachmentRecord>, ClientError> {
+    pub async fn recent_attachments(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<AttachmentRecord>, ClientError> {
         self.get_json("api/attachments/recent", limit).await
     }
 
-    pub async fn chatroom_snapshots(&self, chatroom_id: &str, limit: Option<u32>) -> Result<ApiPage<ChatroomSnapshot>, ClientError> {
-        self.get_json(&format!("api/chatrooms/{chatroom_id}/snapshots"), limit).await
+    pub async fn download_attachment(&self, sha256: &str) -> Result<Vec<u8>, ClientError> {
+        let path = format!("api/attachments/{sha256}/download");
+        let mut request = self.http.get(self.url(&path)?);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response.bytes().await?.to_vec());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Err(ClientError::Api { status, body })
     }
 
-    pub async fn chatroom_events(&self, chatroom_id: &str, limit: Option<u32>) -> Result<ApiPage<ChatroomMemberEvent>, ClientError> {
-        self.get_json(&format!("api/chatrooms/{chatroom_id}/events"), limit).await
+    pub async fn chatroom_snapshots(
+        &self,
+        chatroom_id: &str,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<ChatroomSnapshot>, ClientError> {
+        self.get_json(&format!("api/chatrooms/{chatroom_id}/snapshots"), limit)
+            .await
     }
 
-    pub async fn chatroom_system_events(&self, chatroom_id: &str, limit: Option<u32>) -> Result<ApiPage<ChatroomSystemEvent>, ClientError> {
-        self.get_json(&format!("api/chatrooms/{chatroom_id}/system-events"), limit).await
+    pub async fn chatroom_events(
+        &self,
+        chatroom_id: &str,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<ChatroomMemberEvent>, ClientError> {
+        self.get_json(&format!("api/chatrooms/{chatroom_id}/events"), limit)
+            .await
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str, limit: Option<u32>) -> Result<T, ClientError> {
+    pub async fn chatroom_system_events(
+        &self,
+        chatroom_id: &str,
+        limit: Option<u32>,
+    ) -> Result<ApiPage<ChatroomSystemEvent>, ClientError> {
+        self.get_json(&format!("api/chatrooms/{chatroom_id}/system-events"), limit)
+            .await
+    }
+
+    async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        limit: Option<u32>,
+    ) -> Result<T, ClientError> {
         let mut url = self.url(path)?;
         if let Some(limit) = limit {
-            url.query_pairs_mut().append_pair("limit", &limit.to_string());
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
         }
         let mut request = self.http.get(url);
         if let Some(token) = &self.read_token {
@@ -131,7 +193,9 @@ impl GeweSkillClient {
         Ok(self.base_url.join(path.trim_start_matches('/'))?)
     }
 
-    async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ClientError> {
+    async fn decode_response<T: DeserializeOwned>(
+        response: reqwest::Response,
+    ) -> Result<T, ClientError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response.json().await?);

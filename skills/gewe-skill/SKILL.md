@@ -26,6 +26,7 @@ gewe-skill recent --limit 20
 gewe-skill search --q '<keyword>' --limit 20
 gewe-skill conversations --limit 50
 gewe-skill attachments --limit 20
+gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
 gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 50
 gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 50
 ```
@@ -74,7 +75,7 @@ gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.00
 
 1. Run `gewe-skill attachments --limit 20`.
 2. Use `kind`, `mime_type`, `size_bytes`, `message_key`, and `sha256` when referencing attachment evidence.
-3. Download bytes only through the read-authenticated memory API when the user asks to inspect actual media or file content.
+3. Download bytes with `gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin` only when the user asks to inspect actual media or file content.
 
 ## Interpretation rules
 
