@@ -78,6 +78,19 @@ impl GeweSkillClient {
         self.get_json("api/messages/recent", limit).await
     }
 
+    pub async fn search_messages(&self, query: &str, limit: Option<u32>) -> Result<ApiPage<NormalizedMessage>, ClientError> {
+        let mut url = self.url("api/messages/search")?;
+        url.query_pairs_mut().append_pair("q", query);
+        if let Some(limit) = limit {
+            url.query_pairs_mut().append_pair("limit", &limit.to_string());
+        }
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
     pub async fn conversations(&self, limit: Option<u32>) -> Result<ApiPage<ConversationSummary>, ClientError> {
         self.get_json("api/conversations", limit).await
     }
