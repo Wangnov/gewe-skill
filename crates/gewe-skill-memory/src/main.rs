@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
-use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage};
+use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
@@ -40,12 +40,6 @@ struct HealthResponse {
 struct IngestResponse {
     ok: bool,
     message_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCallbackRequest {
-    received_at: String,
-    body: Value,
 }
 
 #[tokio::main]

@@ -186,6 +186,12 @@ pub struct IngestEventRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawCallbackRequest {
+    pub received_at: Timestamp,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiPage<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
