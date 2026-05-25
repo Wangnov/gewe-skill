@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / Cloudflare
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+!.dev.vars.example
+
+# Runtime data and secrets
+data/
+secrets/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+attachments/
+raw/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
