@@ -1,0 +1,17 @@
+{
+  "name": "gewe-skill-edge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "check": "wrangler check",
+    "tail": "wrangler tail",
+    "migrate:local": "wrangler d1 migrations apply gewe_skill_edge --local",
+    "migrate:remote": "wrangler d1 migrations apply gewe_skill_edge --remote"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.84.1"
+  }
+}
