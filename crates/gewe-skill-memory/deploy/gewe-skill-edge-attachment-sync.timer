@@ -1,0 +1,12 @@
+[Unit]
+Description=Run gewe-skill edge attachment sync every five minutes
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=gewe-skill-edge-attachment-sync.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
