@@ -91,10 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_client(cli: &Cli) -> Result<GeweSkillClient, Box<dyn std::error::Error>> {
     let mut client = GeweSkillClient::new(&cli.base_url)?;
     if let Some(token) = &cli.read_token {
-        client = client.with_read_token(token);
+        client = client.with_read_token(token.clone());
     }
     if let Some(token) = &cli.write_token {
-        client = client.with_write_token(token);
+        client = client.with_write_token(token.clone());
     }
     Ok(client)
 }
