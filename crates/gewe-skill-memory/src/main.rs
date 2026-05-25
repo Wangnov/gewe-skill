@@ -11,7 +11,7 @@ use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomS
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::{env, net::SocketAddr, path::Path, sync::Arc};
+use std::{env, net::SocketAddr, path::Path as FsPath, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
@@ -92,7 +92,7 @@ fn ensure_sqlite_parent(database_url: &str) -> std::io::Result<()> {
     if path == ":memory:" {
         return Ok(());
     }
-    if let Some(parent) = Path::new(path).parent() {
+    if let Some(parent) = FsPath::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
