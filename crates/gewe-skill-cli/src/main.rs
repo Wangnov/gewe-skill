@@ -87,7 +87,7 @@ struct EdgeExportResponse {
 struct EdgeExportEvent {
     raw_event_id: i64,
     received_at: String,
-    body: Value,
+    body: Option<Value>,
 }
 
 #[tokio::main]
@@ -155,22 +155,38 @@ async fn sync_edge(
         .await?;
 
     let mut written = 0usize;
+    let mut failed = Vec::new();
     let mut last_raw_event_id = after_raw_event_id;
     for event in &export.events {
         last_raw_event_id = event.raw_event_id;
-        client
+        let Some(body) = &event.body else {
+            failed.push(serde_json::json!({
+                "raw_event_id": event.raw_event_id,
+                "error": "missing_body"
+            }));
+            continue;
+        };
+        match client
             .write_raw_event(&RawCallbackRequest {
                 received_at: event.received_at.clone(),
-                body: event.body.clone(),
+                body: body.clone(),
             })
-            .await?;
-        written += 1;
+            .await
+        {
+            Ok(_) => written += 1,
+            Err(error) => failed.push(serde_json::json!({
+                "raw_event_id": event.raw_event_id,
+                "error": error.to_string()
+            })),
+        }
     }
 
     Ok(serde_json::json!({
         "ok": true,
         "scanned": export.events.len(),
         "written": written,
+        "failed": failed,
+        "failed_count": failed.len(),
         "after_raw_event_id": after_raw_event_id,
         "last_raw_event_id": last_raw_event_id,
         "next_after_raw_event_id": export.next_after_raw_event_id
