@@ -5,12 +5,14 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "check": "wrangler check",
+    "check": "tsc --noEmit",
     "tail": "wrangler tail",
     "migrate:local": "wrangler d1 migrations apply gewe_skill_edge --local",
-    "migrate:remote": "wrangler d1 migrations apply gewe_skill_edge --remote"
+    "migrate:remote": "wrangler d1 migrations apply gewe_skill_edge --remote",
+    "check:startup": "wrangler check startup"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260525.1",
     "typescript": "^5.9.3",
     "wrangler": "^4.84.1"
   }

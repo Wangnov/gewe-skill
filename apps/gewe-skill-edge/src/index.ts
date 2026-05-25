@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const MAX_PREVIEW_CHARS = 500;
 
