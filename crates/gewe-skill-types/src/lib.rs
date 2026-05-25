@@ -102,6 +102,8 @@ pub struct NormalizedMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentRecord {
     pub id: Option<i64>,
+    pub edge_job_id: Option<i64>,
+    pub job_key: Option<String>,
     pub message_key: String,
     pub raw_event_dedupe_key: String,
     pub appid: String,

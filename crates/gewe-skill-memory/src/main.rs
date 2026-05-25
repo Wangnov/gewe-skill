@@ -7,17 +7,18 @@ use axum::{
     Json, Router,
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
-use gewe_skill_types::{ApiPage, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest};
+use gewe_skill_types::{ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
-use std::{env, net::SocketAddr, path::Path as FsPath, sync::Arc};
+use std::{env, net::SocketAddr, path::{Path as FsPath, PathBuf}, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
+    attachment_dir: PathBuf,
     read_token: Option<String>,
     write_token: Option<String>,
 }
@@ -54,12 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = env::var("GEWE_SKILL_DATABASE_URL").unwrap_or_else(|_| "sqlite:/opt/gewe-skill-memory/data/gewe-skill-memory.sqlite?mode=rwc".to_string());
     let listen = env::var("GEWE_SKILL_LISTEN").unwrap_or_else(|_| "127.0.0.1:8788".to_string());
+    let attachment_dir = PathBuf::from(env::var("GEWE_SKILL_ATTACHMENT_DIR").unwrap_or_else(|_| "/opt/gewe-skill-memory/data/attachments".to_string()));
     ensure_sqlite_parent(&database_url)?;
+    std::fs::create_dir_all(&attachment_dir)?;
     let db = SqlitePoolOptions::new().max_connections(8).connect(&database_url).await?;
     init_db(&db).await?;
 
     let state = Arc::new(AppState {
         db,
+        attachment_dir,
         read_token: env::var("GEWE_SKILL_READ_TOKEN").ok(),
         write_token: env::var("GEWE_SKILL_WRITE_TOKEN").ok(),
     });
@@ -68,9 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(healthz))
         .route("/write/events", post(write_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
         .route("/write/raw-events", post(write_raw_event).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
+        .route("/write/attachments", post(write_attachment).route_layer(middleware::from_fn_with_state(state.clone(), require_write_token)))
         .route("/api/messages/recent", get(recent_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/messages/search", get(search_messages).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/conversations", get(conversations).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/attachments/recent", get(recent_attachments).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
+        .route("/api/attachments/{sha256}/download", get(download_attachment).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/snapshots", get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/events", get(chatroom_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
         .route("/api/chatrooms/{chatroom_id}/system-events", get(chatroom_system_events).route_layer(middleware::from_fn_with_state(state.clone(), require_read_token)))
@@ -144,6 +151,11 @@ async fn write_raw_event(State(state): State<SharedState>, Json(request): Json<R
         }
     }
     write_ingest_request(&state.db, ingest).await
+}
+
+async fn write_attachment(State(state): State<SharedState>, Json(record): Json<AttachmentRecord>) -> Result<Json<serde_json::Value>, ApiError> {
+    insert_attachment(&state.db, &record).await?;
+    Ok(Json(json!({ "ok": true, "sha256": record.sha256 })))
 }
 
 async fn write_ingest_request(db: &SqlitePool, request: IngestEventRequest) -> Result<Json<IngestResponse>, ApiError> {
@@ -259,6 +271,58 @@ async fn conversations(State(state): State<SharedState>, Query(query): Query<Lim
         })
         .collect();
     Ok(Json(ApiPage { items, next_cursor: None }))
+}
+
+async fn recent_attachments(State(state): State<SharedState>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<AttachmentRecord>>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let rows = sqlx::query(
+        r#"
+        SELECT attachment_json
+        FROM attachments
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    let items = rows
+        .iter()
+        .filter_map(|row| serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json")).ok())
+        .collect::<Vec<_>>();
+    Ok(Json(ApiPage { items, next_cursor: None }))
+}
+
+async fn download_attachment(State(state): State<SharedState>, Path(sha256): Path<String>) -> Result<Response, ApiError> {
+    if !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) || sha256.len() != 64 {
+        return Ok((StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": "invalid_sha256" }))).into_response());
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT object_key, mime_type
+        FROM attachments
+        WHERE sha256 = ?
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&sha256)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(row) = row else {
+        return Ok((StatusCode::NOT_FOUND, Json(json!({ "ok": false, "error": "attachment_not_found" }))).into_response());
+    };
+    let object_key: String = row.get("object_key");
+    let path = safe_attachment_path(&state.attachment_dir, &object_key);
+    let Some(path) = path else {
+        return Ok((StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": "invalid_object_key" }))).into_response());
+    };
+    let bytes = tokio::fs::read(path).await.map_err(ApiError::Io)?;
+    let mime_type: Option<String> = row.get("mime_type");
+    Ok((
+        [("content-type", mime_type.unwrap_or_else(|| "application/octet-stream".to_string()))],
+        bytes,
+    ).into_response())
 }
 
 async fn chatroom_snapshots(State(state): State<SharedState>, Path(chatroom_id): Path<String>, Query(query): Query<LimitQuery>) -> Result<Json<ApiPage<ChatroomSnapshot>>, ApiError> {
@@ -388,6 +452,42 @@ async fn insert_chatroom_system_event(tx: &mut sqlx::Transaction<'_, sqlx::Sqlit
     Ok(())
 }
 
+async fn insert_attachment(db: &SqlitePool, record: &AttachmentRecord) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO attachments (
+          edge_job_id, job_key, message_key, raw_event_dedupe_key, appid, account_wxid,
+          kind, variant, object_key, sha256, size_bytes, mime_type, source_url,
+          created_at, attachment_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sha256) DO UPDATE SET
+          edge_job_id = COALESCE(excluded.edge_job_id, attachments.edge_job_id),
+          job_key = COALESCE(excluded.job_key, attachments.job_key),
+          message_key = excluded.message_key,
+          raw_event_dedupe_key = excluded.raw_event_dedupe_key,
+          attachment_json = excluded.attachment_json
+        "#,
+    )
+    .bind(record.edge_job_id)
+    .bind(&record.job_key)
+    .bind(&record.message_key)
+    .bind(&record.raw_event_dedupe_key)
+    .bind(&record.appid)
+    .bind(&record.account_wxid)
+    .bind(format!("{:?}", record.kind))
+    .bind(&record.variant)
+    .bind(&record.object_key)
+    .bind(&record.sha256)
+    .bind(record.size_bytes)
+    .bind(&record.mime_type)
+    .bind(&record.source_url)
+    .bind(&record.created_at)
+    .bind(serde_json::to_string(record)?)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(50).clamp(1, 200)
 }
@@ -489,7 +589,41 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(db)
     .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_chatroom_system_events_chatroom_received ON chatroom_system_events(chatroom_id, received_at DESC)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS attachments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          edge_job_id INTEGER UNIQUE,
+          job_key TEXT,
+          message_key TEXT NOT NULL,
+          raw_event_dedupe_key TEXT NOT NULL,
+          appid TEXT NOT NULL,
+          account_wxid TEXT,
+          kind TEXT NOT NULL,
+          variant TEXT,
+          object_key TEXT NOT NULL,
+          sha256 TEXT NOT NULL UNIQUE,
+          size_bytes INTEGER,
+          mime_type TEXT,
+          source_url TEXT,
+          created_at TEXT NOT NULL,
+          attachment_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_key)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_created ON attachments(created_at DESC)").execute(db).await?;
     Ok(())
+}
+
+fn safe_attachment_path(root: &FsPath, object_key: &str) -> Option<PathBuf> {
+    let relative = FsPath::new(object_key);
+    if relative.is_absolute() || object_key.contains("..") {
+        return None;
+    }
+    Some(root.join(relative))
 }
 
 #[derive(Debug)]
@@ -497,6 +631,7 @@ enum ApiError {
     Sqlx(sqlx::Error),
     Serde(serde_json::Error),
     Core(gewe_skill_core::CoreError),
+    Io(std::io::Error),
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -517,12 +652,19 @@ impl From<gewe_skill_core::CoreError> for ApiError {
     }
 }
 
+impl From<std::io::Error> for ApiError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = match self {
             Self::Sqlx(error) => error.to_string(),
             Self::Serde(error) => error.to_string(),
             Self::Core(error) => error.to_string(),
+            Self::Io(error) => error.to_string(),
         };
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "ok": false, "error": message }))).into_response()
     }
