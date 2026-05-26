@@ -103,6 +103,11 @@ enum Command {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Inspect local memory health and backlog before running repair actions.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
     /// Raw read-only API escape hatch using configured auth.
     Request {
         #[command(subcommand)]
@@ -452,6 +457,12 @@ enum SyncCommand {
         )]
         attachment_dir: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCommand {
+    /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -813,6 +824,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 print_json(result)?;
+            }
+        },
+        Command::Maintenance { command } => match command {
+            MaintenanceCommand::Status => {
+                print_json(client.maintenance_status().await?)?;
             }
         },
         Command::Request { command } => match command {

@@ -165,6 +165,14 @@ Voice transcription is content-deduplicated. If two voice messages point to the 
 
 ## Trusted maintenance path
 
+Start with a read-only status check before trusted ingest, sync, or repair workflows:
+
+```bash
+gewe-skill --json maintenance status
+```
+
+Use the status output to decide whether the problem is missing callbacks, missing synced attachments, missing voice transcripts, stale identity memory, or chatroom event coverage.
+
 Use these only for trusted ingest, sync, or repair workflows:
 
 ```bash

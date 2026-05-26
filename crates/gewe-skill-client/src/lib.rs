@@ -58,6 +58,10 @@ impl GeweSkillClient {
         self.get_json("healthz", None).await
     }
 
+    pub async fn maintenance_status(&self) -> Result<serde_json::Value, ClientError> {
+        self.get_json("api/maintenance/status", None).await
+    }
+
     pub async fn write_event(
         &self,
         request: &IngestEventRequest,

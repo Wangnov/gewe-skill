@@ -230,6 +230,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/maintenance/status",
+            get(maintenance_status).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
             "/api/chatrooms/{chatroom_id}/snapshots",
             get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -309,6 +316,78 @@ async fn healthz() -> Json<HealthResponse> {
         ok: true,
         service: "gewe-skill-memory",
     })
+}
+
+async fn maintenance_status(State(state): State<SharedState>) -> Result<Json<Value>, ApiError> {
+    let db = &state.db;
+    Ok(Json(json!({
+        "ok": true,
+        "service": "gewe-skill-memory",
+        "generated_at": now_iso(),
+        "messages": {
+            "total": scalar_i64(db, "SELECT COUNT(*) AS value FROM messages").await?,
+            "conversations": scalar_i64(db, "SELECT COUNT(DISTINCT conversation_id) AS value FROM messages WHERE conversation_id IS NOT NULL AND conversation_id != ''").await?,
+            "by_kind": count_map(db, "SELECT lower(kind) AS key, COUNT(*) AS count FROM messages GROUP BY lower(kind) ORDER BY count DESC").await?,
+            "oldest_received_at": scalar_text(db, "SELECT MIN(received_at) AS value FROM messages").await?,
+            "newest_received_at": scalar_text(db, "SELECT MAX(received_at) AS value FROM messages").await?,
+        },
+        "attachments": {
+            "total": scalar_i64(db, "SELECT COUNT(*) AS value FROM attachments").await?,
+            "by_kind": count_map(db, "SELECT lower(kind) AS key, COUNT(*) AS count FROM attachments GROUP BY lower(kind) ORDER BY count DESC").await?,
+            "messages_with_attachments": scalar_i64(db, "SELECT COUNT(DISTINCT message_key) AS value FROM attachments").await?,
+            "duplicate_sha256_groups": scalar_i64(db, "SELECT COUNT(*) AS value FROM (SELECT sha256 FROM attachments WHERE sha256 IS NOT NULL AND sha256 != '' GROUP BY sha256 HAVING COUNT(*) > 1)").await?,
+            "missing_object_key": scalar_i64(db, "SELECT COUNT(*) AS value FROM attachments WHERE object_key IS NULL OR object_key = ''").await?,
+            "missing_sha256": scalar_i64(db, "SELECT COUNT(*) AS value FROM attachments WHERE sha256 IS NULL OR sha256 = ''").await?,
+            "newest_created_at": scalar_text(db, "SELECT MAX(created_at) AS value FROM attachments").await?,
+        },
+        "voice": {
+            "messages": scalar_i64(db, "SELECT COUNT(*) AS value FROM messages WHERE lower(kind) = 'voice'").await?,
+            "messages_with_voice_attachment": scalar_i64(db, "SELECT COUNT(DISTINCT message_key) AS value FROM attachments WHERE lower(kind) = 'voice'").await?,
+            "missing_attachments": scalar_i64(db, "SELECT COUNT(*) AS value FROM messages m WHERE lower(m.kind) = 'voice' AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_key = m.message_key AND lower(a.kind) = 'voice')").await?,
+            "ready_without_completed_transcript": scalar_i64(db, "SELECT COUNT(*) AS value FROM messages m WHERE lower(m.kind) = 'voice' AND EXISTS (SELECT 1 FROM attachments a WHERE a.message_key = m.message_key AND lower(a.kind) = 'voice') AND NOT EXISTS (SELECT 1 FROM voice_transcripts vt WHERE vt.message_key = m.message_key AND vt.status = 'completed')").await?,
+            "transcripts_by_status": count_map(db, "SELECT lower(status) AS key, COUNT(*) AS count FROM voice_transcripts GROUP BY lower(status) ORDER BY count DESC").await?,
+            "failed_transcripts": scalar_i64(db, "SELECT COUNT(*) AS value FROM voice_transcripts WHERE status = 'failed'").await?,
+            "newest_transcript_at": scalar_text(db, "SELECT MAX(updated_at) AS value FROM voice_transcripts").await?,
+        },
+        "identity": {
+            "contacts": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_contacts").await?,
+            "chatrooms": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_chatrooms").await?,
+            "current_chatroom_members": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_chatroom_members WHERE is_current != 0").await?,
+            "all_chatroom_members": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_chatroom_members").await?,
+            "aliases": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_aliases").await?,
+            "current_aliases": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_aliases WHERE is_current != 0").await?,
+        },
+        "chatrooms": {
+            "snapshots": scalar_i64(db, "SELECT COUNT(*) AS value FROM chatroom_snapshots").await?,
+            "member_events": scalar_i64(db, "SELECT COUNT(*) AS value FROM chatroom_member_events").await?,
+            "system_events": scalar_i64(db, "SELECT COUNT(*) AS value FROM chatroom_system_events").await?,
+            "member_events_by_type": count_map(db, "SELECT lower(event_type) AS key, COUNT(*) AS count FROM chatroom_member_events GROUP BY lower(event_type) ORDER BY count DESC").await?,
+            "system_events_by_type": count_map(db, "SELECT lower(event_type) AS key, COUNT(*) AS count FROM chatroom_system_events GROUP BY lower(event_type) ORDER BY count DESC").await?,
+        }
+    })))
+}
+
+async fn scalar_i64(db: &SqlitePool, sql: &str) -> Result<i64, ApiError> {
+    let row = sqlx::query(sql).fetch_one(db).await?;
+    Ok(row.get("value"))
+}
+
+async fn scalar_text(db: &SqlitePool, sql: &str) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query(sql).fetch_one(db).await?;
+    Ok(row.get("value"))
+}
+
+async fn count_map(db: &SqlitePool, sql: &str) -> Result<Value, ApiError> {
+    let rows = sqlx::query(sql).fetch_all(db).await?;
+    let mut map = Map::new();
+    for row in rows {
+        let key = row
+            .get::<Option<String>, _>("key")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        map.insert(key, json!(row.get::<i64, _>("count")));
+    }
+    Ok(Value::Object(map))
 }
 
 async fn require_write_token(
