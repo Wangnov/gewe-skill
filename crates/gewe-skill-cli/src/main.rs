@@ -1557,13 +1557,7 @@ async fn agent_speaker_block(
                 {
                     missing_effective_display_count += 1;
                 }
-                let mut value = serde_json::to_value(&profile)?;
-                if let Some(object) = value.as_object_mut() {
-                    object.insert(
-                        "display_name_source".to_string(),
-                        serde_json::json!(speaker_display_source(&profile)),
-                    );
-                }
+                let value = agent_speaker_profile_value(&profile);
                 by_wxid.insert(profile.entity_id.clone(), value);
             }
             Err(error) => {
@@ -1598,6 +1592,39 @@ async fn agent_speaker_block(
             ]
         }
     }))
+}
+
+fn agent_speaker_profile_value(profile: &IdentityProfileResponse) -> Value {
+    let contact = profile.contact.as_ref().map(|contact| {
+        serde_json::json!({
+            "wxid": contact.wxid.clone(),
+            "nickname": contact.nickname.clone(),
+            "remark": contact.remark.clone(),
+            "alias": contact.alias.clone(),
+            "last_seen_at": contact.last_seen_at.clone(),
+            "updated_at": contact.updated_at.clone(),
+        })
+    });
+    let chatroom_member = profile.chatroom_member.as_ref().map(|member| {
+        serde_json::json!({
+            "chatroom_id": member.chatroom_id.clone(),
+            "member_wxid": member.member_wxid.clone(),
+            "display_name": member.display_name.clone(),
+            "nickname": member.nickname.clone(),
+            "is_current": member.is_current,
+            "last_seen_at": member.last_seen_at.clone(),
+        })
+    });
+
+    serde_json::json!({
+        "entity_id": profile.entity_id.clone(),
+        "chatroom_id": profile.chatroom_id.clone(),
+        "effective_display_name": profile.effective_display_name.clone(),
+        "display_name_source": speaker_display_source(profile),
+        "contact": contact,
+        "chatroom_member": chatroom_member,
+        "aliases": profile.aliases.clone(),
+    })
 }
 
 fn collect_message_speaker_wxids(messages: &[NormalizedMessage]) -> Vec<String> {
@@ -2854,7 +2881,7 @@ mod tests {
                 nickname: Some("左".to_string()),
                 remark: Some("左备注".to_string()),
                 alias: None,
-                raw: None,
+                raw: Some(serde_json::json!({"phoneNumList": ["secret"]})),
                 last_seen_at: None,
                 updated_at: None,
             }),
@@ -2864,13 +2891,18 @@ mod tests {
                 display_name: Some("左（今天你喝水了吗）".to_string()),
                 nickname: Some("左".to_string()),
                 is_current: true,
-                raw: None,
+                raw: Some(serde_json::json!({"bigHeadImgUrl": "secret"})),
                 last_seen_at: None,
             }),
             aliases: Vec::new(),
         };
 
         assert_eq!(speaker_display_source(&profile), "contact_remark");
+
+        let value = agent_speaker_profile_value(&profile);
+        assert_eq!(value["display_name_source"], "contact_remark");
+        assert!(value["contact"].get("raw").is_none());
+        assert!(value["chatroom_member"].get("raw").is_none());
     }
 
     fn test_message(
