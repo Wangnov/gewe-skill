@@ -117,6 +117,7 @@ gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment
 - [Privacy](docs/privacy.md)
 - [GeWe callback notes](docs/gewe-callbacks.md)
 - [Live validation](docs/live-validation.md)
+- [Release](docs/release.md)
 
 ## License
 
