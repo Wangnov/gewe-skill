@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{
+    collections::BTreeSet,
     env,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
@@ -463,8 +464,43 @@ async fn resolve_identity(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<IdentityResolveResponse>, ApiError> {
     let limit = clamp_limit(query.limit);
-    let alias_key = normalize_alias(&query.q);
-    let like = format!("%{}%", query.q.trim());
+    let mut items = Vec::new();
+    let mut seen = BTreeSet::new();
+    for term in identity_query_terms(&query.q) {
+        let matches = query_identity_matches(&state.db, &term, query.q.trim(), limit).await?;
+        for item in matches {
+            let key = format!(
+                "{}:{}:{}:{}",
+                item.entity_type,
+                item.entity_id,
+                item.chatroom_id.as_deref().unwrap_or_default(),
+                item.source.as_deref().unwrap_or_default()
+            );
+            if seen.insert(key) {
+                items.push(item);
+            }
+            if items.len() >= limit as usize {
+                break;
+            }
+        }
+        if items.len() >= limit as usize {
+            break;
+        }
+    }
+    Ok(Json(IdentityResolveResponse {
+        query: query.q,
+        items,
+    }))
+}
+
+async fn query_identity_matches(
+    db: &SqlitePool,
+    term: &str,
+    raw_query: &str,
+    limit: i64,
+) -> Result<Vec<IdentityMatch>, ApiError> {
+    let alias_key = normalize_alias(term);
+    let like = format!("%{}%", term.trim());
     let rows = sqlx::query(
         r#"
         SELECT entity_type, entity_id, NULLIF(scope_key, '') AS chatroom_id, alias, source,
@@ -498,11 +534,11 @@ async fn resolve_identity(
     .bind(&alias_key)
     .bind(&alias_key)
     .bind(&like)
-    .bind(query.q.trim())
+    .bind(raw_query)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await?;
-    let items = rows
+    Ok(rows
         .iter()
         .map(|row| IdentityMatch {
             entity_type: row.get("entity_type"),
@@ -515,11 +551,7 @@ async fn resolve_identity(
             score: row.get("score"),
             last_seen_at: row.get("last_seen_at"),
         })
-        .collect();
-    Ok(Json(IdentityResolveResponse {
-        query: query.q,
-        items,
-    }))
+        .collect())
 }
 
 async fn refresh_identity(
@@ -1607,6 +1639,31 @@ fn normalize_alias(value: &str) -> String {
         .to_lowercase()
         .split_whitespace()
         .collect::<String>()
+}
+
+fn identity_query_terms(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let mut terms = Vec::new();
+    push_term(&mut terms, trimmed);
+    for separator in ['（', '(', '[', '【'] {
+        if let Some((head, tail)) = trimmed.split_once(separator) {
+            push_term(&mut terms, head);
+            let tail = tail
+                .trim_end_matches('）')
+                .trim_end_matches(')')
+                .trim_end_matches(']')
+                .trim_end_matches('】');
+            push_term(&mut terms, tail);
+        }
+    }
+    terms
+}
+
+fn push_term(terms: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() && !terms.iter().any(|item| item == value) {
+        terms.push(value.to_string());
+    }
 }
 
 fn now_iso() -> String {
