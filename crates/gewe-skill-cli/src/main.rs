@@ -3,15 +3,16 @@ use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomMemberEvent,
-    ChatroomSystemEvent, IdentityMatch, IdentityRefreshRequest, MessageQuery, NormalizedMessage,
-    RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
+    ChatroomSystemEvent, IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest,
+    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
+    VoiceTranscribeRequest, VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -1228,6 +1229,8 @@ async fn agent_query_chatroom_events(
         }
     });
     events.truncate(args.limit);
+    let identity_enrichment =
+        enrich_timeline_event_identities(client, &chatroom_id, &mut events).await?;
 
     Ok(serde_json::json!({
         "ok": true,
@@ -1250,13 +1253,227 @@ async fn agent_query_chatroom_events(
             "member_events": member_scanned,
             "system_events": system_scanned,
         },
+        "identity_enrichment": identity_enrichment,
         "events": events,
         "agent_hints": [
             "system events usually have better actor/target names when GeWe parsed the system message",
             "member events come from snapshot diffs and are better evidence for actual membership state changes",
+            "display names are enriched from memory and keep wxids as stable evidence fields",
             "if system and member events disagree, report the disagreement instead of guessing"
         ]
     }))
+}
+
+async fn enrich_timeline_event_identities(
+    client: &GeweSkillClient,
+    chatroom_id: &str,
+    events: &mut [Value],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut wxids = HashSet::new();
+    for event in events.iter() {
+        collect_event_wxids(event, &mut wxids);
+    }
+
+    let mut profiles: HashMap<String, Option<IdentityProfileResponse>> = HashMap::new();
+    let mut failed = Vec::new();
+    for wxid in wxids.iter() {
+        match client.identity_profile(wxid, Some(chatroom_id)).await {
+            Ok(profile) => {
+                profiles.insert(wxid.clone(), Some(profile));
+            }
+            Err(error) => {
+                profiles.insert(wxid.clone(), None);
+                failed.push(serde_json::json!({
+                    "wxid": wxid,
+                    "error": error.to_string()
+                }));
+            }
+        }
+    }
+
+    for event in events.iter_mut() {
+        apply_identity_enrichment(event, &profiles);
+    }
+
+    let enriched = profiles
+        .values()
+        .filter(|profile| profile.is_some())
+        .count();
+    Ok(serde_json::json!({
+        "requested": wxids.len(),
+        "enriched": enriched,
+        "failed_count": failed.len(),
+        "failed": failed
+    }))
+}
+
+fn collect_event_wxids(event: &Value, wxids: &mut HashSet<String>) {
+    for key in ["member_wxid", "actor_wxid", "target_wxid"] {
+        if let Some(wxid) = event.get(key).and_then(Value::as_str) {
+            if looks_like_identity_wxid(wxid) {
+                wxids.insert(wxid.to_string());
+            }
+        }
+    }
+    if let Some(values) = event.get("target_wxids").and_then(Value::as_array) {
+        for value in values {
+            if let Some(wxid) = value.as_str() {
+                if looks_like_identity_wxid(wxid) {
+                    wxids.insert(wxid.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn apply_identity_enrichment(
+    event: &mut Value,
+    profiles: &HashMap<String, Option<IdentityProfileResponse>>,
+) {
+    let mut member_display_name = None;
+    let mut actor_display_name = None;
+    let mut target_display_name = None;
+
+    if let Some(wxid) = event.get("member_wxid").and_then(Value::as_str) {
+        member_display_name = display_name_for_wxid(wxid, profiles);
+    }
+    if let Some(wxid) = event.get("actor_wxid").and_then(Value::as_str) {
+        actor_display_name = display_name_for_wxid(wxid, profiles);
+    }
+    if let Some(wxid) = event.get("target_wxid").and_then(Value::as_str) {
+        target_display_name = display_name_for_wxid(wxid, profiles);
+    }
+
+    let target_display_names = event
+        .get("target_wxids")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|wxid| {
+                    display_name_for_wxid(wxid, profiles).unwrap_or_else(|| wxid.to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let summary = enriched_event_summary(
+        event,
+        member_display_name.as_deref(),
+        actor_display_name.as_deref(),
+        target_display_name.as_deref(),
+        &target_display_names,
+    );
+
+    if let Some(object) = event.as_object_mut() {
+        if let Some(value) = member_display_name {
+            object.insert("member_display_name".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = actor_display_name {
+            object.insert("actor_display_name".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = target_display_name {
+            object.insert("target_display_name".to_string(), serde_json::json!(value));
+        }
+        if !target_display_names.is_empty() {
+            object.insert(
+                "target_display_names".to_string(),
+                serde_json::json!(target_display_names),
+            );
+        }
+        object.insert("summary".to_string(), serde_json::json!(summary));
+    }
+}
+
+fn display_name_for_wxid(
+    wxid: &str,
+    profiles: &HashMap<String, Option<IdentityProfileResponse>>,
+) -> Option<String> {
+    profiles
+        .get(wxid)
+        .and_then(Option::as_ref)
+        .and_then(|profile| profile.effective_display_name.clone())
+}
+
+fn enriched_event_summary(
+    event: &Value,
+    member_display_name: Option<&str>,
+    actor_display_name: Option<&str>,
+    target_display_name: Option<&str>,
+    target_display_names: &[String],
+) -> String {
+    let event_type = event
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "member_joined" => format!(
+            "member joined: {}",
+            member_display_name
+                .or_else(|| event.get("member_wxid").and_then(Value::as_str))
+                .unwrap_or("unknown")
+        ),
+        "member_left" => format!(
+            "member left: {}",
+            member_display_name
+                .or_else(|| event.get("member_wxid").and_then(Value::as_str))
+                .unwrap_or("unknown")
+        ),
+        "member_removed" => format!(
+            "member removed: {}",
+            target_display_name
+                .or(member_display_name)
+                .or_else(|| event.get("target_name").and_then(Value::as_str))
+                .or_else(|| event.get("target_wxid").and_then(Value::as_str))
+                .or_else(|| event.get("member_wxid").and_then(Value::as_str))
+                .unwrap_or("unknown")
+        ),
+        "member_invited" => {
+            let targets = if !target_display_names.is_empty() {
+                target_display_names.join(", ")
+            } else {
+                event
+                    .get("target_names")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        target_display_name
+                            .or(member_display_name)
+                            .or_else(|| event.get("target_wxid").and_then(Value::as_str))
+                            .or_else(|| event.get("member_wxid").and_then(Value::as_str))
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+            };
+            let actor = actor_display_name
+                .or_else(|| event.get("actor_name").and_then(Value::as_str))
+                .or_else(|| event.get("actor_wxid").and_then(Value::as_str));
+            if let Some(actor) = actor {
+                format!("member invited by {actor}: {targets}")
+            } else {
+                format!("member invited: {targets}")
+            }
+        }
+        _ => event
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("chatroom event")
+            .to_string(),
+    }
+}
+
+fn looks_like_identity_wxid(value: &str) -> bool {
+    looks_like_stable_wechat_id(value)
+        || value.starts_with("qq")
+        || value.chars().any(|character| character.is_ascii_digit())
 }
 
 fn timeline_event_dedupe_key(event: &Value) -> String {

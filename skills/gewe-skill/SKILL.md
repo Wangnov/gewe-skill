@@ -115,7 +115,7 @@ gewe-skill --json chatrooms system-events --chatroom-id '<chatroom_id>' --limit 
 gewe-skill --json chatrooms snapshots --chatroom-id '<chatroom_id>' --limit 20
 ```
 
-Prefer `query chatroom-events` for Agent answers because it resolves the group name and merges member/system events into one timeline. Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
+Prefer `query chatroom-events` for Agent answers because it resolves the group name, enriches wxids with current identity display memory, and merges member/system events into one timeline. Keep wxid fields as stable evidence, but use `*_display_name` fields when explaining people to the user. Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
 
 ## Attachments
 
