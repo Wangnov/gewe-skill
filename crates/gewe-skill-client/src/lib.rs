@@ -2,7 +2,8 @@
 
 use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomEventWriteRequest, ChatroomMemberEvent, ChatroomSnapshot,
-    ChatroomSystemEvent, ConversationSummary, IdentityProfileResponse, IdentityRefreshRequest,
+    ChatroomSystemEvent, ConversationSummary, IdentityEventBackfillRequest,
+    IdentityEventBackfillResponse, IdentityProfileResponse, IdentityRefreshRequest,
     IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest, MessageContextResponse,
     MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
     VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
@@ -60,6 +61,14 @@ impl GeweSkillClient {
 
     pub async fn maintenance_status(&self) -> Result<serde_json::Value, ClientError> {
         self.get_json("api/maintenance/status", None).await
+    }
+
+    pub async fn maintenance_identity_event_backfill(
+        &self,
+        request: &IdentityEventBackfillRequest,
+    ) -> Result<IdentityEventBackfillResponse, ClientError> {
+        self.post_read_json_as("api/maintenance/identity-event-backfill", request)
+            .await
     }
 
     pub async fn write_event(
@@ -221,9 +230,18 @@ impl GeweSkillClient {
         &self,
         request: &IdentityRefreshRequest,
     ) -> Result<IdentityRefreshResponse, ClientError> {
+        self.post_read_json_as("api/identity/refresh", request)
+            .await
+    }
+
+    async fn post_read_json_as<T: serde::Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<R, ClientError> {
         let response = self
             .http
-            .post(self.url("api/identity/refresh")?)
+            .post(self.url(path)?)
             .bearer_auth(self.read_token.as_deref().unwrap_or_default())
             .json(request)
             .send()

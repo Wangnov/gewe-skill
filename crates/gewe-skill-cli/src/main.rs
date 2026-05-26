@@ -3,9 +3,9 @@ use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomMemberEvent,
-    ChatroomSystemEvent, IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest,
-    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
-    VoiceTranscribeRequest, VoiceWarmRequest,
+    ChatroomSystemEvent, IdentityEventBackfillRequest, IdentityMatch, IdentityProfileResponse,
+    IdentityRefreshRequest, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
+    VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -533,6 +533,19 @@ enum SyncCommand {
 enum MaintenanceCommand {
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
+    /// Refresh missing display memory for wxids seen in recent chatroom events.
+    IdentityBackfill {
+        #[arg(long, default_value_t = 500)]
+        event_limit: i64,
+        #[arg(long, default_value_t = 10)]
+        max_chatrooms: i64,
+        #[arg(long, default_value_t = 100)]
+        max_wxids: i64,
+        #[arg(long = "no-contact-detail", action = ArgAction::SetFalse, default_value_t = true)]
+        contact_detail: bool,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Backfill ready voice messages that do not have completed transcripts yet.
     AsrBackfill {
         #[command(flatten)]
@@ -986,6 +999,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Maintenance { command } => match command {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
+            }
+            MaintenanceCommand::IdentityBackfill {
+                event_limit,
+                max_chatrooms,
+                max_wxids,
+                contact_detail,
+                dry_run,
+            } => {
+                print_json(
+                    client
+                        .maintenance_identity_event_backfill(&IdentityEventBackfillRequest {
+                            event_limit: Some(event_limit),
+                            max_chatrooms: Some(max_chatrooms),
+                            max_wxids: Some(max_wxids),
+                            contact_detail: Some(contact_detail),
+                            dry_run: Some(dry_run),
+                        })
+                        .await?,
+                )?;
             }
             MaintenanceCommand::AsrBackfill {
                 filters,

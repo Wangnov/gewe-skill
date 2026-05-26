@@ -176,6 +176,15 @@ gewe-skill --json maintenance status
 
 Use the status output to decide whether the problem is missing callbacks, missing synced attachments, missing voice transcripts, stale identity memory, or chatroom event coverage.
 
+If chatroom event answers still show raw wxids instead of names, run a bounded identity backfill over recent chatroom events:
+
+```bash
+gewe-skill --json maintenance identity-backfill --dry-run --event-limit 500
+gewe-skill --json maintenance identity-backfill --event-limit 500 --max-chatrooms 10 --max-wxids 100
+```
+
+This first refreshes only chatrooms seen in recent events, then refreshes only still-missing wxids. Do not use broad full-contact refresh unless the user explicitly approves the larger GeWe request surface.
+
 If `voice.ready_without_completed_transcript` is greater than zero, run a bounded ASR backfill:
 
 ```bash

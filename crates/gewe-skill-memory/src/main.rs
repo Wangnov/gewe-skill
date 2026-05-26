@@ -11,18 +11,18 @@ use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomEventWriteRequest,
     ChatroomEventWriteResponse, ChatroomMember, ChatroomMemberEvent, ChatroomSnapshot,
     ChatroomSystemEvent, ConversationSummary, IdentityChatroomMemberProfile,
-    IdentityContactProfile, IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest,
-    IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest, MessageContextResponse,
-    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
-    VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest,
-    VoiceWarmResponse,
+    IdentityContactProfile, IdentityEventBackfillRequest, IdentityEventBackfillResponse,
+    IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
+    IdentityResolveResponse, IngestEventRequest, MessageContextResponse, MessageQuery,
+    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
+    VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     env,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
@@ -243,6 +243,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/maintenance/status",
             get(maintenance_status).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/maintenance/identity-event-backfill",
+            post(identity_event_backfill).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -1299,6 +1306,234 @@ async fn refresh_identity(
 
     response.ok = response.errors.is_empty();
     Ok(Json(response))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct EventIdentityCandidate {
+    chatroom_id: String,
+    wxid: String,
+}
+
+async fn identity_event_backfill(
+    State(state): State<SharedState>,
+    Json(request): Json<IdentityEventBackfillRequest>,
+) -> Result<Json<IdentityEventBackfillResponse>, ApiError> {
+    let event_limit = request.event_limit.unwrap_or(500).clamp(1, 5000);
+    let max_chatrooms = request.max_chatrooms.unwrap_or(10).clamp(0, 100) as usize;
+    let max_wxids = request.max_wxids.unwrap_or(100).clamp(0, 1000) as usize;
+    let dry_run = request.dry_run.unwrap_or(false);
+    let contact_detail = request.contact_detail.unwrap_or(true);
+    let now = now_iso();
+
+    let candidates = collect_event_identity_candidates(&state.db, event_limit).await?;
+    let mut missing = missing_identity_candidates(&state.db, &candidates).await?;
+    let initially_missing = missing.len();
+    let mut errors = Vec::new();
+    let mut refreshed_chatrooms = 0;
+    let mut refreshed_members = 0;
+    let mut refreshed_contacts = 0;
+
+    if !dry_run && !missing.is_empty() {
+        let chatroom_ids: Vec<String> = missing
+            .iter()
+            .map(|candidate| candidate.chatroom_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(max_chatrooms)
+            .collect();
+        for chatroom_id in &chatroom_ids {
+            match refresh_chatroom_from_gewe(&state, chatroom_id, &now).await {
+                Ok(member_count) => {
+                    refreshed_chatrooms += 1;
+                    refreshed_members += member_count;
+                }
+                Err(error) => errors.push(json!({
+                    "scope": "chatroom",
+                    "chatroom_id": chatroom_id,
+                    "error": error.to_string()
+                })),
+            }
+        }
+
+        missing = missing_identity_candidates(&state.db, &missing).await?;
+        if contact_detail && max_wxids > 0 && !missing.is_empty() {
+            let wxids: Vec<String> = missing
+                .iter()
+                .map(|candidate| candidate.wxid.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(max_wxids)
+                .collect();
+            for chunk in wxids.chunks(20) {
+                match refresh_contacts_detail(&state, chunk, &now, false).await {
+                    Ok(count) => refreshed_contacts += count,
+                    Err(error) => errors.push(json!({
+                        "scope": "contacts_detail",
+                        "wxids": chunk,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+            missing = missing_identity_candidates(&state.db, &missing).await?;
+        }
+    }
+
+    let sample_missing = missing
+        .iter()
+        .take(20)
+        .map(|candidate| {
+            json!({
+                "chatroom_id": candidate.chatroom_id,
+                "wxid": candidate.wxid
+            })
+        })
+        .collect();
+
+    Ok(Json(IdentityEventBackfillResponse {
+        ok: errors.is_empty(),
+        dry_run,
+        event_limit,
+        scanned_candidates: candidates.len(),
+        initially_missing,
+        refreshed_chatrooms,
+        refreshed_members,
+        refreshed_contacts,
+        unresolved_after: missing.len(),
+        sample_missing,
+        errors,
+    }))
+}
+
+async fn collect_event_identity_candidates(
+    db: &SqlitePool,
+    event_limit: i64,
+) -> Result<Vec<EventIdentityCandidate>, ApiError> {
+    let mut candidates = BTreeSet::new();
+    let member_rows = sqlx::query(
+        r#"
+        SELECT chatroom_id, member_wxid
+        FROM chatroom_member_events
+        WHERE member_wxid IS NOT NULL AND member_wxid != ''
+        ORDER BY received_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(event_limit)
+    .fetch_all(db)
+    .await?;
+    for row in member_rows {
+        push_event_identity_candidate(
+            &mut candidates,
+            row.get::<String, _>("chatroom_id"),
+            row.get::<String, _>("member_wxid"),
+        );
+    }
+
+    let system_rows = sqlx::query(
+        r#"
+        SELECT chatroom_id, actor_wxid, target_wxid, event_json
+        FROM chatroom_system_events
+        ORDER BY received_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(event_limit)
+    .fetch_all(db)
+    .await?;
+    for row in system_rows {
+        let chatroom_id = row.get::<String, _>("chatroom_id");
+        let actor_wxid = row.get::<Option<String>, _>("actor_wxid");
+        let target_wxid = row.get::<Option<String>, _>("target_wxid");
+        if let Some(wxid) = actor_wxid {
+            push_event_identity_candidate(&mut candidates, chatroom_id.clone(), wxid);
+        }
+        if let Some(wxid) = target_wxid {
+            push_event_identity_candidate(&mut candidates, chatroom_id.clone(), wxid);
+        }
+        if let Ok(event) =
+            serde_json::from_str::<ChatroomSystemEvent>(row.get::<&str, _>("event_json"))
+        {
+            for wxid in event.target_wxids {
+                push_event_identity_candidate(&mut candidates, chatroom_id.clone(), wxid);
+            }
+        }
+    }
+
+    Ok(candidates.into_iter().collect())
+}
+
+fn push_event_identity_candidate(
+    candidates: &mut BTreeSet<EventIdentityCandidate>,
+    chatroom_id: String,
+    wxid: String,
+) {
+    let wxid = wxid.trim();
+    if wxid.is_empty() || wxid.ends_with("@chatroom") {
+        return;
+    }
+    candidates.insert(EventIdentityCandidate {
+        chatroom_id,
+        wxid: wxid.to_string(),
+    });
+}
+
+async fn missing_identity_candidates(
+    db: &SqlitePool,
+    candidates: &[EventIdentityCandidate],
+) -> Result<Vec<EventIdentityCandidate>, ApiError> {
+    let mut missing = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        if !seen.insert((candidate.chatroom_id.clone(), candidate.wxid.clone())) {
+            continue;
+        }
+        if !identity_display_known(db, &candidate.chatroom_id, &candidate.wxid).await? {
+            missing.push(candidate.clone());
+        }
+    }
+    Ok(missing)
+}
+
+async fn identity_display_known(
+    db: &SqlitePool,
+    chatroom_id: &str,
+    wxid: &str,
+) -> Result<bool, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          c.remark AS contact_remark,
+          m.display_name AS member_display_name,
+          m.nickname AS member_nickname,
+          c.nickname AS contact_nickname,
+          c.alias AS contact_alias
+        FROM (SELECT ? AS wxid, ? AS chatroom_id) input
+        LEFT JOIN identity_contacts c ON c.wxid = input.wxid
+        LEFT JOIN identity_chatroom_members m
+          ON m.chatroom_id = input.chatroom_id AND m.member_wxid = input.wxid
+        "#,
+    )
+    .bind(wxid)
+    .bind(chatroom_id)
+    .fetch_one(db)
+    .await?;
+    for column in [
+        "contact_remark",
+        "member_display_name",
+        "member_nickname",
+        "contact_nickname",
+        "contact_alias",
+    ] {
+        if row
+            .get::<Option<String>, _>(column)
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn recent_attachments(

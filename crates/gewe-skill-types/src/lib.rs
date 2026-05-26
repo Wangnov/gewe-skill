@@ -295,6 +295,30 @@ pub struct IdentityRefreshResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEventBackfillRequest {
+    pub event_limit: Option<i64>,
+    pub max_chatrooms: Option<i64>,
+    pub max_wxids: Option<i64>,
+    pub contact_detail: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityEventBackfillResponse {
+    pub ok: bool,
+    pub dry_run: bool,
+    pub event_limit: i64,
+    pub scanned_candidates: usize,
+    pub initially_missing: usize,
+    pub refreshed_chatrooms: i64,
+    pub refreshed_members: i64,
+    pub refreshed_contacts: i64,
+    pub unresolved_after: usize,
+    pub sample_missing: Vec<Value>,
+    pub errors: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatroomMember {
     pub wxid: String,
     pub display_name: Option<String>,
