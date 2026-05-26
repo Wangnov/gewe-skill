@@ -7,8 +7,9 @@ use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, IdentityEventBackfillRequest, IdentityMatch,
-    IdentityRefreshRequest, MessageQuery, NormalizedKind, NormalizedMessage, RawCallbackRequest,
-    VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
+    IdentityProfileResponse, IdentityRefreshRequest, MessageQuery, NormalizedKind,
+    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
+    VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -272,6 +273,9 @@ struct AgentMessageQueryArgs {
     /// Disable exact attachment lookup for the returned message window.
     #[arg(long = "no-attachments", action = ArgAction::SetFalse, default_value_t = true)]
     attachments: bool,
+    /// Disable speaker identity lookup for the returned message window.
+    #[arg(long = "no-speakers", action = ArgAction::SetFalse, default_value_t = true)]
+    speakers: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1446,6 +1450,12 @@ async fn agent_query_messages(
         order: Some(args.order.query_value()),
     };
     let messages: ApiPage<NormalizedMessage> = client.messages(&query).await?;
+    let speaker_chatroom_id = conversation
+        .id
+        .as_deref()
+        .filter(|conversation_id| conversation_id.ends_with("@chatroom"));
+    let speaker_block =
+        agent_speaker_block(client, args.speakers, &messages.items, speaker_chatroom_id).await?;
     let message_keys = messages
         .items
         .iter()
@@ -1490,12 +1500,162 @@ async fn agent_query_messages(
         },
         "message_query": query,
         "messages": messages,
+        "speakers": speaker_block,
         "attachments": attachment_block,
         "voice": {
             "included": args.voice_transcripts,
             "items": voice.map(|page| page.items).unwrap_or_default()
         }
     }))
+}
+
+async fn agent_speaker_block(
+    client: &GeweSkillClient,
+    included: bool,
+    messages: &[NormalizedMessage],
+    chatroom_id: Option<&str>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let speaker_wxids = collect_message_speaker_wxids(messages);
+    let messages_missing_sender_count = messages
+        .iter()
+        .filter(|message| {
+            message
+                .sender_wxid
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .count();
+
+    if !included {
+        return Ok(serde_json::json!({
+            "included": false,
+            "by_wxid": {},
+            "lookup_errors": [],
+            "summary": {
+                "message_count": messages.len(),
+                "speaker_count": speaker_wxids.len(),
+                "messages_missing_sender_count": messages_missing_sender_count,
+            }
+        }));
+    }
+
+    let mut by_wxid = serde_json::Map::new();
+    let mut lookup_errors = Vec::new();
+    let mut missing_effective_display_count = 0usize;
+
+    for wxid in &speaker_wxids {
+        match client.identity_profile(wxid, chatroom_id).await {
+            Ok(profile) => {
+                if profile
+                    .effective_display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    missing_effective_display_count += 1;
+                }
+                let mut value = serde_json::to_value(&profile)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "display_name_source".to_string(),
+                        serde_json::json!(speaker_display_source(&profile)),
+                    );
+                }
+                by_wxid.insert(profile.entity_id.clone(), value);
+            }
+            Err(error) => {
+                lookup_errors.push(serde_json::json!({
+                    "wxid": wxid,
+                    "error": error.to_string(),
+                }));
+            }
+        }
+    }
+
+    let resolved_count = by_wxid.len();
+    let lookup_error_count = lookup_errors.len();
+
+    Ok(serde_json::json!({
+        "included": true,
+        "by_wxid": by_wxid,
+        "lookup_errors": lookup_errors,
+        "summary": {
+            "message_count": messages.len(),
+            "speaker_count": speaker_wxids.len(),
+            "resolved_count": resolved_count,
+            "lookup_error_count": lookup_error_count,
+            "messages_missing_sender_count": messages_missing_sender_count,
+            "missing_effective_display_count": missing_effective_display_count,
+            "chatroom_id": chatroom_id,
+            "chatroom_scoped": chatroom_id.is_some(),
+            "agent_notes": [
+                "use speakers.by_wxid[message.sender_wxid].effective_display_name for human-facing names",
+                "keep message.sender_wxid as the stable evidence id when explaining who said something",
+                "for chatrooms, display names prefer contact remark, then room-scoped card/display names, then nicknames"
+            ]
+        }
+    }))
+}
+
+fn collect_message_speaker_wxids(messages: &[NormalizedMessage]) -> Vec<String> {
+    let mut wxids = std::collections::BTreeSet::new();
+    for message in messages {
+        if let Some(wxid) = message.sender_wxid.as_deref() {
+            let wxid = wxid.trim();
+            if !wxid.is_empty() {
+                wxids.insert(wxid.to_string());
+            }
+        }
+    }
+    wxids.into_iter().collect()
+}
+
+fn speaker_display_source(profile: &IdentityProfileResponse) -> &'static str {
+    if profile
+        .contact
+        .as_ref()
+        .and_then(|contact| contact.remark.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        "contact_remark"
+    } else if profile
+        .chatroom_member
+        .as_ref()
+        .and_then(|member| member.display_name.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        "chatroom_display_name"
+    } else if profile
+        .chatroom_member
+        .as_ref()
+        .and_then(|member| member.nickname.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        "chatroom_nickname"
+    } else if profile
+        .contact
+        .as_ref()
+        .and_then(|contact| contact.nickname.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        "contact_nickname"
+    } else if profile
+        .effective_display_name
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        "effective_display_name"
+    } else {
+        "unresolved"
+    }
 }
 
 fn agent_attachment_block(
@@ -2665,6 +2825,52 @@ mod tests {
             "m2"
         );
         assert_eq!(block["by_message_key"]["m1"]["kinds"][0], "image");
+    }
+
+    #[test]
+    fn collect_message_speaker_wxids_deduplicates_and_ignores_empty_values() {
+        let mut first = test_message("m1", gewe_skill_types::NormalizedKind::Text);
+        first.sender_wxid = Some(" wxid_b ".to_string());
+        let mut second = test_message("m2", gewe_skill_types::NormalizedKind::Text);
+        second.sender_wxid = Some("wxid_a".to_string());
+        let mut duplicate = test_message("m3", gewe_skill_types::NormalizedKind::Text);
+        duplicate.sender_wxid = Some("wxid_b".to_string());
+        let mut missing = test_message("m4", gewe_skill_types::NormalizedKind::Text);
+        missing.sender_wxid = Some(" ".to_string());
+
+        let wxids = collect_message_speaker_wxids(&[first, second, duplicate, missing]);
+
+        assert_eq!(wxids, vec!["wxid_a".to_string(), "wxid_b".to_string()]);
+    }
+
+    #[test]
+    fn speaker_display_source_prefers_contact_remark_before_group_card() {
+        let profile = IdentityProfileResponse {
+            entity_id: "wxid_left".to_string(),
+            chatroom_id: Some("room@chatroom".to_string()),
+            effective_display_name: Some("左备注".to_string()),
+            contact: Some(gewe_skill_types::IdentityContactProfile {
+                wxid: "wxid_left".to_string(),
+                nickname: Some("左".to_string()),
+                remark: Some("左备注".to_string()),
+                alias: None,
+                raw: None,
+                last_seen_at: None,
+                updated_at: None,
+            }),
+            chatroom_member: Some(gewe_skill_types::IdentityChatroomMemberProfile {
+                chatroom_id: "room@chatroom".to_string(),
+                member_wxid: "wxid_left".to_string(),
+                display_name: Some("左（今天你喝水了吗）".to_string()),
+                nickname: Some("左".to_string()),
+                is_current: true,
+                raw: None,
+                last_seen_at: None,
+            }),
+            aliases: Vec::new(),
+        };
+
+        assert_eq!(speaker_display_source(&profile), "contact_remark");
     }
 
     fn test_message(

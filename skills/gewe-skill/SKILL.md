@@ -241,6 +241,7 @@ Do not use raw writes unless the user asked for that specific write.
 - Resolve names first, then read messages by stable ids.
 - Treat room-scoped member aliases as scoped to `chatroom_id`; the same display name may appear in multiple groups.
 - For chatroom members, prefer the user's contact remark when available, then room-scoped display/card names, then nicknames.
+- `query messages` returns `speakers.by_wxid` by default; use `effective_display_name` for human-facing explanations and keep `sender_wxid` as stable evidence.
 - Use `identity inspect` when explaining why an old alias maps to a current person, especially when `identity resolve` selected a non-current alias.
 - Observed aliases from quoted messages are useful evidence, but may be historical. Current GeWe group member info has higher confidence for present state.
 - For group-card or nickname changes, preserve the original message text and avoid over-normalizing.
