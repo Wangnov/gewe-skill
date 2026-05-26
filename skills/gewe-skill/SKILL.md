@@ -36,19 +36,29 @@ GEWE_SKILL_WRITE_TOKEN=...
 
 ## Normal read path
 
-1. Resolve human wording before reading messages:
+1. Prefer the composed Agent query when the user names a group, person, time window, or keyword. It resolves human wording first, then reads bounded messages and returns voice transcript evidence for the same scope:
+
+```bash
+gewe-skill --json query messages --conversation '<chatroom/contact wording>' --limit 50
+gewe-skill --json query messages --conversation '<chatroom wording>' --sender '<member/contact wording>' --limit 50
+gewe-skill --json query messages --conversation '<chatroom wording>' --q '<keyword>' --after '<iso-time>' --limit 50
+```
+
+If `query messages` returns `conversation_unresolved` or `sender_unresolved`, show the candidates and ask for a narrower clue instead of doing a broad read.
+
+2. Use manual resolution when you need to inspect or disambiguate ids before reading messages:
 
 ```bash
 gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --limit 10
 ```
 
-2. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
+3. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
 
 ```bash
 gewe-skill --json identity warm --chatroom-id '<chatroom_id>' --recent-messages 200 --max-contacts 50
 ```
 
-3. If names still look stale or missing, refresh only the needed identity scope:
+4. If names still look stale or missing, refresh only the needed identity scope:
 
 ```bash
 gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
@@ -56,7 +66,7 @@ gewe-skill --json identity refresh --wxids '<wxid1>,<wxid2>'
 gewe-skill --json identity refresh --recent-chatrooms 20
 ```
 
-4. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
+5. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
 
 ```bash
 gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
@@ -65,14 +75,14 @@ gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-w
 gewe-skill --json messages list --conversation-id '<conversation_id>' --kind text --direction incoming --limit 50
 ```
 
-5. Search within a scoped window instead of broad global search when the user named a group/person/time:
+6. Search within a scoped window instead of broad global search when the user named a group/person/time:
 
 ```bash
 gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
 gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --after '<iso-time>' --limit 20
 ```
 
-6. If a specific message matters, fetch nearby context:
+7. If a specific message matters, fetch nearby context:
 
 ```bash
 gewe-skill --json messages context --message-key '<message_key>' --before 5 --after 5

@@ -1,9 +1,10 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
-    AttachmentKind, AttachmentRecord, IdentityRefreshRequest, MessageQuery, RawCallbackRequest,
-    VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
+    ApiPage, AttachmentKind, AttachmentRecord, IdentityMatch, IdentityRefreshRequest, MessageQuery,
+    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
+    VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -67,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Agent-friendly composed read queries that resolve names before fetching evidence.
+    Query {
+        #[command(subcommand)]
+        command: QueryCommand,
+    },
     /// Read message windows for group chats and private chats.
     Messages {
         #[command(subcommand)]
@@ -101,6 +107,15 @@ enum Command {
     Request {
         #[command(subcommand)]
         command: RequestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueryCommand {
+    /// Resolve human names, then read a bounded message window with optional voice transcript evidence.
+    Messages {
+        #[command(flatten)]
+        args: AgentMessageQueryArgs,
     },
 }
 
@@ -191,6 +206,47 @@ struct MessageFilterArgs {
     limit: i64,
     #[arg(long, value_enum, default_value = "desc")]
     order: Order,
+}
+
+#[derive(Debug, Clone, Args)]
+struct AgentMessageQueryArgs {
+    /// Human chatroom/contact wording. The CLI resolves it to conversation_id before reading.
+    #[arg(long)]
+    conversation: Option<String>,
+    /// Exact conversation_id escape hatch. Takes precedence over --conversation.
+    #[arg(long)]
+    conversation_id: Option<String>,
+    /// Human sender/member wording. If conversation is a group, room-scoped member aliases are preferred.
+    #[arg(long)]
+    sender: Option<String>,
+    /// Exact sender_wxid escape hatch. Takes precedence over --sender.
+    #[arg(long)]
+    sender_wxid: Option<String>,
+    /// Optional text/XML search term.
+    #[arg(long)]
+    q: Option<String>,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long, value_enum, default_value = "any")]
+    direction: Direction,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long, value_enum, default_value = "desc")]
+    order: Order,
+    #[arg(long, default_value_t = 10)]
+    resolve_limit: u32,
+    /// Continue with a broad read if a provided human conversation/sender cannot be resolved.
+    #[arg(long)]
+    allow_unresolved: bool,
+    /// Disable the companion voice query that returns transcript availability for the same scope.
+    #[arg(long = "no-voice-transcripts", action = ArgAction::SetFalse, default_value_t = true)]
+    voice_transcripts: bool,
 }
 
 #[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
@@ -580,6 +636,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
         },
+        Command::Query { command } => match command {
+            QueryCommand::Messages { args } => {
+                print_json(agent_query_messages(&client, args).await?)?;
+            }
+        },
         Command::Messages { command } => match command {
             MessagesCommand::List { filters } => {
                 print_json(client.messages(&message_query(None, filters)).await?)?;
@@ -771,6 +832,267 @@ fn message_query(q: Option<String>, filters: MessageFilterArgs) -> MessageQuery 
         limit: Some(filters.limit),
         order: Some(filters.order.query_value()),
     }
+}
+
+async fn agent_query_messages(
+    client: &GeweSkillClient,
+    args: AgentMessageQueryArgs,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let conversation = resolve_conversation_for_query(
+        client,
+        args.conversation_id.clone(),
+        args.conversation.clone(),
+        args.resolve_limit,
+    )
+    .await?;
+    let sender = resolve_sender_for_query(
+        client,
+        args.sender_wxid.clone(),
+        args.sender.clone(),
+        conversation.id.as_deref(),
+        args.resolve_limit,
+    )
+    .await?;
+
+    if args.conversation.is_some() && conversation.id.is_none() && !args.allow_unresolved {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "executed": false,
+            "error": "conversation_unresolved",
+            "resolved": {
+                "conversation": conversation.to_json(),
+                "sender": sender.to_json(),
+            }
+        }));
+    }
+    if args.sender.is_some() && sender.id.is_none() && !args.allow_unresolved {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "executed": false,
+            "error": "sender_unresolved",
+            "resolved": {
+                "conversation": conversation.to_json(),
+                "sender": sender.to_json(),
+            }
+        }));
+    }
+
+    let query = MessageQuery {
+        q: args.q.clone(),
+        conversation_id: conversation.id.clone(),
+        sender_wxid: sender.id.clone(),
+        kind: args.kind.clone(),
+        direction: args.direction.query_value(),
+        after: args.after.clone(),
+        before: args.before.clone(),
+        cursor: args.cursor.clone(),
+        limit: Some(args.limit),
+        order: Some(args.order.query_value()),
+    };
+    let messages: ApiPage<NormalizedMessage> = client.messages(&query).await?;
+    let voice: Option<ApiPage<VoiceItem>> = if args.voice_transcripts {
+        Some(
+            client
+                .voices(&VoiceQuery {
+                    conversation_id: query.conversation_id.clone(),
+                    sender_wxid: query.sender_wxid.clone(),
+                    after: query.after.clone(),
+                    before: query.before.clone(),
+                    cursor: query.cursor.clone(),
+                    limit: query.limit,
+                    order: query.order.clone(),
+                    missing_only: None,
+                })
+                .await?,
+        )
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "executed": true,
+        "query_mode": "agent_messages",
+        "resolved": {
+            "conversation": conversation.to_json(),
+            "sender": sender.to_json(),
+        },
+        "message_query": query,
+        "messages": messages,
+        "voice": {
+            "included": args.voice_transcripts,
+            "items": voice.map(|page| page.items).unwrap_or_default()
+        }
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct QueryResolution {
+    input: Option<String>,
+    id: Option<String>,
+    selected: Option<IdentityMatch>,
+    candidates: Vec<IdentityMatch>,
+    source: &'static str,
+}
+
+impl QueryResolution {
+    fn exact(id: Option<String>) -> Self {
+        Self {
+            input: id.clone(),
+            id,
+            selected: None,
+            candidates: Vec::new(),
+            source: "exact",
+        }
+    }
+
+    fn missing(input: Option<String>, candidates: Vec<IdentityMatch>) -> Self {
+        Self {
+            input,
+            id: None,
+            selected: None,
+            candidates,
+            source: "unresolved",
+        }
+    }
+
+    fn from_identity(
+        input: Option<String>,
+        id: Option<String>,
+        selected: Option<IdentityMatch>,
+        candidates: Vec<IdentityMatch>,
+    ) -> Self {
+        Self {
+            input,
+            id,
+            selected,
+            candidates,
+            source: "identity",
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "input": self.input.clone(),
+            "id": self.id.clone(),
+            "source": self.source,
+            "selected": self.selected.clone(),
+            "candidates": self.candidates.clone(),
+        })
+    }
+}
+
+async fn resolve_conversation_for_query(
+    client: &GeweSkillClient,
+    exact: Option<String>,
+    input: Option<String>,
+    limit: u32,
+) -> Result<QueryResolution, Box<dyn std::error::Error>> {
+    if exact
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(QueryResolution::exact(exact));
+    }
+    let Some(input) = input.filter(|value| !value.trim().is_empty()) else {
+        return Ok(QueryResolution::missing(None, Vec::new()));
+    };
+    if looks_like_stable_wechat_id(&input) {
+        return Ok(QueryResolution::exact(Some(input)));
+    }
+
+    let response = client.resolve_identity(&input, Some(limit)).await?;
+    let selected = response
+        .items
+        .iter()
+        .find(|item| item.entity_type == "chatroom")
+        .or_else(|| {
+            response
+                .items
+                .iter()
+                .find(|item| item.entity_type == "contact")
+        })
+        .or_else(|| {
+            response
+                .items
+                .iter()
+                .find(|item| item.entity_type == "chatroom_member")
+        })
+        .cloned();
+    let id = selected
+        .as_ref()
+        .and_then(conversation_id_from_identity_match);
+    Ok(QueryResolution::from_identity(
+        Some(input),
+        id,
+        selected,
+        response.items,
+    ))
+}
+
+async fn resolve_sender_for_query(
+    client: &GeweSkillClient,
+    exact: Option<String>,
+    input: Option<String>,
+    conversation_id: Option<&str>,
+    limit: u32,
+) -> Result<QueryResolution, Box<dyn std::error::Error>> {
+    if exact
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(QueryResolution::exact(exact));
+    }
+    let Some(input) = input.filter(|value| !value.trim().is_empty()) else {
+        return Ok(QueryResolution::missing(None, Vec::new()));
+    };
+    if looks_like_stable_wechat_id(&input) {
+        return Ok(QueryResolution::exact(Some(input)));
+    }
+
+    let response = client.resolve_identity(&input, Some(limit.max(20))).await?;
+    let selected = response
+        .items
+        .iter()
+        .find(|item| {
+            item.entity_type == "chatroom_member" && item.chatroom_id.as_deref() == conversation_id
+        })
+        .or_else(|| {
+            response
+                .items
+                .iter()
+                .find(|item| item.entity_type == "contact")
+        })
+        .or_else(|| {
+            response
+                .items
+                .iter()
+                .find(|item| item.entity_type == "chatroom_member")
+        })
+        .cloned();
+    let id = selected.as_ref().map(|item| item.entity_id.clone());
+    Ok(QueryResolution::from_identity(
+        Some(input),
+        id,
+        selected,
+        response.items,
+    ))
+}
+
+fn conversation_id_from_identity_match(item: &IdentityMatch) -> Option<String> {
+    match item.entity_type.as_str() {
+        "chatroom" | "contact" => Some(item.entity_id.clone()),
+        "chatroom_member" => item.chatroom_id.clone(),
+        _ => None,
+    }
+}
+
+fn looks_like_stable_wechat_id(value: &str) -> bool {
+    let value = value.trim();
+    value.ends_with("@chatroom")
+        || value.starts_with("wxid_")
+        || value.starts_with("gh_")
+        || value.starts_with("openim_")
 }
 
 fn voice_query(filters: VoiceFilterArgs, missing_only: Option<bool>) -> VoiceQuery {
