@@ -107,12 +107,15 @@ Prefer `identity resolve` over keyword search for names. If multiple candidates 
 Use both event surfaces before claiming who joined, left, was removed, or renamed something:
 
 ```bash
+gewe-skill --json query chatroom-events --conversation '<chatroom wording>' --limit 100
+gewe-skill --json query chatroom-events --conversation '<chatroom wording>' --event-type member_joined,member_left,member_removed --limit 100
+gewe-skill --json query chatroom-events --conversation '<chatroom wording>' --after '<iso-time>' --before '<iso-time>' --limit 100
 gewe-skill --json chatrooms events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill --json chatrooms system-events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill --json chatrooms snapshots --chatroom-id '<chatroom_id>' --limit 20
 ```
 
-Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
+Prefer `query chatroom-events` for Agent answers because it resolves the group name and merges member/system events into one timeline. Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
 
 ## Attachments
 
