@@ -189,6 +189,7 @@ If `voice.ready_without_completed_transcript` is greater than zero, run a bounde
 
 ```bash
 gewe-skill --json maintenance voice-issues --limit 50
+gewe-skill --json maintenance voice-repair --limit 20 --provider codex-asr --language zh
 gewe-skill --json maintenance asr-backfill --limit 20 --provider codex-asr --language zh
 ```
 
@@ -197,6 +198,8 @@ Prefer `maintenance voice-issues` before repair. It returns an Agent-readable ac
 - `missing_attachment`: run `sync attachments` before ASR.
 - `asr_pending`: run bounded `voice transcribe` or `maintenance asr-backfill`.
 - `asr_failed`: retry only after the provider or decoder issue is fixed.
+
+Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
 
 The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
 

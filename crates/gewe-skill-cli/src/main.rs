@@ -539,6 +539,17 @@ enum MaintenanceCommand {
         #[command(flatten)]
         filters: VoiceFilterArgs,
     },
+    /// Run a bounded ASR repair pass and return before/after voice issue counts.
+    VoiceRepair {
+        #[command(flatten)]
+        filters: VoiceFilterArgs,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Refresh missing display memory for wxids seen in recent chatroom events.
     IdentityBackfill {
         #[arg(long, default_value_t = 500)]
@@ -1009,6 +1020,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MaintenanceCommand::VoiceIssues { filters } => {
                 print_json(
                     voice_maintenance::voice_issues(&client, voice_query(filters, None)).await?,
+                )?;
+            }
+            MaintenanceCommand::VoiceRepair {
+                filters,
+                provider,
+                language,
+                force,
+            } => {
+                print_json(
+                    voice_maintenance::voice_repair(
+                        &client,
+                        voice_query(filters, None),
+                        provider,
+                        language,
+                        force,
+                    )
+                    .await?,
                 )?;
             }
             MaintenanceCommand::IdentityBackfill {

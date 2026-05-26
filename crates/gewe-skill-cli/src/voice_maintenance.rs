@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use gewe_skill_client::GeweSkillClient;
-use gewe_skill_types::{VoiceItem, VoiceQuery};
+use gewe_skill_types::{VoiceItem, VoiceQuery, VoiceWarmRequest};
 use serde_json::{json, Value};
 
 pub(crate) async fn voice_issues(
@@ -41,6 +41,50 @@ pub(crate) async fn voice_issues(
             "asr_pending means audio bytes are present and a bounded ASR warm/transcribe pass can fill the transcript",
             "asr_failed means ASR has already failed once; retry only when the provider or decoder issue has been fixed",
             "keep message_key, attachment sha256, and transcript status as evidence when explaining voice coverage"
+        ]
+    }))
+}
+
+pub(crate) async fn voice_repair(
+    client: &GeweSkillClient,
+    query: VoiceQuery,
+    provider: Option<String>,
+    language: Option<String>,
+    force: bool,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let before = voice_issues(client, query.clone()).await?;
+    let repair = client
+        .warm_voice(&VoiceWarmRequest {
+            conversation_id: query.conversation_id.clone(),
+            sender_wxid: query.sender_wxid.clone(),
+            after: query.after.clone(),
+            before: query.before.clone(),
+            limit: query.limit,
+            provider: provider.clone(),
+            language: language.clone(),
+            force: Some(force),
+        })
+        .await?;
+    let after = voice_issues(client, query.clone()).await?;
+    let delta = voice_issue_delta(&before, &after);
+
+    Ok(json!({
+        "ok": true,
+        "query_mode": "maintenance_voice_repair",
+        "voice_query": query,
+        "repair_request": {
+            "provider": provider,
+            "language": language,
+            "force": force
+        },
+        "before": before,
+        "repair": repair,
+        "after": after,
+        "delta": delta,
+        "agent_hints": [
+            "voice-repair runs bounded ASR warm; it does not sync missing attachments because that requires edge admin credentials",
+            "if missing_attachment remains after repair, run sync attachments first and then rerun voice-repair",
+            "if asr_failed remains, inspect transcript_error before retrying repeatedly"
         ]
     }))
 }
@@ -161,6 +205,51 @@ fn recommended_cli(action: &str, message_key: &str) -> Vec<String> {
     }
 }
 
+fn voice_issue_delta(before: &Value, after: &Value) -> Value {
+    let before_total = issue_count(before);
+    let after_total = issue_count(after);
+    let issue_types = ["missing_attachment", "asr_pending", "asr_failed"];
+    let by_issue_type = issue_types
+        .iter()
+        .map(|issue_type| {
+            let before_count = issue_type_count(before, issue_type);
+            let after_count = issue_type_count(after, issue_type);
+            (
+                (*issue_type).to_string(),
+                json!({
+                    "before": before_count,
+                    "after": after_count,
+                    "resolved": before_count.saturating_sub(after_count),
+                    "new": after_count.saturating_sub(before_count)
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    json!({
+        "before_issue_count": before_total,
+        "after_issue_count": after_total,
+        "resolved_issue_count": before_total.saturating_sub(after_total),
+        "new_issue_count": after_total.saturating_sub(before_total),
+        "by_issue_type": by_issue_type
+    })
+}
+
+fn issue_count(value: &Value) -> usize {
+    value
+        .get("issue_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize
+}
+
+fn issue_type_count(value: &Value, issue_type: &str) -> usize {
+    value
+        .get("by_issue_type")
+        .and_then(|counts| counts.get(issue_type))
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VoiceIssueClassification {
     issue_type: &'static str,
@@ -250,5 +339,30 @@ mod tests {
             classify_voice_issue("transcribed", Some("completed"), true),
             None
         );
+    }
+
+    #[test]
+    fn voice_issue_delta_counts_resolved_by_type() {
+        let before = json!({
+            "issue_count": 4,
+            "by_issue_type": {
+                "missing_attachment": 2,
+                "asr_pending": 1,
+                "asr_failed": 1
+            }
+        });
+        let after = json!({
+            "issue_count": 2,
+            "by_issue_type": {
+                "missing_attachment": 2
+            }
+        });
+
+        let delta = voice_issue_delta(&before, &after);
+
+        assert_eq!(delta["resolved_issue_count"], 2);
+        assert_eq!(delta["by_issue_type"]["asr_pending"]["resolved"], 1);
+        assert_eq!(delta["by_issue_type"]["asr_failed"]["resolved"], 1);
+        assert_eq!(delta["by_issue_type"]["missing_attachment"]["resolved"], 0);
     }
 }
