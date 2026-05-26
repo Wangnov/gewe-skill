@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to test, for example v0.1.0"
-        required: true
-        default: "v0.1.0"
+        description: "Release tag to test, for example v0.1.43. Leave empty to use the current workspace version."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -39,6 +39,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Resolve release tag
+        id: release-tag
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_TAG" ]; then
+            tag="$REQUESTED_TAG"
+          else
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gewe-skill-cli") | .version')"
+            tag="v${version}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $tag"
+
       - name: Install musl tools
         if: matrix.musl
         run: |
@@ -54,7 +70,7 @@ jobs:
 
       - name: Build release archives
         run: |
-          dist build --tag "${{ inputs.tag }}" --artifacts=local --target "${{ matrix.target }}"
+          dist build --tag "${{ steps.release-tag.outputs.tag }}" --artifacts=local --target "${{ matrix.target }}"
 
       - name: Smoke test archives
         shell: bash
