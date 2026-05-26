@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -1209,6 +1210,8 @@ async fn agent_query_chatroom_events(
                 .map(|before| received_at <= before)
                 .unwrap_or(true)
     });
+    let mut seen_events = HashSet::new();
+    events.retain(|event| seen_events.insert(timeline_event_dedupe_key(event)));
 
     events.sort_by(|left, right| {
         let left_time = left
@@ -1254,6 +1257,40 @@ async fn agent_query_chatroom_events(
             "if system and member events disagree, report the disagreement instead of guessing"
         ]
     }))
+}
+
+fn timeline_event_dedupe_key(event: &Value) -> String {
+    let read = |key: &str| {
+        event
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let target_names = event
+        .get("target_names")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    [
+        read("source"),
+        read("event_type"),
+        read("received_at"),
+        read("content_text"),
+        read("template_text"),
+        read("member_wxid"),
+        read("actor_wxid"),
+        read("target_wxid"),
+        read("current_value"),
+        target_names,
+    ]
+    .join("|")
 }
 
 fn member_event_timeline_item(event: ChatroomMemberEvent) -> Value {
