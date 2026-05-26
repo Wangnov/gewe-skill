@@ -406,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let contact_ids = response
                         .items
                         .iter()
-                        .filter(|item| item.entity_type == "contact")
+                        .filter(|item| item.entity_type == "contact" && item.score >= 0.9)
                         .map(|item| item.entity_id.clone())
                         .collect::<Vec<_>>();
                     response.items.retain(|item| {
