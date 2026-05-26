@@ -70,10 +70,59 @@ fn voice_issue_json(item: &VoiceItem) -> Option<Value> {
         "attachment_object_key": item.attachment.as_ref().and_then(|record| record.object_key.clone()),
         "transcript_status": transcript_status,
         "transcript_error": item.transcript.as_ref().and_then(|record| record.error.clone()),
-        "message": item.message,
-        "attachment": item.attachment,
-        "transcript": item.transcript
+        "message_evidence": message_evidence(item),
+        "attachment_evidence": attachment_evidence(item),
+        "transcript_evidence": transcript_evidence(item)
     }))
+}
+
+fn message_evidence(item: &VoiceItem) -> Value {
+    json!({
+        "message_key": item.message.message_key,
+        "conversation_id": item.message.conversation_id,
+        "sender_wxid": item.message.sender_wxid,
+        "received_at": item.message.received_at,
+        "schema_version": item.message.schema_version,
+        "msg_id": item.message.msg_id,
+        "new_msg_id": item.message.new_msg_id,
+        "msg_type": item.message.msg_type,
+        "kind": item.message.kind,
+        "is_group": item.message.is_group,
+        "is_outgoing": item.message.is_outgoing
+    })
+}
+
+fn attachment_evidence(item: &VoiceItem) -> Option<Value> {
+    item.attachment.as_ref().map(|record| {
+        json!({
+            "id": record.id,
+            "edge_job_id": record.edge_job_id,
+            "message_key": record.message_key,
+            "kind": record.kind,
+            "variant": record.variant,
+            "object_key": record.object_key,
+            "sha256": record.sha256,
+            "size_bytes": record.size_bytes,
+            "mime_type": record.mime_type,
+            "created_at": record.created_at
+        })
+    })
+}
+
+fn transcript_evidence(item: &VoiceItem) -> Option<Value> {
+    item.transcript.as_ref().map(|record| {
+        json!({
+            "message_key": record.message_key,
+            "attachment_sha256": record.attachment_sha256,
+            "provider": record.provider,
+            "language": record.language,
+            "status": record.status,
+            "error": record.error,
+            "duration_ms": record.duration_ms,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at
+        })
+    })
 }
 
 fn recommended_cli(action: &str, message_key: &str) -> Vec<String> {
