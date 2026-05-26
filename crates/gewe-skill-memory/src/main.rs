@@ -3814,3 +3814,30 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn event_identity_candidates_skip_empty_and_chatroom_ids() {
+        let mut candidates = BTreeSet::new();
+        push_event_identity_candidate(&mut candidates, "123@chatroom".to_string(), " ".to_string());
+        push_event_identity_candidate(
+            &mut candidates,
+            "123@chatroom".to_string(),
+            "456@chatroom".to_string(),
+        );
+        push_event_identity_candidate(
+            &mut candidates,
+            "123@chatroom".to_string(),
+            "wxid_member".to_string(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = candidates.iter().next().expect("candidate exists");
+        assert_eq!(candidate.chatroom_id, "123@chatroom");
+        assert_eq!(candidate.wxid, "wxid_member");
+    }
+}

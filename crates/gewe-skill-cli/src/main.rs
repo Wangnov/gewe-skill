@@ -2378,3 +2378,76 @@ fn print_json(value: impl serde::Serialize) -> Result<(), serde_json::Error> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn event_type_filters_normalize_spacing_and_hyphens() {
+        let filters = normalized_event_type_filters(&[
+            " member-joined ".to_string(),
+            "member_left".to_string(),
+            "".to_string(),
+        ]);
+        assert_eq!(filters, vec!["member_joined", "member_left"]);
+    }
+
+    #[test]
+    fn timeline_event_dedupe_key_ignores_edge_event_id_noise() {
+        let first = json!({
+            "source": "system_event",
+            "event_type": "system_unknown",
+            "received_at": "2026-05-26T15:05:06.874Z",
+            "content_text": "",
+            "template_text": null,
+            "target_names": [],
+            "details": { "edge_event_id": 1 }
+        });
+        let second = json!({
+            "source": "system_event",
+            "event_type": "system_unknown",
+            "received_at": "2026-05-26T15:05:06.874Z",
+            "content_text": "",
+            "template_text": null,
+            "target_names": [],
+            "details": { "edge_event_id": 129 }
+        });
+        assert_eq!(
+            timeline_event_dedupe_key(&first),
+            timeline_event_dedupe_key(&second)
+        );
+    }
+
+    #[test]
+    fn identity_enrichment_adds_display_name_but_keeps_stable_wxid() {
+        let wxid = "wxid_left_member".to_string();
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            wxid.clone(),
+            Some(IdentityProfileResponse {
+                entity_id: wxid.clone(),
+                chatroom_id: Some("123@chatroom".to_string()),
+                effective_display_name: Some("视频怪物".to_string()),
+                contact: None,
+                chatroom_member: None,
+                aliases: Vec::new(),
+            }),
+        );
+        let mut event = json!({
+            "source": "member_event",
+            "event_type": "member_left",
+            "received_at": "2026-05-26T08:34:51.997Z",
+            "chatroom_id": "123@chatroom",
+            "member_wxid": wxid,
+            "summary": "member left: wxid_left_member"
+        });
+
+        apply_identity_enrichment(&mut event, &profiles);
+
+        assert_eq!(event["member_wxid"], "wxid_left_member");
+        assert_eq!(event["member_display_name"], "视频怪物");
+        assert_eq!(event["summary"], "member left: 视频怪物");
+    }
+}
