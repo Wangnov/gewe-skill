@@ -696,10 +696,19 @@ async fn query_identity_matches(
                      SELECT COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), NULLIF(alias, ''))
                      FROM identity_contacts WHERE wxid = entity_id
                    )
-                   WHEN entity_type = 'chatroom_member' THEN (
-                     SELECT COALESCE(NULLIF(display_name, ''), NULLIF(nickname, ''))
-                     FROM identity_chatroom_members
-                     WHERE chatroom_id = scope_key AND member_wxid = entity_id
+                   WHEN entity_type = 'chatroom_member' THEN COALESCE(
+                     (SELECT NULLIF(remark, '')
+                      FROM identity_contacts
+                      WHERE wxid = entity_id),
+                     (SELECT NULLIF(display_name, '')
+                      FROM identity_chatroom_members
+                      WHERE chatroom_id = scope_key AND member_wxid = entity_id),
+                     (SELECT NULLIF(nickname, '')
+                      FROM identity_chatroom_members
+                      WHERE chatroom_id = scope_key AND member_wxid = entity_id),
+                     (SELECT COALESCE(NULLIF(nickname, ''), NULLIF(alias, ''))
+                      FROM identity_contacts
+                      WHERE wxid = entity_id)
                    )
                  END,
                  alias
@@ -795,7 +804,14 @@ async fn refresh_identity(
         }
     }
 
-    if request.chatroom_id.is_none() && !request.full.unwrap_or(false) {
+    if request.chatroom_id.is_none()
+        && request
+            .wxids
+            .as_ref()
+            .map(|wxids| wxids.is_empty())
+            .unwrap_or(true)
+        && !request.full.unwrap_or(false)
+    {
         let limit = request.recent_chatrooms.unwrap_or(20).clamp(1, 200);
         let chatroom_ids = recent_chatroom_ids(&state.db, limit).await?;
         for chatroom_id in chatroom_ids {

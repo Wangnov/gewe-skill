@@ -42,14 +42,21 @@ GEWE_SKILL_WRITE_TOKEN=...
 gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --limit 10
 ```
 
-2. If names look stale or missing, refresh only the needed identity scope:
+2. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
+
+```bash
+gewe-skill --json identity warm --chatroom-id '<chatroom_id>' --recent-messages 200 --max-contacts 50
+```
+
+3. If names still look stale or missing, refresh only the needed identity scope:
 
 ```bash
 gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
+gewe-skill --json identity refresh --wxids '<wxid1>,<wxid2>'
 gewe-skill --json identity refresh --recent-chatrooms 20
 ```
 
-3. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
+4. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
 
 ```bash
 gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
@@ -58,14 +65,14 @@ gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-w
 gewe-skill --json messages list --conversation-id '<conversation_id>' --kind text --direction incoming --limit 50
 ```
 
-4. Search within a scoped window instead of broad global search when the user named a group/person/time:
+5. Search within a scoped window instead of broad global search when the user named a group/person/time:
 
 ```bash
 gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
 gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --after '<iso-time>' --limit 20
 ```
 
-5. If a specific message matters, fetch nearby context:
+6. If a specific message matters, fetch nearby context:
 
 ```bash
 gewe-skill --json messages context --message-key '<message_key>' --before 5 --after 5
@@ -131,6 +138,7 @@ Do not use raw writes unless the user asked for that specific write.
 
 - Resolve names first, then read messages by stable ids.
 - Treat room-scoped member aliases as scoped to `chatroom_id`; the same display name may appear in multiple groups.
+- For chatroom members, prefer the user's contact remark when available, then room-scoped display/card names, then nicknames.
 - Observed aliases from quoted messages are useful evidence, but may be historical. Current GeWe group member info has higher confidence for present state.
 - For group-card or nickname changes, preserve the original message text and avoid over-normalizing.
 - For files, images, voice, video, and emoji, mention whether the attachment was downloaded or only detected.

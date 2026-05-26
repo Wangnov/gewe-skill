@@ -129,6 +129,15 @@ enum IdentityCommand {
         #[arg(long)]
         recent_chatrooms: Option<i64>,
     },
+    /// Prepare identity memory for one chatroom without broad contact polling.
+    Warm {
+        #[arg(long)]
+        chatroom_id: String,
+        #[arg(long, default_value_t = 200)]
+        recent_messages: i64,
+        #[arg(long, default_value_t = 50)]
+        max_contacts: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -394,10 +403,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let mut response = client.resolve_identity(&q, Some(limit)).await?;
                 if let Some(chatroom_id) = chatroom_id {
+                    let contact_ids = response
+                        .items
+                        .iter()
+                        .filter(|item| item.entity_type == "contact")
+                        .map(|item| item.entity_id.clone())
+                        .collect::<Vec<_>>();
                     response.items.retain(|item| {
                         item.chatroom_id.as_deref() == Some(chatroom_id.as_str())
                             || (item.entity_type == "chatroom" && item.entity_id == chatroom_id)
                     });
+                    for contact_id in contact_ids {
+                        let member_response = client
+                            .resolve_identity(&contact_id, Some(limit.max(50)))
+                            .await?;
+                        for item in member_response.items {
+                            if item.entity_type != "chatroom_member"
+                                || item.chatroom_id.as_deref() != Some(chatroom_id.as_str())
+                                || response.items.iter().any(|existing| {
+                                    existing.entity_type == item.entity_type
+                                        && existing.entity_id == item.entity_id
+                                        && existing.chatroom_id == item.chatroom_id
+                                })
+                            {
+                                continue;
+                            }
+                            response.items.push(item);
+                        }
+                    }
                 }
                 print_json(response)?;
             }
@@ -414,6 +447,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recent_chatrooms,
                 };
                 print_json(client.refresh_identity(&request).await?)?;
+            }
+            IdentityCommand::Warm {
+                chatroom_id,
+                recent_messages,
+                max_contacts,
+            } => {
+                let max_contacts = max_contacts.clamp(1, 500);
+                let chatroom_refresh = client
+                    .refresh_identity(&IdentityRefreshRequest {
+                        full: Some(false),
+                        chatroom_id: Some(chatroom_id.clone()),
+                        wxids: None,
+                        recent_chatrooms: None,
+                    })
+                    .await?;
+
+                let messages = client
+                    .messages(&MessageQuery {
+                        q: None,
+                        conversation_id: Some(chatroom_id.clone()),
+                        sender_wxid: None,
+                        kind: None,
+                        direction: None,
+                        after: None,
+                        before: None,
+                        cursor: None,
+                        limit: Some(recent_messages.clamp(1, 1000)),
+                        order: Some("desc".to_string()),
+                    })
+                    .await?;
+
+                let mut active_wxids = Vec::new();
+                for message in &messages.items {
+                    let Some(sender_wxid) = message.sender_wxid.as_deref() else {
+                        continue;
+                    };
+                    if sender_wxid.is_empty()
+                        || sender_wxid.ends_with("@chatroom")
+                        || active_wxids.iter().any(|item| item == sender_wxid)
+                    {
+                        continue;
+                    }
+                    active_wxids.push(sender_wxid.to_string());
+                    if active_wxids.len() >= max_contacts {
+                        break;
+                    }
+                }
+
+                let contact_refresh = if active_wxids.is_empty() {
+                    None
+                } else {
+                    Some(
+                        client
+                            .refresh_identity(&IdentityRefreshRequest {
+                                full: Some(false),
+                                chatroom_id: None,
+                                wxids: Some(active_wxids.clone()),
+                                recent_chatrooms: None,
+                            })
+                            .await?,
+                    )
+                };
+
+                print_json(serde_json::json!({
+                    "ok": chatroom_refresh.ok && contact_refresh.as_ref().map(|item| item.ok).unwrap_or(true),
+                    "strategy": "chatroom_active_contacts",
+                    "chatroom_id": chatroom_id,
+                    "recent_messages_scanned": messages.items.len(),
+                    "max_contacts": max_contacts,
+                    "active_contacts_refreshed": active_wxids.len(),
+                    "active_wxids": active_wxids,
+                    "chatroom_refresh": chatroom_refresh,
+                    "contact_refresh": contact_refresh,
+                }))?;
             }
         },
         Command::Messages { command } => match command {
