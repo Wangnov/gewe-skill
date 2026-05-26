@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Debug, Parser)]
@@ -484,6 +485,107 @@ enum SyncCommand {
         after_job_id: Option<i64>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-attachment-sync.cursor"
+        )]
+        cursor_file: PathBuf,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_DIR",
+            default_value = "/opt/gewe-skill-memory/data/attachments"
+        )]
+        attachment_dir: PathBuf,
+    },
+    /// Inspect the edge attachment download queue.
+    AttachmentQueue {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        asset_type: Option<String>,
+        #[arg(long)]
+        after_job_id: Option<i64>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Backfill missing edge attachment download jobs from stored messages.
+    AttachmentBackfill {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+        #[arg(long, default_value = "voice")]
+        asset_type: String,
+        #[arg(long)]
+        schema_version: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_existing: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Requeue pending/retryable/stale edge attachment download jobs.
+    AttachmentRequeue {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+    },
+    /// Reset terminal edge attachment jobs, then send them back to the queue.
+    AttachmentRetry {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+        #[arg(long, default_value = "failed")]
+        status: String,
+        #[arg(long)]
+        asset_type: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Run one bounded attachment queue repair sweep: backfill, requeue, then sync completed files.
+    AttachmentRepair {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+        #[arg(long, default_value = "voice")]
+        asset_type: String,
+        #[arg(long)]
+        schema_version: Option<String>,
+        #[arg(long, default_value_t = false)]
+        include_existing: bool,
+        #[arg(long, default_value_t = 100)]
+        backfill_limit: u32,
+        #[arg(long, default_value_t = 50)]
+        sync_limit: u32,
+        #[arg(long, default_value_t = 2_000)]
+        settle_ms: u64,
         #[arg(
             long,
             env = "GEWE_SKILL_ATTACHMENT_CURSOR_FILE",
@@ -982,6 +1084,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &admin_token,
                     after_job_id,
                     limit,
+                    cursor_file,
+                    attachment_dir,
+                )
+                .await?;
+                print_json(result)?;
+            }
+            SyncCommand::AttachmentQueue {
+                edge_url,
+                admin_token,
+                status,
+                asset_type,
+                after_job_id,
+                limit,
+            } => {
+                let result = edge_download_jobs(
+                    &edge_url,
+                    &admin_token,
+                    status,
+                    asset_type,
+                    after_job_id,
+                    limit,
+                )
+                .await?;
+                print_json(result)?;
+            }
+            SyncCommand::AttachmentBackfill {
+                edge_url,
+                admin_token,
+                asset_type,
+                schema_version,
+                include_existing,
+                limit,
+            } => {
+                let result = backfill_edge_download_jobs(
+                    &edge_url,
+                    &admin_token,
+                    asset_type,
+                    schema_version,
+                    include_existing,
+                    limit,
+                )
+                .await?;
+                print_json(result)?;
+            }
+            SyncCommand::AttachmentRequeue {
+                edge_url,
+                admin_token,
+            } => {
+                let result = requeue_edge_download_jobs(&edge_url, &admin_token).await?;
+                print_json(result)?;
+            }
+            SyncCommand::AttachmentRetry {
+                edge_url,
+                admin_token,
+                status,
+                asset_type,
+                limit,
+            } => {
+                let result =
+                    retry_edge_download_jobs(&edge_url, &admin_token, status, asset_type, limit)
+                        .await?;
+                print_json(result)?;
+            }
+            SyncCommand::AttachmentRepair {
+                edge_url,
+                admin_token,
+                asset_type,
+                schema_version,
+                include_existing,
+                backfill_limit,
+                sync_limit,
+                settle_ms,
+                cursor_file,
+                attachment_dir,
+            } => {
+                let result = repair_edge_attachment_queue(
+                    &client,
+                    &edge_url,
+                    &admin_token,
+                    asset_type,
+                    schema_version,
+                    include_existing,
+                    backfill_limit,
+                    sync_limit,
+                    settle_ms,
                     cursor_file,
                     attachment_dir,
                 )
@@ -1854,6 +2041,215 @@ fn attachment_cursor_overlap() -> i64 {
         .clamp(0, 5000)
 }
 
+async fn edge_download_jobs(
+    edge_url: &str,
+    admin_token: &str,
+    status: Option<String>,
+    asset_type: Option<String>,
+    after_job_id: Option<i64>,
+    limit: u32,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+    edge_admin_get_json(
+        &http,
+        edge_url,
+        admin_token,
+        "/admin/download-jobs",
+        vec![
+            ("limit", Some(limit.to_string())),
+            ("after_job_id", after_job_id.map(|value| value.to_string())),
+            ("status", status),
+            ("asset_type", asset_type),
+        ],
+    )
+    .await
+}
+
+async fn backfill_edge_download_jobs(
+    edge_url: &str,
+    admin_token: &str,
+    asset_type: String,
+    schema_version: Option<String>,
+    include_existing: bool,
+    limit: u32,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+    edge_admin_post_json(
+        &http,
+        edge_url,
+        admin_token,
+        "/admin/backfill-download-jobs",
+        vec![
+            ("limit", Some(limit.to_string())),
+            ("asset_type", Some(asset_type)),
+            ("schema_version", schema_version),
+            (
+                "include_existing",
+                include_existing.then(|| "true".to_string()),
+            ),
+        ],
+    )
+    .await
+}
+
+async fn requeue_edge_download_jobs(
+    edge_url: &str,
+    admin_token: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+    edge_admin_post_json(
+        &http,
+        edge_url,
+        admin_token,
+        "/admin/requeue-downloads",
+        vec![],
+    )
+    .await
+}
+
+async fn retry_edge_download_jobs(
+    edge_url: &str,
+    admin_token: &str,
+    status: String,
+    asset_type: Option<String>,
+    limit: u32,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+    edge_admin_post_json(
+        &http,
+        edge_url,
+        admin_token,
+        "/admin/retry-downloads",
+        vec![
+            ("limit", Some(limit.to_string())),
+            ("status", Some(status)),
+            ("asset_type", asset_type),
+        ],
+    )
+    .await
+}
+
+async fn repair_edge_attachment_queue(
+    client: &GeweSkillClient,
+    edge_url: &str,
+    admin_token: &str,
+    asset_type: String,
+    schema_version: Option<String>,
+    include_existing: bool,
+    backfill_limit: u32,
+    sync_limit: u32,
+    settle_ms: u64,
+    cursor_file: PathBuf,
+    attachment_dir: PathBuf,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+    let before = edge_admin_get_json(&http, edge_url, admin_token, "/admin/stats", vec![]).await?;
+    let backfill = backfill_edge_download_jobs(
+        edge_url,
+        admin_token,
+        asset_type.clone(),
+        schema_version.clone(),
+        include_existing,
+        backfill_limit,
+    )
+    .await?;
+    let requeue = requeue_edge_download_jobs(edge_url, admin_token).await?;
+
+    if settle_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    }
+
+    let sync = sync_edge_attachments(
+        client,
+        edge_url,
+        admin_token,
+        None,
+        sync_limit,
+        cursor_file,
+        attachment_dir,
+    )
+    .await?;
+    let after = edge_admin_get_json(&http, edge_url, admin_token, "/admin/stats", vec![]).await?;
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "query_mode": "sync_attachment_queue_repair",
+        "asset_type": asset_type,
+        "schema_version": schema_version,
+        "include_existing": include_existing,
+        "settle_ms": settle_ms,
+        "before": before,
+        "backfill": backfill,
+        "requeue": requeue,
+        "sync": sync,
+        "after": after,
+        "agent_hints": [
+            "attachment-repair backfills missing edge jobs, requeues ready jobs, then pulls completed files into memory",
+            "if backfill queued jobs but sync wrote zero files, run attachment-repair again after the edge queue finishes processing",
+            "use sync attachment-queue to inspect failed, unavailable, pending, retry_scheduled, and completed jobs before retrying terminal failures"
+        ]
+    }))
+}
+
+async fn edge_admin_get_json(
+    http: &reqwest::Client,
+    edge_url: &str,
+    admin_token: &str,
+    path: &str,
+    params: Vec<(&str, Option<String>)>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let url = edge_admin_url(edge_url, path, params)?;
+    Ok(http
+        .get(url)
+        .bearer_auth(admin_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+async fn edge_admin_post_json(
+    http: &reqwest::Client,
+    edge_url: &str,
+    admin_token: &str,
+    path: &str,
+    params: Vec<(&str, Option<String>)>,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let url = edge_admin_url(edge_url, path, params)?;
+    Ok(http
+        .post(url)
+        .bearer_auth(admin_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+fn edge_admin_url(
+    edge_url: &str,
+    path: &str,
+    params: Vec<(&str, Option<String>)>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut url = Url::parse(&format!(
+        "{}/{}",
+        edge_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    ))?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in params {
+            if let Some(value) = value.map(|item| item.trim().to_string()) {
+                if !value.is_empty() {
+                    query.append_pair(key, &value);
+                }
+            }
+        }
+    }
+    Ok(url.to_string())
+}
+
 async fn sync_one_attachment(
     client: &GeweSkillClient,
     http: &reqwest::Client,
@@ -1956,5 +2352,25 @@ mod tests {
     fn attachment_cursor_does_not_advance_when_first_item_fails() {
         let cursor = attachment_sync_cursor_after_batch(100, 250, &[(120, false), (140, true)]);
         assert_eq!(cursor, 100);
+    }
+
+    #[test]
+    fn edge_admin_url_builds_filtered_queue_url() {
+        let url = edge_admin_url(
+            "https://example.com/",
+            "/admin/download-jobs",
+            vec![
+                ("limit", Some("20".to_string())),
+                ("status", Some("failed".to_string())),
+                ("asset_type", Some("voice".to_string())),
+                ("schema_version", None),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            url,
+            "https://example.com/admin/download-jobs?limit=20&status=failed&asset_type=voice"
+        );
     }
 }
