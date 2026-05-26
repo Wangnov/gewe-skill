@@ -1750,19 +1750,31 @@ async fn sync_edge_attachments(
 
     let mut written = 0usize;
     let mut failed = Vec::new();
+    let mut item_results = Vec::new();
     let mut last_job_id = after_job_id;
     for item in &manifest.attachments {
         last_job_id = item.job_id;
         match sync_one_attachment(client, &http, edge_url, admin_token, item, &attachment_dir).await
         {
-            Ok(_) => written += 1,
-            Err(error) => failed.push(serde_json::json!({
-                "job_id": item.job_id,
-                "error": error.to_string()
-            })),
+            Ok(_) => {
+                written += 1;
+                item_results.push((item.job_id, true));
+            }
+            Err(error) => {
+                item_results.push((item.job_id, false));
+                failed.push(serde_json::json!({
+                    "job_id": item.job_id,
+                    "error": error.to_string()
+                }));
+            }
         }
     }
-    write_cursor(&cursor_file, manifest.next_after_job_id)?;
+    let cursor_written =
+        attachment_sync_cursor_after_batch(after_job_id, manifest.next_after_job_id, &item_results);
+    write_cursor(&cursor_file, cursor_written)?;
+    let cursor_blocked_by_failed_job_id = item_results
+        .iter()
+        .find_map(|(job_id, ok)| (!ok).then_some(*job_id));
 
     Ok(serde_json::json!({
         "ok": true,
@@ -1773,9 +1785,26 @@ async fn sync_edge_attachments(
         "after_job_id": after_job_id,
         "last_job_id": last_job_id,
         "next_after_job_id": manifest.next_after_job_id,
+        "cursor_written": cursor_written,
+        "cursor_blocked_by_failed_job_id": cursor_blocked_by_failed_job_id,
         "cursor_overlap": cursor_overlap,
         "configured_cursor_overlap": configured_cursor_overlap
     }))
+}
+
+fn attachment_sync_cursor_after_batch(
+    after_job_id: i64,
+    manifest_next_after_job_id: i64,
+    item_results: &[(i64, bool)],
+) -> i64 {
+    let mut cursor = after_job_id;
+    for (job_id, ok) in item_results {
+        if !ok {
+            return cursor;
+        }
+        cursor = *job_id;
+    }
+    manifest_next_after_job_id
 }
 
 fn attachment_cursor_overlap() -> i64 {
@@ -1861,4 +1890,32 @@ fn parse_attachment_kind(value: &str) -> AttachmentKind {
 fn print_json(value: impl serde::Serialize) -> Result<(), serde_json::Error> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_cursor_stops_before_first_failed_item() {
+        let cursor = attachment_sync_cursor_after_batch(
+            100,
+            250,
+            &[(120, true), (140, true), (160, false), (180, true)],
+        );
+        assert_eq!(cursor, 140);
+    }
+
+    #[test]
+    fn attachment_cursor_uses_manifest_cursor_when_batch_succeeds() {
+        let cursor =
+            attachment_sync_cursor_after_batch(100, 250, &[(120, true), (140, true), (160, true)]);
+        assert_eq!(cursor, 250);
+    }
+
+    #[test]
+    fn attachment_cursor_does_not_advance_when_first_item_fails() {
+        let cursor = attachment_sync_cursor_after_batch(100, 250, &[(120, false), (140, true)]);
+        assert_eq!(cursor, 100);
+    }
 }
