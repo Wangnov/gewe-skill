@@ -1251,7 +1251,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let jobs =
                     edge_download_jobs(&edge_url, &admin_token, None, asset_type, None, limit)
                         .await?;
-                let result = attachment_maintenance::queue_health(&jobs);
+                let memory_attachments = client.recent_attachments(Some(limit)).await?;
+                let memory_attachments = serde_json::to_value(memory_attachments)?;
+                let result =
+                    attachment_maintenance::queue_health_with_memory(&jobs, &memory_attachments);
                 print_json(&result)?;
             }
 
@@ -2236,7 +2239,10 @@ async fn repair_edge_attachment_queue(
         queue_limit,
     )
     .await?;
-    let before_queue_health = attachment_maintenance::queue_health(&before_queue);
+    let before_memory_attachments = client.recent_attachments(Some(queue_limit)).await?;
+    let before_memory_attachments = serde_json::to_value(before_memory_attachments)?;
+    let before_queue_health =
+        attachment_maintenance::queue_health_with_memory(&before_queue, &before_memory_attachments);
     let backfill = backfill_edge_download_jobs(
         edge_url,
         admin_token,
@@ -2272,7 +2278,10 @@ async fn repair_edge_attachment_queue(
         queue_limit,
     )
     .await?;
-    let after_queue_health = attachment_maintenance::queue_health(&after_queue);
+    let after_memory_attachments = client.recent_attachments(Some(queue_limit)).await?;
+    let after_memory_attachments = serde_json::to_value(after_memory_attachments)?;
+    let after_queue_health =
+        attachment_maintenance::queue_health_with_memory(&after_queue, &after_memory_attachments);
 
     Ok(serde_json::json!({
         "ok": true,

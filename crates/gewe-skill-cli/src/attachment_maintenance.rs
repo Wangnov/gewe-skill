@@ -10,7 +10,16 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 const STATUS_PURGED: &str = "purged";
 
 pub fn queue_health(edge_jobs: &Value) -> Value {
+    queue_health_inner(edge_jobs, None)
+}
+
+pub fn queue_health_with_memory(edge_jobs: &Value, memory_attachments: &Value) -> Value {
+    queue_health_inner(edge_jobs, Some(memory_attachments))
+}
+
+fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> Value {
     let jobs = extract_jobs(edge_jobs);
+    let memory_index = memory_attachments.map(memory_attachment_index);
     let mut by_status = BTreeMap::<String, u64>::new();
     let mut by_asset_type = BTreeMap::<String, u64>::new();
     let mut by_asset_status = BTreeMap::<String, BTreeMap<String, u64>>::new();
@@ -20,10 +29,15 @@ pub fn queue_health(edge_jobs: &Value) -> Value {
     let mut message_keys = BTreeMap::<String, u64>::new();
     let mut statuses_seen = BTreeSet::<String>::new();
     let mut asset_types_seen = BTreeSet::<String>::new();
+    let mut completed_ingested_count = 0u64;
+    let mut completed_not_ingested_count = 0u64;
+    let mut completed_not_ingested_jobs = Vec::<Value>::new();
 
     for job in &jobs {
         let status = string_field(job, "status").unwrap_or_else(|| "unknown".to_string());
         let asset_type = string_field(job, "asset_type").unwrap_or_else(|| "unknown".to_string());
+        let job_key = string_field(job, "job_key");
+        let message_key = string_field(job, "message_key");
 
         statuses_seen.insert(status.clone());
         asset_types_seen.insert(asset_type.clone());
@@ -35,11 +49,29 @@ pub fn queue_health(edge_jobs: &Value) -> Value {
             .entry(status.clone())
             .or_insert(0) += 1;
 
-        if let Some(job_key) = string_field(job, "job_key") {
-            *job_keys.entry(job_key).or_insert(0) += 1;
+        if let Some(job_key) = job_key.as_ref() {
+            *job_keys.entry(job_key.clone()).or_insert(0) += 1;
         }
-        if let Some(message_key) = string_field(job, "message_key") {
-            *message_keys.entry(message_key).or_insert(0) += 1;
+        if let Some(message_key) = message_key.as_ref() {
+            *message_keys.entry(message_key.clone()).or_insert(0) += 1;
+        }
+        if status == STATUS_COMPLETED {
+            if let Some(index) = &memory_index {
+                if index.contains(job_key.as_deref(), message_key.as_deref(), &asset_type) {
+                    completed_ingested_count += 1;
+                } else {
+                    completed_not_ingested_count += 1;
+                    if completed_not_ingested_jobs.len() < 20 {
+                        completed_not_ingested_jobs.push(json!({
+                            "job_id": job.get("job_id").cloned().unwrap_or(Value::Null),
+                            "job_key": job_key,
+                            "message_key": message_key,
+                            "asset_type": asset_type,
+                            "status": status,
+                        }));
+                    }
+                }
+            }
         }
     }
 
@@ -66,10 +98,14 @@ pub fn queue_health(edge_jobs: &Value) -> Value {
     let duplicate_job_key_count = duplicate_job_keys.len() as u64;
     let duplicate_message_key_count = duplicate_message_keys.len() as u64;
 
+    let completed_memory_checked = memory_index.is_some();
+
     let health = if failed_count > 0 || duplicate_job_key_count > 0 {
         "needs_attention"
     } else if active_count > 0 {
         "in_progress"
+    } else if completed_not_ingested_count > 0 {
+        "needs_sync"
     } else if non_retryable_terminal_count > 0 {
         "has_unavailable"
     } else {
@@ -89,6 +125,10 @@ pub fn queue_health(edge_jobs: &Value) -> Value {
         "active_count": active_count,
         "retryable_terminal_count": failed_count,
         "non_retryable_terminal_count": non_retryable_terminal_count,
+        "completed_memory_checked": completed_memory_checked,
+        "completed_ingested_count": completed_ingested_count,
+        "completed_not_ingested_count": completed_not_ingested_count,
+        "completed_not_ingested_jobs": completed_not_ingested_jobs,
         "duplicate_job_key_count": duplicate_job_key_count,
         "duplicate_message_key_count": duplicate_message_key_count,
         "duplicate_job_keys": duplicate_job_keys,
@@ -99,14 +139,68 @@ pub fn queue_health(edge_jobs: &Value) -> Value {
             failed_count,
             non_retryable_terminal_count,
             duplicate_job_key_count,
+            completed_memory_checked,
+            completed_not_ingested_count,
         ),
         "agent_notes": [
-            "completed jobs should be pulled into memory with sync attachments before analysis",
+            "completed_memory_checked means completed edge jobs were compared against recent memory attachment records in the inspected window",
+            "completed_not_ingested_count means edge has completed media that was not found in memory yet and should be synced before analysis",
             "failed jobs are retryable terminal jobs, but retry them intentionally instead of looping forever",
             "unavailable and purged jobs are non-retryable terminal evidence; explain them to the user unless explicitly asked to retry upstream",
             "duplicate job keys indicate queue dedupe drift and should be investigated before bulk retrying"
         ]
     })
+}
+
+#[derive(Default)]
+struct MemoryAttachmentIndex {
+    job_keys: BTreeSet<String>,
+    message_kind_keys: BTreeSet<(String, String)>,
+}
+
+impl MemoryAttachmentIndex {
+    fn contains(&self, job_key: Option<&str>, message_key: Option<&str>, asset_type: &str) -> bool {
+        if let Some(job_key) = job_key {
+            if self.job_keys.contains(job_key) {
+                return true;
+            }
+        }
+        let Some(message_key) = message_key else {
+            return false;
+        };
+        self.message_kind_keys
+            .contains(&(message_key.to_string(), normalize_kind(asset_type)))
+    }
+}
+
+fn memory_attachment_index(memory_attachments: &Value) -> MemoryAttachmentIndex {
+    let mut index = MemoryAttachmentIndex::default();
+    for attachment in extract_memory_attachments(memory_attachments) {
+        if let Some(job_key) = string_field(attachment, "job_key") {
+            index.job_keys.insert(job_key);
+        }
+        if let Some(message_key) = string_field(attachment, "message_key") {
+            let kind = string_field(attachment, "kind")
+                .map(|value| normalize_kind(&value))
+                .unwrap_or_else(|| "unknown".to_string());
+            index.message_kind_keys.insert((message_key, kind));
+        }
+    }
+    index
+}
+
+fn extract_memory_attachments(memory_attachments: &Value) -> Vec<&Value> {
+    if let Some(items) = memory_attachments.get("items").and_then(Value::as_array) {
+        return items.iter().collect();
+    }
+    memory_attachments
+        .as_array()
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
+fn normalize_kind(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn extract_jobs(edge_jobs: &Value) -> Vec<&Value> {
@@ -141,10 +235,19 @@ fn next_actions(
     failed_count: u64,
     non_retryable_terminal_count: u64,
     duplicate_job_key_count: u64,
+    completed_memory_checked: bool,
+    completed_not_ingested_count: u64,
 ) -> Vec<Value> {
     let mut actions = Vec::new();
 
-    if completed_count > 0 {
+    if completed_memory_checked && completed_not_ingested_count > 0 {
+        actions.push(json!({
+            "action": "sync_completed_attachments",
+            "priority": "high",
+            "recommended_cli": ["sync", "attachments"],
+            "reason": "completed edge jobs exist but are not present in memory yet"
+        }));
+    } else if !completed_memory_checked && completed_count > 0 {
         actions.push(json!({
             "action": "sync_completed_attachments",
             "priority": "high",
@@ -245,5 +348,36 @@ mod tests {
         assert_eq!(report["queue_health"], "needs_attention");
         assert_eq!(report["duplicate_job_key_count"], 1);
         assert_eq!(report["duplicate_message_key_count"], 1);
+    }
+
+    #[test]
+    fn reports_completed_jobs_missing_from_memory() {
+        let edge_jobs = json!({
+            "jobs": [
+                {"job_key": "synced-job", "message_key": "m1", "asset_type": "voice", "status": "completed"},
+                {"job_key": "missing-job", "message_key": "m2", "asset_type": "image", "status": "completed"}
+            ]
+        });
+        let memory_attachments = json!({
+            "items": [
+                {"job_key": "synced-job", "message_key": "m1", "kind": "Voice"}
+            ]
+        });
+
+        let report = queue_health_with_memory(&edge_jobs, &memory_attachments);
+
+        assert_eq!(report["queue_health"], "needs_sync");
+        assert_eq!(report["completed_memory_checked"], true);
+        assert_eq!(report["completed_ingested_count"], 1);
+        assert_eq!(report["completed_not_ingested_count"], 1);
+        assert_eq!(
+            report["completed_not_ingested_jobs"][0]["job_key"],
+            "missing-job"
+        );
+        assert!(report["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "sync_completed_attachments"));
     }
 }
