@@ -469,8 +469,24 @@ enum SyncCommand {
         admin_token: String,
         #[arg(long)]
         chatroom_id: Option<String>,
+        #[arg(long)]
+        after_member_event_id: Option<i64>,
+        #[arg(long)]
+        after_system_event_id: Option<i64>,
         #[arg(long, default_value_t = 100)]
         limit: u32,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_CHATROOM_MEMBER_EVENT_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-chatroom-member-events.cursor"
+        )]
+        member_cursor_file: PathBuf,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_CHATROOM_SYSTEM_EVENT_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-chatroom-system-events.cursor"
+        )]
+        system_cursor_file: PathBuf,
     },
 }
 
@@ -518,6 +534,7 @@ struct EdgeExportEvent {
 #[derive(Debug, Deserialize)]
 struct EdgeChatroomMemberEventResponse {
     events: Vec<EdgeChatroomMemberEvent>,
+    next_after_event_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,6 +556,7 @@ struct EdgeChatroomMemberEvent {
 #[derive(Debug, Deserialize)]
 struct EdgeChatroomSystemEventResponse {
     events: Vec<EdgeChatroomSystemEvent>,
+    next_after_event_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -902,11 +920,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 edge_url,
                 admin_token,
                 chatroom_id,
+                after_member_event_id,
+                after_system_event_id,
                 limit,
+                member_cursor_file,
+                system_cursor_file,
             } => {
-                let result =
-                    sync_chatroom_events(&client, &edge_url, &admin_token, chatroom_id, limit)
-                        .await?;
+                let result = sync_chatroom_events(
+                    &client,
+                    &edge_url,
+                    &admin_token,
+                    chatroom_id,
+                    after_member_event_id,
+                    after_system_event_id,
+                    limit,
+                    member_cursor_file,
+                    system_cursor_file,
+                )
+                .await?;
                 print_json(result)?;
             }
         },
@@ -1405,15 +1436,24 @@ async fn sync_chatroom_events(
     edge_url: &str,
     admin_token: &str,
     chatroom_id: Option<String>,
+    after_member_event_id: Option<i64>,
+    after_system_event_id: Option<i64>,
     limit: u32,
+    member_cursor_file: PathBuf,
+    system_cursor_file: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    let after_member_event_id =
+        after_member_event_id.unwrap_or_else(|| read_cursor(&member_cursor_file).unwrap_or(0));
+    let after_system_event_id =
+        after_system_event_id.unwrap_or_else(|| read_cursor(&system_cursor_file).unwrap_or(0));
     let edge_url = edge_url.trim_end_matches('/');
     let http = reqwest::Client::new();
 
     let mut member_url = reqwest::Url::parse(&format!("{edge_url}/admin/chatroom-events"))?;
     member_url
         .query_pairs_mut()
-        .append_pair("limit", &limit.to_string());
+        .append_pair("limit", &limit.to_string())
+        .append_pair("after_id", &after_member_event_id.to_string());
     if let Some(chatroom_id) = chatroom_id.as_deref() {
         member_url
             .query_pairs_mut()
@@ -1431,7 +1471,8 @@ async fn sync_chatroom_events(
     let mut system_url = reqwest::Url::parse(&format!("{edge_url}/admin/chatroom-system-events"))?;
     system_url
         .query_pairs_mut()
-        .append_pair("limit", &limit.to_string());
+        .append_pair("limit", &limit.to_string())
+        .append_pair("after_id", &after_system_event_id.to_string());
     if let Some(chatroom_id) = chatroom_id.as_deref() {
         system_url
             .query_pairs_mut()
@@ -1521,6 +1562,17 @@ async fn sync_chatroom_events(
         })
         .await?;
 
+    let next_after_member_event_id = member_response
+        .next_after_event_id
+        .unwrap_or(after_member_event_id);
+    let next_after_system_event_id = system_response
+        .next_after_event_id
+        .unwrap_or(after_system_event_id);
+    if failed.is_empty() {
+        write_cursor(&member_cursor_file, next_after_member_event_id)?;
+        write_cursor(&system_cursor_file, next_after_system_event_id)?;
+    }
+
     Ok(serde_json::json!({
         "ok": failed.is_empty(),
         "member_events_scanned": member_event_count + failed.iter().filter(|item| item.get("kind").and_then(Value::as_str) == Some("member_event")).count(),
@@ -1529,6 +1581,10 @@ async fn sync_chatroom_events(
         "system_events_written": system_event_count,
         "failed_count": failed.len(),
         "failed": failed,
+        "after_member_event_id": after_member_event_id,
+        "after_system_event_id": after_system_event_id,
+        "next_after_member_event_id": next_after_member_event_id,
+        "next_after_system_event_id": next_after_system_event_id,
         "write_response": write_response
     }))
 }

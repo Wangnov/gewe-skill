@@ -349,10 +349,30 @@ async function handleAdmin(request, env, url) {
   }
 
   if (url.pathname === "/admin/chatroom-events") {
-    const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
+    const limit = clampInt(url.searchParams.get("limit"), 1, 500, 20);
     const chatroomId = url.searchParams.get("chatroom_id");
-    const rows = chatroomId
-      ? await env.DB.prepare(`
+    const hasAfterId = url.searchParams.has("after_id");
+    const afterId = Math.max(0, Number.parseInt(url.searchParams.get("after_id") || "0", 10) || 0);
+    const rows = hasAfterId
+      ? chatroomId
+        ? await env.DB.prepare(`
+          SELECT id, received_at, event_type, chatroom_id, member_wxid, previous_chatroom_name, current_chatroom_name,
+                 previous_member_count, current_member_count, previous_snapshot_id, current_snapshot_id, details_json
+          FROM chatroom_member_events
+          WHERE chatroom_id = ? AND id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(chatroomId, afterId, limit).all()
+        : await env.DB.prepare(`
+          SELECT id, received_at, event_type, chatroom_id, member_wxid, previous_chatroom_name, current_chatroom_name,
+                 previous_member_count, current_member_count, previous_snapshot_id, current_snapshot_id, details_json
+          FROM chatroom_member_events
+          WHERE id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(afterId, limit).all()
+      : chatroomId
+        ? await env.DB.prepare(`
           SELECT id, received_at, event_type, chatroom_id, member_wxid, previous_chatroom_name, current_chatroom_name,
                  previous_member_count, current_member_count, previous_snapshot_id, current_snapshot_id, details_json
           FROM chatroom_member_events
@@ -367,14 +387,40 @@ async function handleAdmin(request, env, url) {
           ORDER BY id DESC
           LIMIT ?
         `).bind(limit).all();
-    return json({ ok: true, events: rows.results || [] });
+    const events = rows.results || [];
+    const nextAfterEventId = events.reduce((max, row) => Math.max(max, Number(row.id) || max), afterId);
+    return json({ ok: true, events, next_after_event_id: nextAfterEventId });
   }
 
   if (url.pathname === "/admin/chatroom-system-events") {
-    const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
+    const limit = clampInt(url.searchParams.get("limit"), 1, 500, 20);
     const chatroomId = url.searchParams.get("chatroom_id");
-    const rows = chatroomId
-      ? await env.DB.prepare(`
+    const hasAfterId = url.searchParams.has("after_id");
+    const afterId = Math.max(0, Number.parseInt(url.searchParams.get("after_id") || "0", 10) || 0);
+    const rows = hasAfterId
+      ? chatroomId
+        ? await env.DB.prepare(`
+          SELECT id, received_at, event_type, chatroom_id, actor_wxid, actor_name,
+                 target_wxid, target_name, target_wxids_json, target_names_json,
+                 previous_value, current_value, template_text, content_text,
+                 raw_event_id, message_id, details_json
+          FROM chatroom_system_events
+          WHERE chatroom_id = ? AND id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(chatroomId, afterId, limit).all()
+        : await env.DB.prepare(`
+          SELECT id, received_at, event_type, chatroom_id, actor_wxid, actor_name,
+                 target_wxid, target_name, target_wxids_json, target_names_json,
+                 previous_value, current_value, template_text, content_text,
+                 raw_event_id, message_id, details_json
+          FROM chatroom_system_events
+          WHERE id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(afterId, limit).all()
+      : chatroomId
+        ? await env.DB.prepare(`
           SELECT id, received_at, event_type, chatroom_id, actor_wxid, actor_name,
                  target_wxid, target_name, target_wxids_json, target_names_json,
                  previous_value, current_value, template_text, content_text,
@@ -393,7 +439,9 @@ async function handleAdmin(request, env, url) {
           ORDER BY id DESC
           LIMIT ?
         `).bind(limit).all();
-    return json({ ok: true, events: rows.results || [] });
+    const events = rows.results || [];
+    const nextAfterEventId = events.reduce((max, row) => Math.max(max, Number(row.id) || max), afterId);
+    return json({ ok: true, events, next_after_event_id: nextAfterEventId });
   }
 
   if (url.pathname === "/admin/raw") {
