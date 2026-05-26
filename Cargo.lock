@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "gewe-skill-cli"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "clap",
  "gewe-skill-client",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "gewe-skill-client"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "gewe-skill-types",
  "reqwest",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "gewe-skill-core"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "gewe-skill-types",
  "hex",
@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "gewe-skill-memory"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "axum",
  "chrono",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "gewe-skill-types"
-version = "0.1.35"
+version = "0.1.36"
 dependencies = [
  "serde",
  "serde_json",
