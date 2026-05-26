@@ -173,6 +173,14 @@ gewe-skill --json maintenance status
 
 Use the status output to decide whether the problem is missing callbacks, missing synced attachments, missing voice transcripts, stale identity memory, or chatroom event coverage.
 
+If `voice.ready_without_completed_transcript` is greater than zero, run a bounded ASR backfill:
+
+```bash
+gewe-skill --json maintenance asr-backfill --limit 20 --provider codex-asr --language zh
+```
+
+The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
+
 Use these only for trusted ingest, sync, or repair workflows:
 
 ```bash

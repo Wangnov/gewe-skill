@@ -26,6 +26,7 @@ use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
@@ -114,6 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gewe_token: env_first(&["GEWE_SKILL_GEWE_TOKEN", "GEWE_TOKEN"]),
         http: HttpClient::new(),
     });
+
+    maybe_spawn_voice_backfill_worker(state.clone());
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -305,6 +308,86 @@ fn auto_voice_transcribe_language() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone)]
+struct VoiceBackfillConfig {
+    enabled: bool,
+    interval: Duration,
+    limit: i64,
+    provider: Option<String>,
+    language: Option<String>,
+    force: bool,
+}
+
+fn voice_backfill_config() -> VoiceBackfillConfig {
+    VoiceBackfillConfig {
+        enabled: env_bool("GEWE_SKILL_ASR_BACKGROUND_ENABLED", false),
+        interval: Duration::from_secs(env_u64("GEWE_SKILL_ASR_BACKGROUND_INTERVAL_SECONDS", 300)),
+        limit: env_i64("GEWE_SKILL_ASR_BACKGROUND_LIMIT", 20).clamp(1, 200),
+        provider: env::var("GEWE_SKILL_ASR_BACKGROUND_PROVIDER")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| env::var("GEWE_SKILL_ASR_PROVIDER").ok())
+            .filter(|value| !value.is_empty()),
+        language: env::var("GEWE_SKILL_ASR_BACKGROUND_LANGUAGE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(auto_voice_transcribe_language),
+        force: env_bool("GEWE_SKILL_ASR_BACKGROUND_FORCE", false),
+    }
+}
+
+fn maybe_spawn_voice_backfill_worker(state: SharedState) {
+    let config = voice_backfill_config();
+    if !config.enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            match run_voice_backfill_once(&state, &config).await {
+                Ok(summary) => {
+                    if summary.scanned > 0 || summary.failed > 0 {
+                        info!(
+                            scanned = summary.scanned,
+                            transcribed = summary.transcribed,
+                            skipped = summary.skipped,
+                            failed = summary.failed,
+                            "voice asr background backfill finished"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(error = %error, "voice asr background backfill failed");
+                }
+            }
+        }
+    });
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name).map_or(default, |value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         warn!(%error, "failed to listen for shutdown signal");
@@ -320,6 +403,7 @@ async fn healthz() -> Json<HealthResponse> {
 
 async fn maintenance_status(State(state): State<SharedState>) -> Result<Json<Value>, ApiError> {
     let db = &state.db;
+    let voice_backfill = voice_backfill_config();
     Ok(Json(json!({
         "ok": true,
         "service": "gewe-skill-memory",
@@ -348,6 +432,14 @@ async fn maintenance_status(State(state): State<SharedState>) -> Result<Json<Val
             "transcripts_by_status": count_map(db, "SELECT lower(status) AS key, COUNT(*) AS count FROM voice_transcripts GROUP BY lower(status) ORDER BY count DESC").await?,
             "failed_transcripts": scalar_i64(db, "SELECT COUNT(*) AS value FROM voice_transcripts WHERE status = 'failed'").await?,
             "newest_transcript_at": scalar_text(db, "SELECT MAX(updated_at) AS value FROM voice_transcripts").await?,
+        },
+        "asr_background": {
+            "enabled": voice_backfill.enabled,
+            "interval_seconds": voice_backfill.interval.as_secs(),
+            "limit": voice_backfill.limit,
+            "provider": voice_backfill.provider,
+            "language": voice_backfill.language,
+            "force": voice_backfill.force,
         },
         "identity": {
             "contacts": scalar_i64(db, "SELECT COUNT(*) AS value FROM identity_contacts").await?,
@@ -1280,6 +1372,13 @@ async fn warm_voice(
     State(state): State<SharedState>,
     Json(request): Json<VoiceWarmRequest>,
 ) -> Result<Json<VoiceWarmResponse>, ApiError> {
+    run_voice_warm(&state, request).await.map(Json)
+}
+
+async fn run_voice_warm(
+    state: &SharedState,
+    request: VoiceWarmRequest,
+) -> Result<VoiceWarmResponse, ApiError> {
     let query = VoiceQuery {
         conversation_id: request.conversation_id.clone(),
         sender_wxid: request.sender_wxid.clone(),
@@ -1328,14 +1427,34 @@ async fn warm_voice(
             )
         })
         .count();
-    Ok(Json(VoiceWarmResponse {
+    Ok(VoiceWarmResponse {
         ok: failed == 0,
         scanned: items.len(),
         transcribed,
         skipped,
         failed,
         items,
-    }))
+    })
+}
+
+async fn run_voice_backfill_once(
+    state: &SharedState,
+    config: &VoiceBackfillConfig,
+) -> Result<VoiceWarmResponse, ApiError> {
+    run_voice_warm(
+        state,
+        VoiceWarmRequest {
+            conversation_id: None,
+            sender_wxid: None,
+            after: None,
+            before: None,
+            limit: Some(config.limit),
+            provider: config.provider.clone(),
+            language: config.language.clone(),
+            force: Some(config.force),
+        },
+    )
+    .await
 }
 
 async fn list_voice_impl(

@@ -463,6 +463,17 @@ enum SyncCommand {
 enum MaintenanceCommand {
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
+    /// Backfill ready voice messages that do not have completed transcripts yet.
+    AsrBackfill {
+        #[command(flatten)]
+        filters: VoiceFilterArgs,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -829,6 +840,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Maintenance { command } => match command {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
+            }
+            MaintenanceCommand::AsrBackfill {
+                filters,
+                provider,
+                language,
+                force,
+            } => {
+                print_json(
+                    client
+                        .warm_voice(&VoiceWarmRequest {
+                            conversation_id: filters.conversation_id,
+                            sender_wxid: filters.sender_wxid,
+                            after: filters.after,
+                            before: filters.before,
+                            limit: Some(filters.limit),
+                            provider,
+                            language,
+                            force: Some(force),
+                        })
+                        .await?,
+                )?;
             }
         },
         Command::Request { command } => match command {
