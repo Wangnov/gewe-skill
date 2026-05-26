@@ -3,6 +3,7 @@ use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     AttachmentKind, AttachmentRecord, IdentityRefreshRequest, MessageQuery, RawCallbackRequest,
+    VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -75,6 +76,11 @@ enum Command {
     Attachments {
         #[command(subcommand)]
         command: AttachmentsCommand,
+    },
+    /// Inspect and transcribe voice messages that have synced audio attachments.
+    Voice {
+        #[command(subcommand)]
+        command: VoiceCommand,
     },
     /// Inspect chatroom snapshots and member/system events.
     Chatrooms {
@@ -237,6 +243,57 @@ enum AttachmentsCommand {
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum VoiceCommand {
+    /// List voice messages with attachment/transcript availability.
+    List {
+        #[command(flatten)]
+        filters: VoiceFilterArgs,
+        #[arg(long)]
+        missing_only: bool,
+    },
+    /// Transcribe one voice message if its audio attachment is available.
+    Transcribe {
+        #[arg(long)]
+        message_key: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Transcribe a bounded window of voice messages.
+    Warm {
+        #[command(flatten)]
+        filters: VoiceFilterArgs,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct VoiceFilterArgs {
+    #[arg(long)]
+    conversation_id: Option<String>,
+    #[arg(long)]
+    sender_wxid: Option<String>,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    limit: i64,
+    #[arg(long, value_enum, default_value = "desc")]
+    order: Order,
 }
 
 #[derive(Debug, Subcommand)]
@@ -570,6 +627,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
         },
+        Command::Voice { command } => match command {
+            VoiceCommand::List {
+                filters,
+                missing_only,
+            } => {
+                print_json(
+                    client
+                        .voices(&voice_query(filters, Some(missing_only)))
+                        .await?,
+                )?;
+            }
+            VoiceCommand::Transcribe {
+                message_key,
+                provider,
+                language,
+                force,
+            } => {
+                print_json(
+                    client
+                        .transcribe_voice(&VoiceTranscribeRequest {
+                            message_key,
+                            provider,
+                            language,
+                            force: Some(force),
+                        })
+                        .await?,
+                )?;
+            }
+            VoiceCommand::Warm {
+                filters,
+                provider,
+                language,
+                force,
+            } => {
+                print_json(
+                    client
+                        .warm_voice(&VoiceWarmRequest {
+                            conversation_id: filters.conversation_id,
+                            sender_wxid: filters.sender_wxid,
+                            after: filters.after,
+                            before: filters.before,
+                            limit: Some(filters.limit),
+                            provider,
+                            language,
+                            force: Some(force),
+                        })
+                        .await?,
+                )?;
+            }
+        },
         Command::Chatrooms { command } => match command {
             ChatroomsCommand::Snapshots { chatroom_id, limit } => {
                 print_json(client.chatroom_snapshots(&chatroom_id, Some(limit)).await?)?
@@ -663,6 +770,19 @@ fn message_query(q: Option<String>, filters: MessageFilterArgs) -> MessageQuery 
         cursor: filters.cursor,
         limit: Some(filters.limit),
         order: Some(filters.order.query_value()),
+    }
+}
+
+fn voice_query(filters: VoiceFilterArgs, missing_only: Option<bool>) -> VoiceQuery {
+    VoiceQuery {
+        conversation_id: filters.conversation_id,
+        sender_wxid: filters.sender_wxid,
+        after: filters.after,
+        before: filters.before,
+        cursor: filters.cursor,
+        limit: Some(filters.limit),
+        order: Some(filters.order.query_value()),
+        missing_only,
     }
 }
 
@@ -843,7 +963,9 @@ async fn sync_edge_attachments(
     cursor_file: PathBuf,
     attachment_dir: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let after_job_id = after_job_id.unwrap_or_else(|| read_cursor(&cursor_file).unwrap_or(0));
+    let cursor_overlap = attachment_cursor_overlap();
+    let after_job_id = after_job_id
+        .unwrap_or_else(|| (read_cursor(&cursor_file).unwrap_or(0) - cursor_overlap).max(0));
     let edge_url = edge_url.trim_end_matches('/');
     let manifest_url =
         format!("{edge_url}/admin/attachments?after_job_id={after_job_id}&limit={limit}");
@@ -881,8 +1003,17 @@ async fn sync_edge_attachments(
         "failed_count": failed.len(),
         "after_job_id": after_job_id,
         "last_job_id": last_job_id,
-        "next_after_job_id": manifest.next_after_job_id
+        "next_after_job_id": manifest.next_after_job_id,
+        "cursor_overlap": cursor_overlap
     }))
+}
+
+fn attachment_cursor_overlap() -> i64 {
+    std::env::var("GEWE_SKILL_ATTACHMENT_CURSOR_OVERLAP")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(500)
+        .clamp(0, 5000)
 }
 
 async fn sync_one_attachment(

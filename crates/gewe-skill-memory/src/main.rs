@@ -8,10 +8,12 @@ use axum::{
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{
-    ApiPage, AttachmentRecord, ChatroomEventType, ChatroomMember, ChatroomMemberEvent,
-    ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IdentityMatch,
+    ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomMember,
+    ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IdentityMatch,
     IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
-    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest,
+    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
+    VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord,
+    VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -193,6 +195,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/voice",
+            get(list_voice).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/voice/transcribe",
+            post(transcribe_voice).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/api/voice/warm",
+            post(warm_voice).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
             "/api/chatrooms/{chatroom_id}/snapshots",
             get(chatroom_snapshots).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -242,6 +265,23 @@ fn ensure_sqlite_parent(database_url: &str) -> std::io::Result<()> {
 
 fn env_first(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok())
+}
+
+fn auto_voice_transcribe_enabled() -> bool {
+    matches!(
+        env::var("GEWE_SKILL_AUTO_TRANSCRIBE_VOICE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn auto_voice_transcribe_language() -> Option<String> {
+    env::var("GEWE_SKILL_ASR_LANGUAGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn shutdown_signal() {
@@ -329,8 +369,38 @@ async fn write_attachment(
     State(state): State<SharedState>,
     Json(record): Json<AttachmentRecord>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let should_auto_transcribe =
+        matches!(&record.kind, AttachmentKind::Voice) && auto_voice_transcribe_enabled();
+    let message_key = record.message_key.clone();
+    let language = auto_voice_transcribe_language();
     insert_attachment(&state.db, &record).await?;
-    Ok(Json(json!({ "ok": true, "sha256": record.sha256 })))
+    let auto_transcribe = if should_auto_transcribe {
+        match transcribe_voice_impl(
+            &state,
+            VoiceTranscribeRequest {
+                message_key,
+                provider: None,
+                language,
+                force: Some(false),
+            },
+        )
+        .await
+        {
+            Ok(response) => Some(json!(response)),
+            Err(error) => Some(json!({
+                "ok": false,
+                "status": "auto_transcribe_error",
+                "error": error.to_string()
+            })),
+        }
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "sha256": record.sha256,
+        "auto_transcribe": auto_transcribe
+    })))
 }
 
 async fn write_ingest_request(
@@ -913,6 +983,642 @@ async fn download_attachment(
         bytes,
     )
         .into_response())
+}
+
+async fn list_voice(
+    State(state): State<SharedState>,
+    Query(query): Query<VoiceQuery>,
+) -> Result<Json<ApiPage<VoiceItem>>, ApiError> {
+    list_voice_impl(&state.db, &query).await.map(Json)
+}
+
+async fn transcribe_voice(
+    State(state): State<SharedState>,
+    Json(request): Json<VoiceTranscribeRequest>,
+) -> Result<Json<VoiceTranscribeResponse>, ApiError> {
+    transcribe_voice_impl(&state, request).await.map(Json)
+}
+
+async fn warm_voice(
+    State(state): State<SharedState>,
+    Json(request): Json<VoiceWarmRequest>,
+) -> Result<Json<VoiceWarmResponse>, ApiError> {
+    let query = VoiceQuery {
+        conversation_id: request.conversation_id.clone(),
+        sender_wxid: request.sender_wxid.clone(),
+        after: request.after.clone(),
+        before: request.before.clone(),
+        cursor: None,
+        limit: Some(request.limit.unwrap_or(10).clamp(1, 50)),
+        order: Some("desc".to_string()),
+        missing_only: None,
+    };
+    let page = list_voice_impl(&state.db, &query).await?;
+    let mut items = Vec::new();
+    for item in page.items {
+        items.push(
+            transcribe_voice_impl(
+                &state,
+                VoiceTranscribeRequest {
+                    message_key: item.message.message_key,
+                    provider: request.provider.clone(),
+                    language: request.language.clone(),
+                    force: request.force,
+                },
+            )
+            .await?,
+        );
+    }
+    let transcribed = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status.as_str(),
+                "completed" | "already_transcribed" | "reused"
+            )
+        })
+        .count();
+    let skipped = items
+        .iter()
+        .filter(|item| item.status == "missing_attachment")
+        .count();
+    let failed = items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.status.as_str(),
+                "completed" | "already_transcribed" | "reused" | "missing_attachment"
+            )
+        })
+        .count();
+    Ok(Json(VoiceWarmResponse {
+        ok: failed == 0,
+        scanned: items.len(),
+        transcribed,
+        skipped,
+        failed,
+        items,
+    }))
+}
+
+async fn list_voice_impl(
+    db: &SqlitePool,
+    query: &VoiceQuery,
+) -> Result<ApiPage<VoiceItem>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let order = query
+        .order
+        .as_deref()
+        .unwrap_or("desc")
+        .to_ascii_lowercase();
+    let ascending = order == "asc";
+    let mut sql =
+        String::from("SELECT message_json FROM messages WHERE lower(kind) = lower('Voice')");
+    let mut args = Vec::<String>::new();
+
+    if let Some(value) = query
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        sql.push_str(" AND conversation_id = ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query
+        .sender_wxid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        sql.push_str(" AND sender_wxid = ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.after.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND received_at >= ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.before.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND received_at < ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.cursor.as_deref().filter(|value| !value.is_empty()) {
+        if ascending {
+            sql.push_str(" AND received_at > ?");
+        } else {
+            sql.push_str(" AND received_at < ?");
+        }
+        args.push(value.to_string());
+    }
+    if ascending {
+        sql.push_str(" ORDER BY received_at ASC, id ASC LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY received_at DESC, id DESC LIMIT ?");
+    }
+
+    let mut statement = sqlx::query(&sql);
+    for arg in args {
+        statement = statement.bind(arg);
+    }
+    let rows = statement.bind(limit).fetch_all(db).await?;
+    let mut items = Vec::new();
+    for row in rows {
+        let Ok(message) =
+            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json"))
+        else {
+            continue;
+        };
+        let item = voice_item_from_message(db, message).await?;
+        if query.missing_only.unwrap_or(false) && item.availability != "missing_attachment" {
+            continue;
+        }
+        items.push(item);
+    }
+    let next_cursor = items.last().map(|item| item.message.received_at.clone());
+    Ok(ApiPage { items, next_cursor })
+}
+
+async fn voice_item_from_message(
+    db: &SqlitePool,
+    message: NormalizedMessage,
+) -> Result<VoiceItem, ApiError> {
+    let attachment = voice_attachment_for_message(db, &message.message_key).await?;
+    let transcript = voice_transcript_for_message(db, &message.message_key).await?;
+    let (availability, reason) = match (&attachment, &transcript) {
+        (_, Some(record)) if record.status == "completed" => ("transcribed", None),
+        (_, Some(record)) if record.status == "failed" => (
+            "failed",
+            record.error.clone().or(Some("asr_failed".to_string())),
+        ),
+        (Some(record), _) if record.sha256.is_some() && record.object_key.is_some() => {
+            ("ready", None)
+        }
+        (Some(_), _) => (
+            "missing_attachment",
+            Some("attachment_metadata_incomplete".to_string()),
+        ),
+        (None, _) => (
+            "missing_attachment",
+            Some("voice_attachment_not_synced".to_string()),
+        ),
+    };
+    Ok(VoiceItem {
+        message,
+        attachment,
+        transcript,
+        availability: availability.to_string(),
+        reason,
+    })
+}
+
+async fn voice_attachment_for_message(
+    db: &SqlitePool,
+    message_key: &str,
+) -> Result<Option<AttachmentRecord>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, attachment_json
+        FROM attachments
+        WHERE message_key = ?
+          AND lower(kind) = lower('Voice')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(message_key)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut record =
+        serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
+    record.id = Some(row.get("id"));
+    Ok(Some(record))
+}
+
+async fn voice_message_by_key(
+    db: &SqlitePool,
+    message_key: &str,
+) -> Result<Option<NormalizedMessage>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT message_json
+        FROM messages
+        WHERE message_key = ?
+          AND lower(kind) = lower('Voice')
+        LIMIT 1
+        "#,
+    )
+    .bind(message_key)
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| serde_json::from_str(row.get::<&str, _>("message_json")))
+        .transpose()
+        .map_err(ApiError::from)
+}
+
+async fn voice_transcript_for_message(
+    db: &SqlitePool,
+    message_key: &str,
+) -> Result<Option<VoiceTranscriptRecord>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT message_key, attachment_sha256, provider, language, text, status,
+               error, duration_ms, response_json, created_at, updated_at
+        FROM voice_transcripts
+        WHERE message_key = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(message_key)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let response_json: Option<String> = row.get("response_json");
+    Ok(Some(VoiceTranscriptRecord {
+        message_key: row.get("message_key"),
+        attachment_sha256: row.get("attachment_sha256"),
+        provider: row.get("provider"),
+        language: row.get("language"),
+        text: row.get("text"),
+        status: row.get("status"),
+        error: row.get("error"),
+        duration_ms: row.get("duration_ms"),
+        response_json: response_json.and_then(|value| serde_json::from_str(&value).ok()),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+async fn reusable_voice_transcript(
+    db: &SqlitePool,
+    attachment_sha256: &str,
+    provider: &str,
+    language: Option<&str>,
+    exclude_message_key: &str,
+) -> Result<Option<VoiceTranscriptRecord>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT message_key, attachment_sha256, provider, language, text, status,
+               error, duration_ms, response_json, created_at, updated_at
+        FROM voice_transcripts
+        WHERE attachment_sha256 = ?
+          AND provider = ?
+          AND COALESCE(language, '') = ?
+          AND status = 'completed'
+          AND text IS NOT NULL
+          AND message_key != ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(attachment_sha256)
+    .bind(provider)
+    .bind(language.unwrap_or(""))
+    .bind(exclude_message_key)
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let response_json: Option<String> = row.get("response_json");
+    Ok(Some(VoiceTranscriptRecord {
+        message_key: row.get("message_key"),
+        attachment_sha256: row.get("attachment_sha256"),
+        provider: row.get("provider"),
+        language: row.get("language"),
+        text: row.get("text"),
+        status: row.get("status"),
+        error: row.get("error"),
+        duration_ms: row.get("duration_ms"),
+        response_json: response_json.and_then(|value| serde_json::from_str(&value).ok()),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+async fn transcribe_voice_impl(
+    state: &SharedState,
+    request: VoiceTranscribeRequest,
+) -> Result<VoiceTranscribeResponse, ApiError> {
+    let Some(message) = voice_message_by_key(&state.db, &request.message_key).await? else {
+        return Ok(VoiceTranscribeResponse {
+            ok: false,
+            message_key: request.message_key,
+            status: "message_not_found".to_string(),
+            transcript: None,
+            error: Some("voice_message_not_found".to_string()),
+        });
+    };
+    let Some(attachment) = voice_attachment_for_message(&state.db, &message.message_key).await?
+    else {
+        return Ok(VoiceTranscribeResponse {
+            ok: false,
+            message_key: message.message_key,
+            status: "missing_attachment".to_string(),
+            transcript: None,
+            error: Some("voice_attachment_not_synced".to_string()),
+        });
+    };
+    let Some(sha256) = attachment.sha256.clone() else {
+        return Ok(VoiceTranscribeResponse {
+            ok: false,
+            message_key: message.message_key,
+            status: "missing_attachment".to_string(),
+            transcript: None,
+            error: Some("attachment_sha256_missing".to_string()),
+        });
+    };
+    let Some(object_key) = attachment.object_key.clone() else {
+        return Ok(VoiceTranscribeResponse {
+            ok: false,
+            message_key: message.message_key,
+            status: "missing_attachment".to_string(),
+            transcript: None,
+            error: Some("attachment_object_key_missing".to_string()),
+        });
+    };
+    let provider = normalize_asr_provider(request.provider.as_deref());
+    if !request.force.unwrap_or(false) {
+        if let Some(existing) =
+            voice_transcript_for_message(&state.db, &message.message_key).await?
+        {
+            if existing.status == "completed" {
+                return Ok(VoiceTranscribeResponse {
+                    ok: true,
+                    message_key: message.message_key,
+                    status: "already_transcribed".to_string(),
+                    transcript: Some(existing),
+                    error: None,
+                });
+            }
+        }
+        if let Some(reusable) = reusable_voice_transcript(
+            &state.db,
+            &sha256,
+            &provider,
+            request.language.as_deref(),
+            &message.message_key,
+        )
+        .await?
+        {
+            let now = now_iso();
+            let transcript = VoiceTranscriptRecord {
+                message_key: message.message_key.clone(),
+                attachment_sha256: Some(sha256),
+                provider,
+                language: request.language.clone(),
+                text: reusable.text,
+                status: "completed".to_string(),
+                error: None,
+                duration_ms: voice_duration_ms(&message),
+                response_json: Some(json!({
+                    "reused": true,
+                    "reused_from_message_key": reusable.message_key,
+                    "reused_from_attachment_sha256": reusable.attachment_sha256,
+                    "source_provider": reusable.provider,
+                    "source_language": reusable.language,
+                    "source_updated_at": reusable.updated_at
+                })),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            record_voice_transcript(&state.db, &transcript).await?;
+            return Ok(VoiceTranscribeResponse {
+                ok: true,
+                message_key: message.message_key,
+                status: "reused".to_string(),
+                transcript: Some(transcript),
+                error: None,
+            });
+        }
+    }
+
+    let Some(path) = safe_attachment_path(&state.attachment_dir, &object_key) else {
+        return Ok(VoiceTranscribeResponse {
+            ok: false,
+            message_key: message.message_key,
+            status: "missing_attachment".to_string(),
+            transcript: None,
+            error: Some("invalid_attachment_path".to_string()),
+        });
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VoiceTranscribeResponse {
+                ok: false,
+                message_key: message.message_key,
+                status: "missing_attachment".to_string(),
+                transcript: None,
+                error: Some("attachment_file_missing".to_string()),
+            });
+        }
+        Err(error) => return Err(ApiError::Io(error)),
+    };
+
+    let filename = format!("{sha256}.silk");
+    let asr = match provider.as_str() {
+        "codex-asr" => {
+            transcribe_with_codex_asr(state, bytes, filename, request.language.as_deref()).await
+        }
+        "cloudflare" => {
+            transcribe_with_cloudflare(state, bytes, filename, request.language.as_deref()).await
+        }
+        _ => {
+            return Ok(VoiceTranscribeResponse {
+                ok: false,
+                message_key: message.message_key,
+                status: "unsupported_provider".to_string(),
+                transcript: None,
+                error: Some(format!("unsupported_asr_provider:{provider}")),
+            });
+        }
+    };
+
+    let now = now_iso();
+    let duration_ms = voice_duration_ms(&message);
+    let transcript = match asr {
+        Ok(response_json) => VoiceTranscriptRecord {
+            message_key: message.message_key.clone(),
+            attachment_sha256: Some(sha256),
+            provider,
+            language: request.language,
+            text: asr_text_from_value(&response_json),
+            status: "completed".to_string(),
+            error: None,
+            duration_ms,
+            response_json: Some(response_json),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        Err(error) => VoiceTranscriptRecord {
+            message_key: message.message_key.clone(),
+            attachment_sha256: Some(sha256),
+            provider,
+            language: request.language,
+            text: None,
+            status: "failed".to_string(),
+            error: Some(error.to_string()),
+            duration_ms,
+            response_json: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    };
+    record_voice_transcript(&state.db, &transcript).await?;
+    Ok(VoiceTranscribeResponse {
+        ok: transcript.status == "completed",
+        message_key: message.message_key,
+        status: if transcript.status == "completed" {
+            "completed".to_string()
+        } else {
+            "asr_failed".to_string()
+        },
+        error: transcript.error.clone(),
+        transcript: Some(transcript),
+    })
+}
+
+async fn record_voice_transcript(
+    db: &SqlitePool,
+    record: &VoiceTranscriptRecord,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO voice_transcripts (
+          message_key, attachment_sha256, provider, language, text, status, error,
+          duration_ms, response_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_key) DO UPDATE SET
+          attachment_sha256 = excluded.attachment_sha256,
+          provider = excluded.provider,
+          language = excluded.language,
+          text = excluded.text,
+          status = excluded.status,
+          error = excluded.error,
+          duration_ms = excluded.duration_ms,
+          response_json = excluded.response_json,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&record.message_key)
+    .bind(&record.attachment_sha256)
+    .bind(&record.provider)
+    .bind(&record.language)
+    .bind(&record.text)
+    .bind(&record.status)
+    .bind(&record.error)
+    .bind(record.duration_ms)
+    .bind(record.response_json.as_ref().map(Value::to_string))
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn transcribe_with_codex_asr(
+    state: &SharedState,
+    bytes: Vec<u8>,
+    filename: String,
+    language: Option<&str>,
+) -> Result<Value, ApiError> {
+    let base_url = env_first(&["GEWE_SKILL_CODEX_ASR_URL", "CODEX_ASR_URL"])
+        .unwrap_or_else(|| "http://127.0.0.1:18788".to_string());
+    let url = format!("{}/v1/audio/transcriptions", base_url.trim_end_matches('/'));
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", "whisper-1")
+        .text("response_format", "json");
+    if let Some(language) = language.filter(|value| !value.is_empty()) {
+        form = form.text("language", language.to_string());
+    }
+    let mut request = state.http.post(url).multipart(form);
+    if let Some(token) = env_first(&[
+        "GEWE_SKILL_CODEX_ASR_API_KEY",
+        "CODEX_ASR_SERVER_KEY",
+        "CODEX_ASR_API_KEY",
+    ]) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    asr_json_response(response).await
+}
+
+async fn transcribe_with_cloudflare(
+    state: &SharedState,
+    bytes: Vec<u8>,
+    filename: String,
+    language: Option<&str>,
+) -> Result<Value, ApiError> {
+    let account_id = env_first(&["GEWE_SKILL_CF_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID"])
+        .ok_or(ApiError::AsrConfig("missing Cloudflare account id"))?;
+    let token = env_first(&["GEWE_SKILL_CF_API_TOKEN", "CLOUDFLARE_API_TOKEN"])
+        .ok_or(ApiError::AsrConfig("missing Cloudflare API token"))?;
+    let model = env_first(&["GEWE_SKILL_CF_WHISPER_MODEL"])
+        .unwrap_or_else(|| "@cf/openai/whisper".to_string());
+    let url = format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}");
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+    let mut form = reqwest::multipart::Form::new().part("audio", part);
+    if let Some(language) = language.filter(|value| !value.is_empty()) {
+        form = form.text("language", language.to_string());
+    }
+    let response = state
+        .http
+        .post(url)
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await?;
+    asr_json_response(response).await
+}
+
+async fn asr_json_response(response: reqwest::Response) -> Result<Value, ApiError> {
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(ApiError::Asr(format!(
+            "asr_http_{}:{body}",
+            status.as_u16()
+        )));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+fn normalize_asr_provider(provider: Option<&str>) -> String {
+    provider
+        .map(ToString::to_string)
+        .or_else(|| env_first(&["GEWE_SKILL_ASR_PROVIDER"]))
+        .unwrap_or_else(|| "codex-asr".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+}
+
+fn asr_text_from_value(value: &Value) -> Option<String> {
+    value
+        .get("text")
+        .or_else(|| value.pointer("/result/text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn voice_duration_ms(message: &NormalizedMessage) -> Option<i64> {
+    let xml = message.content_xml.as_deref()?;
+    extract_xml_attr(xml, "voicelength").and_then(|value| value.parse().ok())
+}
+
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = xml.find(&needle)? + needle.len();
+    let end = xml[start..].find('"')? + start;
+    let value = xml[start..end].trim();
+    (!value.is_empty()).then_some(value.to_string())
 }
 
 async fn chatroom_snapshots(
@@ -1826,11 +2532,20 @@ async fn insert_attachment(db: &SqlitePool, record: &AttachmentRecord) -> Result
           kind, variant, object_key, sha256, size_bytes, mime_type, source_url,
           created_at, attachment_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(sha256) DO UPDATE SET
-          edge_job_id = COALESCE(excluded.edge_job_id, attachments.edge_job_id),
+        ON CONFLICT(edge_job_id) DO UPDATE SET
           job_key = COALESCE(excluded.job_key, attachments.job_key),
           message_key = excluded.message_key,
           raw_event_dedupe_key = excluded.raw_event_dedupe_key,
+          appid = excluded.appid,
+          account_wxid = excluded.account_wxid,
+          kind = excluded.kind,
+          variant = excluded.variant,
+          object_key = excluded.object_key,
+          sha256 = excluded.sha256,
+          size_bytes = excluded.size_bytes,
+          mime_type = excluded.mime_type,
+          source_url = excluded.source_url,
+          created_at = excluded.created_at,
           attachment_json = excluded.attachment_json
         "#,
     )
@@ -2153,7 +2868,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
           kind TEXT NOT NULL,
           variant TEXT,
           object_key TEXT NOT NULL,
-          sha256 TEXT NOT NULL UNIQUE,
+          sha256 TEXT NOT NULL,
           size_bytes INTEGER,
           mime_type TEXT,
           source_url TEXT,
@@ -2164,6 +2879,7 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(db)
     .await?;
+    migrate_attachments_allow_duplicate_sha(db).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_key)")
         .execute(db)
         .await?;
@@ -2172,6 +2888,110 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(db)
     .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS voice_transcripts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          message_key TEXT NOT NULL UNIQUE,
+          attachment_sha256 TEXT,
+          provider TEXT NOT NULL,
+          language TEXT,
+          text TEXT,
+          status TEXT NOT NULL,
+          error TEXT,
+          duration_ms INTEGER,
+          response_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_voice_transcripts_updated ON voice_transcripts(updated_at DESC)",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn migrate_attachments_allow_duplicate_sha(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'attachments'
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(db)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let sql: String = row.get("sql");
+    if !sql
+        .to_ascii_lowercase()
+        .contains("sha256 text not null unique")
+    {
+        return Ok(());
+    }
+
+    let mut tx = db.begin().await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_attachments_message")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_attachments_created")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("ALTER TABLE attachments RENAME TO attachments_sha_unique_old")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE attachments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          edge_job_id INTEGER UNIQUE,
+          job_key TEXT,
+          message_key TEXT NOT NULL,
+          raw_event_dedupe_key TEXT NOT NULL,
+          appid TEXT NOT NULL,
+          account_wxid TEXT,
+          kind TEXT NOT NULL,
+          variant TEXT,
+          object_key TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          size_bytes INTEGER,
+          mime_type TEXT,
+          source_url TEXT,
+          created_at TEXT NOT NULL,
+          attachment_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO attachments (
+          id, edge_job_id, job_key, message_key, raw_event_dedupe_key, appid, account_wxid,
+          kind, variant, object_key, sha256, size_bytes, mime_type, source_url,
+          created_at, attachment_json
+        )
+        SELECT id, edge_job_id, job_key, message_key, raw_event_dedupe_key, appid, account_wxid,
+               kind, variant, object_key, sha256, size_bytes, mime_type, source_url,
+               created_at, attachment_json
+        FROM attachments_sha_unique_old
+        ORDER BY id
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DROP TABLE attachments_sha_unique_old")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2232,6 +3052,8 @@ enum ApiError {
     Http(reqwest::Error),
     GeweConfig(&'static str),
     Gewe(String),
+    AsrConfig(&'static str),
+    Asr(String),
     Io(std::io::Error),
 }
 
@@ -2244,6 +3066,8 @@ impl std::fmt::Display for ApiError {
             Self::Http(error) => error.to_string(),
             Self::GeweConfig(error) => error.to_string(),
             Self::Gewe(error) => error.clone(),
+            Self::AsrConfig(error) => error.to_string(),
+            Self::Asr(error) => error.clone(),
             Self::Io(error) => error.to_string(),
         };
         formatter.write_str(&message)
@@ -2291,6 +3115,8 @@ impl IntoResponse for ApiError {
             Self::Http(error) => error.to_string(),
             Self::GeweConfig(error) => error.to_string(),
             Self::Gewe(error) => error,
+            Self::AsrConfig(error) => error.to_string(),
+            Self::Asr(error) => error,
             Self::Io(error) => error.to_string(),
         };
         (

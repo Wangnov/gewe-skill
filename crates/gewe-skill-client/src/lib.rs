@@ -4,7 +4,8 @@ use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
     ConversationSummary, IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse,
     IngestEventRequest, MessageContextResponse, MessageQuery, NormalizedMessage,
-    RawCallbackRequest,
+    RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse,
+    VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -83,6 +84,14 @@ impl GeweSkillClient {
         path: &str,
         request: &T,
     ) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json_as(path, request).await
+    }
+
+    async fn post_write_json_as<T: serde::Serialize + ?Sized, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<R, ClientError> {
         let response = self
             .http
             .post(self.url(path)?)
@@ -215,6 +224,31 @@ impl GeweSkillClient {
         Err(ClientError::Api { status, body })
     }
 
+    pub async fn voices(&self, query: &VoiceQuery) -> Result<ApiPage<VoiceItem>, ClientError> {
+        let mut url = self.url("api/voice")?;
+        append_voice_query(&mut url, query);
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
+    pub async fn transcribe_voice(
+        &self,
+        request: &VoiceTranscribeRequest,
+    ) -> Result<VoiceTranscribeResponse, ClientError> {
+        self.post_write_json_as("api/voice/transcribe", request)
+            .await
+    }
+
+    pub async fn warm_voice(
+        &self,
+        request: &VoiceWarmRequest,
+    ) -> Result<VoiceWarmResponse, ClientError> {
+        self.post_write_json_as("api/voice/warm", request).await
+    }
+
     pub async fn chatroom_snapshots(
         &self,
         chatroom_id: &str,
@@ -306,5 +340,33 @@ fn append_message_query(url: &mut Url, query: &MessageQuery) {
     }
     if let Some(value) = &query.order {
         pairs.append_pair("order", value);
+    }
+}
+
+fn append_voice_query(url: &mut Url, query: &VoiceQuery) {
+    let mut pairs = url.query_pairs_mut();
+    if let Some(value) = &query.conversation_id {
+        pairs.append_pair("conversation_id", value);
+    }
+    if let Some(value) = &query.sender_wxid {
+        pairs.append_pair("sender_wxid", value);
+    }
+    if let Some(value) = &query.after {
+        pairs.append_pair("after", value);
+    }
+    if let Some(value) = &query.before {
+        pairs.append_pair("before", value);
+    }
+    if let Some(value) = &query.cursor {
+        pairs.append_pair("cursor", value);
+    }
+    if let Some(value) = query.limit {
+        pairs.append_pair("limit", &value.to_string());
+    }
+    if let Some(value) = &query.order {
+        pairs.append_pair("order", value);
+    }
+    if let Some(value) = query.missing_only {
+        pairs.append_pair("missing_only", if value { "true" } else { "false" });
     }
 }

@@ -133,6 +133,10 @@ async function handleAdmin(request, env, url) {
     return handleAdminBackfillChatroomEvents(request, env);
   }
 
+  if (url.pathname === "/admin/backfill-download-jobs" && request.method === "POST") {
+    return handleAdminBackfillDownloadJobs(env, url);
+  }
+
   if (request.method !== "GET") return json({ ok: false, error: "method_not_allowed" }, 405);
 
   if (url.pathname === "/admin/stats") {
@@ -385,6 +389,97 @@ async function retryDownloadJobs(env, url) {
   }
 
   return json({ ok: true, retried_count: retried.length, retried });
+}
+
+async function handleAdminBackfillDownloadJobs(env, url) {
+  const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
+  const assetType = normalizeAssetType(url.searchParams.get("asset_type"));
+  const schemaVersion = url.searchParams.get("schema_version");
+  const includeExisting = ["1", "true", "yes"].includes(String(url.searchParams.get("include_existing") || "").toLowerCase());
+  const params = [];
+  let where = "m.content_xml IS NOT NULL AND m.content_xml LIKE '<%'";
+
+  if (schemaVersion) {
+    where += " AND m.schema_version = ?";
+    params.push(schemaVersion);
+  }
+  if (assetType) {
+    where += ` AND ${assetTypeMessageWhere(assetType)}`;
+  }
+  if (!includeExisting) {
+    where += " AND NOT EXISTS (SELECT 1 FROM download_jobs d WHERE d.message_id = m.id AND d.asset_type = ?)";
+    params.push(assetType || "");
+  }
+
+  const rows = await env.DB.prepare(`
+    SELECT m.id AS message_id, m.message_key, m.raw_event_id, m.appid, m.account_wxid,
+           m.type_name, m.msg_id, m.new_msg_id, m.msg_type, m.appmsg_type,
+           m.content_text, m.content_xml, m.schema_version
+    FROM messages m
+    WHERE ${where}
+    ORDER BY m.id DESC
+    LIMIT ?
+  `).bind(...params, limit).all();
+
+  const queued = [];
+  const skipped = [];
+  for (const row of rows.results || []) {
+    const normalized = normalizedFromMessageRow(row);
+    const job = buildDownloadJob(normalized, row.raw_event_id, row.message_id, env);
+    if (!job) {
+      skipped.push({ message_key: row.message_key, reason: "not_downloadable" });
+      continue;
+    }
+    if (assetType && job.assetType !== assetType) {
+      skipped.push({ message_key: row.message_key, reason: "asset_type_mismatch", asset_type: job.assetType });
+      continue;
+    }
+    await enqueueDownloadJob(env, job);
+    queued.push({ message_key: row.message_key, job_key: job.jobKey, asset_type: job.assetType });
+  }
+
+  return json({
+    ok: true,
+    scanned_count: rows.results?.length || 0,
+    queued_count: queued.length,
+    skipped_count: skipped.length,
+    queued,
+    skipped
+  });
+}
+
+function normalizedFromMessageRow(row) {
+  return {
+    schemaVersion: row.schema_version,
+    appid: row.appid,
+    accountWxid: row.account_wxid,
+    typeName: row.type_name,
+    msgId: row.msg_id,
+    newMsgId: row.new_msg_id,
+    msgType: row.type_name || row.msg_type,
+    appmsgType: row.appmsg_type,
+    contentText: row.content_text,
+    contentXml: row.content_xml,
+    rawContent: row.content_xml || row.content_text,
+    dedupeKey: row.message_key
+  };
+}
+
+function normalizeAssetType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["image", "voice", "video", "emoji", "file"].includes(normalized) ? normalized : null;
+}
+
+function assetTypeMessageWhere(assetType) {
+  const map = {
+    image: ["IMAGE", "3"],
+    voice: ["VOICE", "34"],
+    video: ["VIDEO", "43", "62"],
+    emoji: ["EMOJI", "47"],
+    file: ["FILE", "49"]
+  };
+  const values = map[assetType] || [];
+  return `upper(CAST(COALESCE(m.type_name, m.msg_type, '') AS TEXT)) IN (${values.map((value) => `'${value}'`).join(", ")})`;
 }
 
 async function redactStoredRawEvents(env, url) {
@@ -1257,14 +1352,15 @@ async function upsertMessage(env, normalized, rawEventId, receivedAt) {
 
 function buildDownloadJob(normalized, rawEventId, messageId, env) {
   const kind = attachmentKind(normalized);
-  if (!kind || !normalized.rawContent || !isLikelyXml(normalized.rawContent)) return null;
+  const xml = downloadableXml(normalized);
+  if (!kind || !xml) return null;
 
   const endpoint = downloadEndpoint(kind);
   if (!endpoint) return null;
 
   const requestJson = {
     appId: normalized.appid,
-    xml: normalized.rawContent
+    xml
   };
   if (kind === "image") requestJson.type = clampInt(env.IMAGE_DOWNLOAD_TYPE, 1, 3, 2);
   if (kind === "voice" && normalized.msgId) requestJson.msgId = Number(normalized.msgId);
@@ -1280,6 +1376,18 @@ function buildDownloadJob(normalized, rawEventId, messageId, env) {
     endpoint,
     requestJson
   };
+}
+
+function downloadableXml(normalized) {
+  for (const value of [normalized.contentXml, normalized.rawContent, normalized.contentText]) {
+    if (isLikelyXml(value)) return value;
+  }
+  for (const value of [normalized.rawContent, normalized.contentText]) {
+    if (typeof value !== "string") continue;
+    const index = ["<msg", "<appmsg"].map((marker) => value.indexOf(marker)).filter((item) => item >= 0).sort((left, right) => left - right)[0];
+    if (index !== undefined) return value.slice(index);
+  }
+  return null;
 }
 
 async function enqueueDownloadJob(env, job) {
@@ -1361,7 +1469,9 @@ async function processDownloadJob(body, env) {
       WHERE job_key = ?
     `).bind(new Date().toISOString(), new Date().toISOString(), objectKey, objectKey, fileUrl, responseSizeBytes, mimeType, jobKey).run();
   } catch (error) {
-    await markDownloadJob(env, jobKey, "failed", safeError(error));
+    const message = safeError(error);
+    const retryable = message.includes("最大支持2条并发") || message.includes("请稍后再试") || message.includes("rate limit");
+    await markDownloadJob(env, jobKey, retryable ? "pending" : "failed", message);
     throw error;
   }
 }

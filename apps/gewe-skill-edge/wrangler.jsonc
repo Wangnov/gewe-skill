@@ -43,8 +43,9 @@
     "consumers": [
       {
         "queue": "gewe-skill-attachments",
-        "max_batch_size": 5,
-        "max_batch_timeout": 30
+        "max_batch_size": 1,
+        "max_batch_timeout": 30,
+        "max_concurrency": 2
       }
     ]
   },

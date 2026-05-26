@@ -141,6 +141,81 @@ pub struct AttachmentRecord {
     pub created_at: Timestamp,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceQuery {
+    pub conversation_id: Option<String>,
+    pub sender_wxid: Option<String>,
+    pub after: Option<Timestamp>,
+    pub before: Option<Timestamp>,
+    pub cursor: Option<Timestamp>,
+    pub limit: Option<i64>,
+    pub order: Option<String>,
+    pub missing_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTranscriptRecord {
+    pub message_key: String,
+    pub attachment_sha256: Option<String>,
+    pub provider: String,
+    pub language: Option<String>,
+    pub text: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub response_json: Option<Value>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceItem {
+    pub message: NormalizedMessage,
+    pub attachment: Option<AttachmentRecord>,
+    pub transcript: Option<VoiceTranscriptRecord>,
+    pub availability: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTranscribeRequest {
+    pub message_key: String,
+    pub provider: Option<String>,
+    pub language: Option<String>,
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceTranscribeResponse {
+    pub ok: bool,
+    pub message_key: String,
+    pub status: String,
+    pub transcript: Option<VoiceTranscriptRecord>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceWarmRequest {
+    pub conversation_id: Option<String>,
+    pub sender_wxid: Option<String>,
+    pub after: Option<Timestamp>,
+    pub before: Option<Timestamp>,
+    pub limit: Option<i64>,
+    pub provider: Option<String>,
+    pub language: Option<String>,
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceWarmResponse {
+    pub ok: bool,
+    pub scanned: usize,
+    pub transcribed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Vec<VoiceTranscribeResponse>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
     pub conversation_id: String,

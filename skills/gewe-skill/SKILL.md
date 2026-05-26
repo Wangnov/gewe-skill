@@ -113,6 +113,43 @@ gewe-skill --json attachments download --sha256 '<sha256>' --output /tmp/gewe-at
 
 Mention whether media was downloaded or only detected.
 
+Attachments are content-deduplicated by `sha256` across images, voice, video, emoji, and files. Multiple messages may legitimately reference the same `sha256`; treat that as shared bytes, not missing data.
+
+## Voice and transcripts
+
+Voice messages have two stages: the callback message may exist before the audio file is available. Always check voice availability before relying on voice content:
+
+```bash
+gewe-skill --json voice list --conversation-id '<conversation_id>' --limit 20
+gewe-skill --json voice list --conversation-id '<conversation_id>' --missing-only --limit 20
+```
+
+Interpret `availability` like this:
+
+- `missing_attachment`: the voice message exists, but the audio bytes are not in the attachment library yet.
+- `ready`: the audio bytes are available and can be transcribed.
+- `transcribed`: a transcript is already stored.
+- `failed`: transcription was attempted and failed; inspect `error`.
+
+Transcribe only bounded windows. This may call a paid or quota-limited ASR provider:
+
+```bash
+gewe-skill --json voice transcribe --message-key '<message_key>' --provider codex-asr --language zh
+gewe-skill --json voice warm --conversation-id '<conversation_id>' --limit 10 --provider codex-asr --language zh
+```
+
+Supported providers are `codex-asr` and `cloudflare`. Prefer `codex-asr` when available because it is self-hosted and better suited for higher-volume private WeChat voice messages. Use Cloudflare only for small bounded batches unless the user approves the quota/cost tradeoff.
+
+The memory service may auto-transcribe voice attachments when they are synced. Do not assume every ready voice already has a transcript: if the ASR service was temporarily unavailable, run a bounded warm pass before analysis:
+
+```bash
+gewe-skill --json voice warm --conversation-id '<conversation_id>' --limit 20 --provider codex-asr
+```
+
+`voice warm` is idempotent. It keeps completed transcripts, retries failed transcripts, and skips messages that still lack attachments.
+
+Voice transcription is content-deduplicated. If two voice messages point to the same downloaded attachment `sha256`, the memory service reuses the existing successful transcript for the same provider and language instead of calling ASR again. Message-level transcript records are still written so each chat message remains independently explainable.
+
 ## Trusted maintenance path
 
 Use these only for trusted ingest, sync, or repair workflows:
