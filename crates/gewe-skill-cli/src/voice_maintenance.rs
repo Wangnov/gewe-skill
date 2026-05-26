@@ -56,7 +56,8 @@ pub(crate) async fn voice_issues_with_edge_queue(
             "when edge_queue_evidence.status is unavailable or purged, the edge queue already proved the upstream attachment cannot currently be downloaded",
             "when edge_queue_evidence.status is failed, use sync attachment-retry intentionally; do not retry unavailable resources in a loop",
             "asr_pending means audio bytes are present and a bounded ASR warm/transcribe pass can fill the transcript",
-            "asr_failed means ASR has already failed once; retry only when the provider or decoder issue has been fixed",
+            "asr_failed means ASR has already failed once; retry only when the provider issue is temporary or the decoder issue has been fixed",
+            "asr_failed with retryable=false is a known transcript gap and should be explained instead of retried in a loop",
             "keep message_key, attachment sha256, and transcript status as evidence when explaining voice coverage"
         ]
     }))
@@ -111,9 +112,14 @@ fn voice_issue_json(item: &VoiceItem) -> Option<Value> {
         .transcript
         .as_ref()
         .map(|record| record.status.as_str());
+    let transcript_error = item
+        .transcript
+        .as_ref()
+        .and_then(|record| record.error.clone());
     let issue = classify_voice_issue(
         &item.availability,
         transcript_status,
+        transcript_error.as_deref(),
         item.attachment.is_some(),
     )?;
     let message_key = item.message.message_key.clone();
@@ -130,7 +136,7 @@ fn voice_issue_json(item: &VoiceItem) -> Option<Value> {
         "attachment_sha256": item.attachment.as_ref().and_then(|record| record.sha256.clone()),
         "attachment_object_key": item.attachment.as_ref().and_then(|record| record.object_key.clone()),
         "transcript_status": transcript_status,
-        "transcript_error": item.transcript.as_ref().and_then(|record| record.error.clone()),
+        "transcript_error": transcript_error,
         "message_evidence": message_evidence(item),
         "attachment_evidence": attachment_evidence(item),
         "transcript_evidence": transcript_evidence(item)
@@ -449,6 +455,14 @@ fn recommended_cli(action: &str, message_key: &str) -> Vec<String> {
             "zh".to_string(),
             "--force".to_string(),
         ],
+        "explain_asr_unavailable" => vec![
+            "gewe-skill".to_string(),
+            "--json".to_string(),
+            "maintenance".to_string(),
+            "voice-issues".to_string(),
+            "--limit".to_string(),
+            "50".to_string(),
+        ],
         _ => vec![
             "gewe-skill".to_string(),
             "--json".to_string(),
@@ -520,6 +534,7 @@ struct VoiceIssueClassification {
 fn classify_voice_issue(
     availability: &str,
     transcript_status: Option<&str>,
+    transcript_error: Option<&str>,
     has_attachment: bool,
 ) -> Option<VoiceIssueClassification> {
     let availability = availability.trim().to_ascii_lowercase();
@@ -542,6 +557,14 @@ fn classify_voice_issue(
         || availability == "asr_failed"
         || availability == "failed"
     {
+        if is_non_retryable_asr_error(transcript_error) {
+            return Some(VoiceIssueClassification {
+                issue_type: "asr_failed",
+                recommended_action: "explain_asr_unavailable",
+                severity: "warning",
+                retryable: false,
+            });
+        }
         return Some(VoiceIssueClassification {
             issue_type: "asr_failed",
             recommended_action: "retry_asr",
@@ -562,6 +585,17 @@ fn classify_voice_issue(
     None
 }
 
+fn is_non_retryable_asr_error(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    let error = error.to_ascii_lowercase();
+    error.contains("rust-silk decode failed")
+        || error.contains("decode failed")
+        || error.contains("invalid audio")
+        || error.contains("unsupported audio")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,7 +603,7 @@ mod tests {
     #[test]
     fn voice_issue_classifies_missing_attachment_first() {
         assert_eq!(
-            classify_voice_issue("missing_attachment", Some("failed"), false),
+            classify_voice_issue("missing_attachment", Some("failed"), None, false),
             Some(VoiceIssueClassification {
                 issue_type: "missing_attachment",
                 recommended_action: "sync_attachment",
@@ -582,7 +616,7 @@ mod tests {
     #[test]
     fn voice_issue_classifies_failed_transcript_as_retryable_asr() {
         assert_eq!(
-            classify_voice_issue("asr_failed", Some("failed"), true),
+            classify_voice_issue("asr_failed", Some("failed"), None, true),
             Some(VoiceIssueClassification {
                 issue_type: "asr_failed",
                 recommended_action: "retry_asr",
@@ -593,9 +627,27 @@ mod tests {
     }
 
     #[test]
+    fn voice_issue_classifies_decoder_failure_as_known_asr_gap() {
+        assert_eq!(
+            classify_voice_issue(
+                "asr_failed",
+                Some("failed"),
+                Some("asr_http_400: rust-silk decode failed with status exit status: 1"),
+                true
+            ),
+            Some(VoiceIssueClassification {
+                issue_type: "asr_failed",
+                recommended_action: "explain_asr_unavailable",
+                severity: "warning",
+                retryable: false,
+            })
+        );
+    }
+
+    #[test]
     fn voice_issue_skips_completed_transcripts() {
         assert_eq!(
-            classify_voice_issue("transcribed", Some("completed"), true),
+            classify_voice_issue("transcribed", Some("completed"), None, true),
             None
         );
     }

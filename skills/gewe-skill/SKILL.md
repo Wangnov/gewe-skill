@@ -203,6 +203,7 @@ Prefer `maintenance voice-issues` before repair. It returns an Agent-readable ac
 - `missing_attachment`: run `sync attachments` before ASR.
 - `asr_pending`: run bounded `voice transcribe` or `maintenance asr-backfill`.
 - `asr_failed`: retry only after the provider or decoder issue is fixed.
+- `asr_failed` with `retryable=false`: treat it as a known transcript gap and explain it; do not retry it in a loop.
 
 Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
 
@@ -216,7 +217,7 @@ When `attachment-queue-health` returns `retryable_terminal_jobs`, explain that t
 
 When `voice-issues --with-edge-queue` returns `edge_queue_evidence.status=unavailable` or `purged`, explain that the edge queue already proved the upstream attachment is not currently downloadable. Do not keep retrying unavailable media unless the user explicitly asks for another upstream retry.
 
-The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
+The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small, prefer `codex-asr`, and keep `GEWE_SKILL_ASR_BACKGROUND_FORCE=false` so known decoder failures do not become a busy retry loop.
 
 Use these only for trusted ingest, sync, or repair workflows:
 

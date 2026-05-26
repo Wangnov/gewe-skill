@@ -1932,6 +1932,14 @@ fn maintenance_data_health_report(
     );
     let asr_pending_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_pending"]);
     let asr_failed_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_failed"]);
+    let retryable_asr_failed_count =
+        count_voice_issues_matching(&voice_issues, Some("asr_failed"), Some(true), None);
+    let known_unavailable_asr_count = count_voice_issues_matching(
+        &voice_issues,
+        Some("asr_failed"),
+        Some(false),
+        Some("explain_asr_unavailable"),
+    );
 
     let mut next_actions = Vec::<Value>::new();
 
@@ -1996,7 +2004,7 @@ fn maintenance_data_health_report(
             true,
         ));
     }
-    if asr_failed_count > 0 {
+    if retryable_asr_failed_count > 0 {
         next_actions.push(maintenance_action(
             70,
             "inspect_failed_asr",
@@ -2034,20 +2042,25 @@ fn maintenance_data_health_report(
         })
         .count();
     let ready_for_analysis = blocking_action_count == 0 && edge_queue_checked;
-    let overall_health =
-        if duplicate_job_key_count > 0 || retryable_terminal_count > 0 || asr_failed_count > 0 {
-            "needs_attention"
-        } else if completed_not_ingested_count > 0 || retryable_missing_attachment_count > 0 {
-            "needs_attachment_sync"
-        } else if asr_pending_count > 0 {
-            "needs_asr"
-        } else if !edge_queue_checked {
-            "partial"
-        } else if non_retryable_terminal_count > 0 || known_unavailable_voice_attachment_count > 0 {
-            "ready_with_known_gaps"
-        } else {
-            "healthy"
-        };
+    let overall_health = if duplicate_job_key_count > 0
+        || retryable_terminal_count > 0
+        || retryable_asr_failed_count > 0
+    {
+        "needs_attention"
+    } else if completed_not_ingested_count > 0 || retryable_missing_attachment_count > 0 {
+        "needs_attachment_sync"
+    } else if asr_pending_count > 0 {
+        "needs_asr"
+    } else if !edge_queue_checked {
+        "partial"
+    } else if non_retryable_terminal_count > 0
+        || known_unavailable_voice_attachment_count > 0
+        || known_unavailable_asr_count > 0
+    {
+        "ready_with_known_gaps"
+    } else {
+        "healthy"
+    };
 
     serde_json::json!({
         "ok": true,
@@ -2075,6 +2088,8 @@ fn maintenance_data_health_report(
             "known_unavailable_voice_attachment_count": known_unavailable_voice_attachment_count,
             "asr_pending_count": asr_pending_count,
             "asr_failed_count": asr_failed_count,
+            "retryable_asr_failed_count": retryable_asr_failed_count,
+            "known_unavailable_asr_count": known_unavailable_asr_count,
             "blocking_action_count": blocking_action_count,
         },
         "next_actions": next_actions,
@@ -2089,7 +2104,8 @@ fn maintenance_data_health_report(
             "ready_for_analysis is high-confidence only when --with-edge-queue was used",
             "next_actions are ordered so attachment sync and queue safety are handled before ASR",
             "multi_job_message_key_count can be normal for attachment variants such as image hd/normal/thumb and does not block analysis by itself",
-            "non-retryable unavailable or purged media may still leave known gaps even when analysis can continue"
+            "non-retryable unavailable or purged media may still leave known gaps even when analysis can continue",
+            "non-retryable ASR decoder failures are known transcript gaps and do not block broader analysis"
         ]
     })
 }
@@ -3391,6 +3407,45 @@ mod tests {
             report["summary"]["retryable_missing_voice_attachment_count"],
             0
         );
+        assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
+    }
+
+    #[test]
+    fn maintenance_data_health_treats_decoder_asr_failure_as_known_gap() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            Some(serde_json::json!({
+                "queue_health": "healthy",
+                "completed_not_ingested_count": 0,
+                "retryable_terminal_count": 0,
+                "non_retryable_terminal_count": 0,
+                "duplicate_job_key_count": 0,
+                "duplicate_message_key_count": 0,
+                "active_count": 0,
+            })),
+            serde_json::json!({
+                "issue_count": 1,
+                "by_issue_type": {
+                    "asr_failed": 1
+                },
+                "issues": [
+                    {
+                        "issue_type": "asr_failed",
+                        "retryable": false,
+                        "recommended_action": "explain_asr_unavailable"
+                    }
+                ]
+            }),
+            true,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "ready_with_known_gaps");
+        assert_eq!(report["ready_for_analysis"], true);
+        assert_eq!(report["summary"]["asr_failed_count"], 1);
+        assert_eq!(report["summary"]["retryable_asr_failed_count"], 0);
+        assert_eq!(report["summary"]["known_unavailable_asr_count"], 1);
         assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
     }
 
