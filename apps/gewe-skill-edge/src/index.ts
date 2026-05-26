@@ -36,8 +36,8 @@ export default {
     }
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(cleanup(env));
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(scheduledMaintenance(env, event?.cron));
   }
 };
 
@@ -125,6 +125,10 @@ async function handleAdmin(request, env, url) {
     return retryDownloadJobs(env, url);
   }
 
+  if (url.pathname === "/admin/requeue-downloads" && request.method === "POST") {
+    return json({ ok: true, ...(await requeueDueDownloadJobs(env)) });
+  }
+
   if (url.pathname === "/admin/redact-raw-events" && request.method === "POST") {
     return redactStoredRawEvents(env, url);
   }
@@ -157,7 +161,54 @@ async function handleAdmin(request, env, url) {
       ORDER BY count DESC
       LIMIT 20
     `).all();
-    return json({ ok: true, totals: result.results || [], recent_24h: recent.results || [] });
+    const downloadJobStatuses = await env.DB.prepare(`
+      SELECT status, asset_type, COUNT(*) AS count, MIN(created_at) AS oldest_created_at,
+             MAX(updated_at) AS newest_updated_at
+      FROM download_jobs
+      GROUP BY status, asset_type
+      ORDER BY status, asset_type
+    `).all();
+    return json({
+      ok: true,
+      totals: result.results || [],
+      recent_24h: recent.results || [],
+      download_job_statuses: downloadJobStatuses.results || []
+    });
+  }
+
+  if (url.pathname === "/admin/download-jobs") {
+    const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
+    const afterJobId = clampInt(url.searchParams.get("after_job_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const status = url.searchParams.get("status");
+    const assetType = normalizeAssetType(url.searchParams.get("asset_type"));
+    const params = [afterJobId];
+    let where = "d.id > ?";
+    if (status) {
+      where += " AND d.status = ?";
+      params.push(status);
+    }
+    if (assetType) {
+      where += " AND d.asset_type = ?";
+      params.push(assetType);
+    }
+    const rows = await env.DB.prepare(`
+      SELECT d.id AS job_id, d.job_key, m.message_key, d.message_id, d.raw_event_id,
+             d.appid, d.account_wxid, d.asset_type, d.variant, d.endpoint, d.status,
+             d.attempts, d.created_at, d.claimed_at, d.locked_until, d.next_attempt_at,
+             d.completed_at, d.terminal_at, d.updated_at, d.source_url, d.size_bytes,
+             d.mime_type, d.last_error
+      FROM download_jobs d
+      LEFT JOIN messages m ON m.id = d.message_id
+      WHERE ${where}
+      ORDER BY d.id ASC
+      LIMIT ?
+    `).bind(...params, limit).all();
+    const jobs = rows.results || [];
+    return json({
+      ok: true,
+      jobs,
+      next_after_job_id: jobs.length ? jobs[jobs.length - 1].job_id : afterJobId
+    });
   }
 
   if (url.pathname === "/admin/samples") {
@@ -381,7 +432,9 @@ async function retryDownloadJobs(env, url) {
   for (const row of rows.results || []) {
     await env.DB.prepare(`
       UPDATE download_jobs
-      SET status = 'pending', last_error = NULL, updated_at = ?
+      SET status = 'pending', last_error = NULL, next_attempt_at = NULL,
+          locked_until = NULL, terminal_at = NULL, attempts = 0,
+          claimed_at = NULL, updated_at = ?
       WHERE job_key = ?
     `).bind(now, row.job_key).run();
     await env.ATTACHMENT_QUEUE.send({ jobKey: row.job_key });
@@ -1391,12 +1444,22 @@ function downloadableXml(normalized) {
 }
 
 async function enqueueDownloadJob(env, job) {
+  const now = new Date().toISOString();
   await env.DB.prepare(`
     INSERT INTO download_jobs (
       job_key, message_id, raw_event_id, appid, account_wxid, asset_type,
-      variant, endpoint, request_json, status, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    ON CONFLICT(job_key) DO NOTHING
+      variant, endpoint, request_json, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    ON CONFLICT(job_key) DO UPDATE SET
+      message_id = excluded.message_id,
+      raw_event_id = excluded.raw_event_id,
+      endpoint = excluded.endpoint,
+      request_json = excluded.request_json,
+      updated_at = CASE
+        WHEN download_jobs.status IN ('completed', 'pending_large', 'pending_unknown_size', 'failed', 'unavailable', 'purged', 'skipped_not_file')
+          THEN download_jobs.updated_at
+        ELSE excluded.updated_at
+      END
   `).bind(
     job.jobKey,
     job.messageId,
@@ -1407,7 +1470,8 @@ async function enqueueDownloadJob(env, job) {
     job.variant,
     job.endpoint,
     JSON.stringify(job.requestJson),
-    new Date().toISOString()
+    now,
+    now
   ).run();
 
   await env.ATTACHMENT_QUEUE.send({ jobKey: job.jobKey });
@@ -1416,14 +1480,8 @@ async function enqueueDownloadJob(env, job) {
 async function processDownloadJob(body, env) {
   const jobKey = body?.jobKey;
   if (!jobKey) return;
-  const job = await env.DB.prepare(`SELECT * FROM download_jobs WHERE job_key = ?`).bind(jobKey).first();
-  if (!job || job.status === "completed" || job.status === "pending_large") return;
-
-  await env.DB.prepare(`
-    UPDATE download_jobs
-    SET status = 'processing', attempts = attempts + 1, claimed_at = ?, updated_at = ?
-    WHERE job_key = ?
-  `).bind(new Date().toISOString(), new Date().toISOString(), jobKey).run();
+  const job = await claimDownloadJob(env, jobKey);
+  if (!job) return;
 
   try {
     const apiResult = await callGeweDownload(env, job.endpoint, JSON.parse(job.request_json));
@@ -1437,7 +1495,8 @@ async function processDownloadJob(body, env) {
       await markDownloadJob(env, jobKey, "pending_large", `Remote file ${headSizeBytes} exceeds max ${maxBytes}`, {
         sourceUrl: fileUrl,
         sizeBytes: headSizeBytes,
-        mimeType: normalizeDownloadedMime(job.asset_type, head?.headers.get("content-type") || null, fileUrl)
+        mimeType: normalizeDownloadedMime(job.asset_type, head?.headers.get("content-type") || null, fileUrl),
+        terminal: true
       });
       return;
     }
@@ -1449,11 +1508,11 @@ async function processDownloadJob(body, env) {
     const objectKey = attachmentObjectKey(job.asset_type, jobKey, fileUrl, fileResponse.headers.get("content-type") || null);
     const mimeType = normalizeDownloadedMime(job.asset_type, fileResponse.headers.get("content-type") || head?.headers.get("content-type") || null, objectKey);
     if (!responseSizeBytes) {
-      await markDownloadJob(env, jobKey, "pending_unknown_size", "Remote file GET response has no content-length", { sourceUrl: fileUrl, mimeType });
+      await markDownloadJob(env, jobKey, "pending_unknown_size", "Remote file GET response has no content-length", { sourceUrl: fileUrl, mimeType, terminal: true });
       return;
     }
     if (responseSizeBytes > maxBytes) {
-      await markDownloadJob(env, jobKey, "pending_large", `Remote file ${responseSizeBytes} exceeds max ${maxBytes}`, { sourceUrl: fileUrl, sizeBytes: responseSizeBytes, mimeType });
+      await markDownloadJob(env, jobKey, "pending_large", `Remote file ${responseSizeBytes} exceeds max ${maxBytes}`, { sourceUrl: fileUrl, sizeBytes: responseSizeBytes, mimeType, terminal: true });
       return;
     }
 
@@ -1465,15 +1524,89 @@ async function processDownloadJob(body, env) {
     await env.DB.prepare(`
       UPDATE download_jobs
       SET status = 'completed', completed_at = ?, updated_at = ?, local_path = ?, r2_object_key = ?,
-          source_url = ?, size_bytes = ?, mime_type = ?, last_error = NULL
+          source_url = ?, size_bytes = ?, mime_type = ?, last_error = NULL,
+          next_attempt_at = NULL, locked_until = NULL, terminal_at = NULL
       WHERE job_key = ?
     `).bind(new Date().toISOString(), new Date().toISOString(), objectKey, objectKey, fileUrl, responseSizeBytes, mimeType, jobKey).run();
   } catch (error) {
-    const message = safeError(error);
-    const retryable = message.includes("最大支持2条并发") || message.includes("请稍后再试") || message.includes("rate limit");
-    await markDownloadJob(env, jobKey, retryable ? "pending" : "failed", message);
-    throw error;
+    await finishDownloadFailure(env, job, error);
   }
+}
+
+async function claimDownloadJob(env, jobKey) {
+  const existing = await env.DB.prepare(`SELECT * FROM download_jobs WHERE job_key = ?`).bind(jobKey).first();
+  if (!existing || isTerminalDownloadStatus(existing.status)) return null;
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  if (existing.status === "retry_scheduled" && existing.next_attempt_at && existing.next_attempt_at > nowIso) return null;
+  if (existing.status === "processing" && existing.locked_until && existing.locked_until > nowIso) return null;
+
+  const lockedUntil = addSeconds(now, clampInt(env.DOWNLOAD_LOCK_SECONDS, 30, 3600, 300)).toISOString();
+  const result = await env.DB.prepare(`
+    UPDATE download_jobs
+    SET status = 'processing', attempts = attempts + 1, claimed_at = ?,
+        locked_until = ?, next_attempt_at = NULL, updated_at = ?
+    WHERE job_key = ?
+      AND status IN ('pending', 'retry_scheduled', 'processing')
+      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      AND (locked_until IS NULL OR locked_until <= ? OR status != 'processing')
+  `).bind(nowIso, lockedUntil, nowIso, jobKey, nowIso, nowIso).run();
+  if (!result.meta?.changes) return null;
+
+  return env.DB.prepare(`SELECT * FROM download_jobs WHERE job_key = ?`).bind(jobKey).first();
+}
+
+async function finishDownloadFailure(env, job, error) {
+  const message = safeError(error);
+  const disposition = classifyDownloadError(message);
+  const attempts = Number(job.attempts || 0);
+  const maxAttempts = clampInt(env.DOWNLOAD_MAX_ATTEMPTS, 1, 50, 6);
+
+  if (disposition.terminal) {
+    await markDownloadJob(env, job.job_key, disposition.status, message, { terminal: true });
+    return;
+  }
+
+  if (attempts >= maxAttempts) {
+    await markDownloadJob(env, job.job_key, "failed", message, { terminal: true });
+    return;
+  }
+
+  const delaySeconds = downloadRetryDelaySeconds(env, attempts);
+  const nextAttemptAt = addSeconds(new Date(), delaySeconds).toISOString();
+  await markDownloadJob(env, job.job_key, "retry_scheduled", message, { nextAttemptAt });
+}
+
+function isTerminalDownloadStatus(status) {
+  return [
+    "completed",
+    "pending_large",
+    "pending_unknown_size",
+    "failed",
+    "unavailable",
+    "purged",
+    "skipped_not_file"
+  ].includes(String(status || ""));
+}
+
+function classifyDownloadError(message) {
+  const text = String(message || "");
+  if (/NullPointerException|no downloadable URL|not found|404|expired|文件不存在|资源不存在|已过期/i.test(text)) {
+    return { terminal: true, status: "unavailable" };
+  }
+  if (/最大支持2条并发|请稍后再试|rate limit|too many requests|timeout|timed out|network|fetch failed|429|500|502|503|504/i.test(text)) {
+    return { terminal: false, status: "retry_scheduled" };
+  }
+  return { terminal: false, status: "retry_scheduled" };
+}
+
+function downloadRetryDelaySeconds(env, attempts) {
+  const base = clampInt(env.DOWNLOAD_RETRY_BASE_SECONDS, 5, 3600, 30);
+  const max = clampInt(env.DOWNLOAD_RETRY_MAX_SECONDS, base, 24 * 3600, 1800);
+  const exponent = Math.max(0, Math.min(10, Number(attempts || 1) - 1));
+  const jitter = Math.floor(Math.random() * Math.min(base, 30));
+  return Math.min(max, base * (2 ** exponent) + jitter);
 }
 
 async function callGeweDownload(env, endpoint, requestJson) {
@@ -1503,12 +1636,65 @@ function extractDownloadUrl(apiResult) {
 }
 
 async function markDownloadJob(env, jobKey, status, error, extra = {}) {
+  const now = new Date().toISOString();
+  const terminalAt = extra.terminal ? now : null;
   await env.DB.prepare(`
     UPDATE download_jobs
     SET status = ?, last_error = ?, updated_at = ?, source_url = COALESCE(?, source_url),
-        size_bytes = COALESCE(?, size_bytes), mime_type = COALESCE(?, mime_type)
+        size_bytes = COALESCE(?, size_bytes), mime_type = COALESCE(?, mime_type),
+        next_attempt_at = ?, locked_until = NULL, terminal_at = ?
     WHERE job_key = ?
-  `).bind(status, String(error || "").slice(0, 1000), new Date().toISOString(), extra.sourceUrl || null, extra.sizeBytes || null, extra.mimeType || null, jobKey).run();
+  `).bind(
+    status,
+    String(error || "").slice(0, 1000),
+    now,
+    extra.sourceUrl || null,
+    extra.sizeBytes || null,
+    extra.mimeType || null,
+    extra.nextAttemptAt || null,
+    terminalAt,
+    jobKey
+  ).run();
+}
+
+async function scheduledMaintenance(env, cron) {
+  await requeueDueDownloadJobs(env);
+  if (cron === "37 18 * * *") {
+    await cleanup(env);
+  }
+}
+
+async function requeueDueDownloadJobs(env) {
+  const limit = clampInt(env.DOWNLOAD_SWEEP_LIMIT, 1, 500, 100);
+  const now = new Date().toISOString();
+  const rows = await env.DB.prepare(`
+    SELECT job_key, status
+    FROM download_jobs
+    WHERE status = 'pending'
+       OR (status = 'retry_scheduled' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+       OR (status = 'processing' AND (locked_until IS NULL OR locked_until <= ?))
+    ORDER BY COALESCE(next_attempt_at, updated_at, created_at) ASC
+    LIMIT ?
+  `).bind(now, now, limit).all();
+
+  let requeued = 0;
+  let recovered = 0;
+  for (const row of rows.results || []) {
+    if (row.status === "processing") {
+      await env.DB.prepare(`
+        UPDATE download_jobs
+        SET status = 'pending', locked_until = NULL, next_attempt_at = NULL,
+            last_error = COALESCE(last_error, 'stale processing lock recovered'),
+            updated_at = ?
+        WHERE job_key = ?
+      `).bind(now, row.job_key).run();
+      recovered += 1;
+    }
+    await env.ATTACHMENT_QUEUE.send({ jobKey: row.job_key });
+    requeued += 1;
+  }
+
+  return { requeued_count: requeued, recovered_processing_count: recovered };
 }
 
 async function cleanup(env) {
@@ -1524,7 +1710,7 @@ async function cleanup(env) {
   `).bind(attachmentTtlDays).all();
   for (const row of oldAttachments.results || []) {
     if (row.object_key) await env.RAW_BUCKET.delete(row.object_key);
-    await env.DB.prepare(`UPDATE download_jobs SET status = 'purged', updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), row.id).run();
+    await env.DB.prepare(`UPDATE download_jobs SET status = 'purged', terminal_at = ?, updated_at = ? WHERE id = ?`).bind(new Date().toISOString(), new Date().toISOString(), row.id).run();
   }
 
   const oldRawObjects = await env.DB.prepare(`
@@ -1785,6 +1971,10 @@ function clampInt(value, min, max, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.max(min, Math.min(max, Math.trunc(number)));
+}
+
+function addSeconds(date, seconds) {
+  return new Date(date.getTime() + (seconds * 1000));
 }
 
 function json(payload, status = 200) {

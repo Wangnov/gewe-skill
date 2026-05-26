@@ -50,7 +50,7 @@
     ]
   },
   "triggers": {
-    "crons": ["37 18 * * *"]
+    "crons": ["*/10 * * * *", "37 18 * * *"]
   },
   "secrets": {
     "required": ["GEWE_TOKEN", "CALLBACK_SECRET", "ADMIN_API_KEY"]
