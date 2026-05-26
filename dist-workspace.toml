@@ -7,6 +7,11 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
+# Keep local hardening patches in .github/workflows/release.yml:
+# - v-only tag trigger, so package-level cargo-release tags cannot publish
+# - job timeouts, so stuck runners cannot hang indefinitely
+# - idempotent release upload, so reruns can recover an existing Release
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
