@@ -1922,6 +1922,14 @@ fn maintenance_data_health_report(
     let voice_issue_count = value_u64_at(&voice_issues, &["issue_count"]);
     let missing_attachment_count =
         value_u64_at(&voice_issues, &["by_issue_type", "missing_attachment"]);
+    let retryable_missing_attachment_count =
+        count_voice_issues_matching(&voice_issues, Some("missing_attachment"), Some(true), None);
+    let known_unavailable_voice_attachment_count = count_voice_issues_matching(
+        &voice_issues,
+        Some("missing_attachment"),
+        Some(false),
+        Some("explain_attachment_unavailable"),
+    );
     let asr_pending_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_pending"]);
     let asr_failed_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_failed"]);
 
@@ -1979,7 +1987,7 @@ fn maintenance_data_health_report(
             false,
         ));
     }
-    if missing_attachment_count > 0 {
+    if retryable_missing_attachment_count > 0 {
         next_actions.push(maintenance_action(
             60,
             "repair_missing_voice_attachments",
@@ -2029,13 +2037,13 @@ fn maintenance_data_health_report(
     let overall_health =
         if duplicate_job_key_count > 0 || retryable_terminal_count > 0 || asr_failed_count > 0 {
             "needs_attention"
-        } else if completed_not_ingested_count > 0 || missing_attachment_count > 0 {
+        } else if completed_not_ingested_count > 0 || retryable_missing_attachment_count > 0 {
             "needs_attachment_sync"
         } else if asr_pending_count > 0 {
             "needs_asr"
         } else if !edge_queue_checked {
             "partial"
-        } else if non_retryable_terminal_count > 0 {
+        } else if non_retryable_terminal_count > 0 || known_unavailable_voice_attachment_count > 0 {
             "ready_with_known_gaps"
         } else {
             "healthy"
@@ -2063,6 +2071,8 @@ fn maintenance_data_health_report(
             "active_attachment_count": active_attachment_count,
             "voice_issue_count": voice_issue_count,
             "missing_voice_attachment_count": missing_attachment_count,
+            "retryable_missing_voice_attachment_count": retryable_missing_attachment_count,
+            "known_unavailable_voice_attachment_count": known_unavailable_voice_attachment_count,
             "asr_pending_count": asr_pending_count,
             "asr_failed_count": asr_failed_count,
             "blocking_action_count": blocking_action_count,
@@ -2112,6 +2122,35 @@ fn value_u64_at(value: &Value, path: &[&str]) -> u64 {
         .as_u64()
         .or_else(|| current.as_i64().and_then(|value| u64::try_from(value).ok()))
         .unwrap_or(0)
+}
+
+fn count_voice_issues_matching(
+    voice_issues: &Value,
+    issue_type: Option<&str>,
+    retryable: Option<bool>,
+    recommended_action: Option<&str>,
+) -> u64 {
+    let Some(issues) = voice_issues.get("issues").and_then(Value::as_array) else {
+        return 0;
+    };
+    issues
+        .iter()
+        .filter(|issue| {
+            issue_type
+                .map(|expected| issue.get("issue_type").and_then(Value::as_str) == Some(expected))
+                .unwrap_or(true)
+                && retryable
+                    .map(|expected| {
+                        issue.get("retryable").and_then(Value::as_bool) == Some(expected)
+                    })
+                    .unwrap_or(true)
+                && recommended_action
+                    .map(|expected| {
+                        issue.get("recommended_action").and_then(Value::as_str) == Some(expected)
+                    })
+                    .unwrap_or(true)
+        })
+        .count() as u64
 }
 
 #[derive(Debug, Clone)]
@@ -3303,6 +3342,55 @@ mod tests {
         assert_eq!(report["overall_health"], "ready_with_known_gaps");
         assert_eq!(report["ready_for_analysis"], true);
         assert_eq!(report["summary"]["multi_job_message_key_count"], 2);
+        assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
+    }
+
+    #[test]
+    fn maintenance_data_health_treats_unavailable_voice_as_known_gap() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            Some(serde_json::json!({
+                "queue_health": "has_unavailable",
+                "completed_not_ingested_count": 0,
+                "retryable_terminal_count": 0,
+                "non_retryable_terminal_count": 2,
+                "duplicate_job_key_count": 0,
+                "duplicate_message_key_count": 0,
+                "active_count": 0,
+            })),
+            serde_json::json!({
+                "issue_count": 2,
+                "by_issue_type": {
+                    "missing_attachment": 2
+                },
+                "issues": [
+                    {
+                        "issue_type": "missing_attachment",
+                        "retryable": false,
+                        "recommended_action": "explain_attachment_unavailable"
+                    },
+                    {
+                        "issue_type": "missing_attachment",
+                        "retryable": false,
+                        "recommended_action": "explain_attachment_unavailable"
+                    }
+                ]
+            }),
+            true,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "ready_with_known_gaps");
+        assert_eq!(report["ready_for_analysis"], true);
+        assert_eq!(
+            report["summary"]["known_unavailable_voice_attachment_count"],
+            2
+        );
+        assert_eq!(
+            report["summary"]["retryable_missing_voice_attachment_count"],
+            0
+        );
         assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
     }
 
