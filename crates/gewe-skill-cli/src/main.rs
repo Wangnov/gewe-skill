@@ -644,6 +644,28 @@ enum SyncCommand {
 enum MaintenanceCommand {
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
+    /// Agent-oriented data readiness report with ordered maintenance actions.
+    DataHealth {
+        /// Include Cloudflare edge attachment queue evidence. Recommended before media-heavy analysis.
+        #[arg(long, default_value_t = false)]
+        with_edge_queue: bool,
+        /// Edge worker base URL.
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        /// Edge admin token.
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        edge_admin_token: Option<String>,
+        /// Maximum voice rows to inspect for ASR and attachment readiness.
+        #[arg(long, default_value_t = 200)]
+        voice_limit: i64,
+        /// Maximum edge attachment jobs to inspect when --with-edge-queue is enabled.
+        #[arg(long, default_value_t = 1000)]
+        edge_queue_limit: u32,
+    },
     /// Inspect edge attachment queue health across all asset types.
     AttachmentQueueHealth {
         /// Edge worker base URL.
@@ -1243,6 +1265,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
             }
+            MaintenanceCommand::DataHealth {
+                with_edge_queue,
+                edge_url,
+                edge_admin_token,
+                voice_limit,
+                edge_queue_limit,
+            } => {
+                let status = client.maintenance_status().await?;
+                let edge_queue = if with_edge_queue {
+                    let Some(admin_token) = edge_admin_token else {
+                        return Err(
+                            "missing GEWE_SKILL_EDGE_ADMIN_TOKEN for --with-edge-queue".into()
+                        );
+                    };
+                    Some(
+                        edge_download_jobs(
+                            &edge_url,
+                            &admin_token,
+                            None,
+                            None,
+                            None,
+                            edge_queue_limit,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let attachment_queue = if let Some(jobs) = edge_queue.as_ref() {
+                    let completed_job_keys = attachment_maintenance::completed_job_keys(jobs);
+                    let memory_attachments =
+                        client.attachments_by_job_keys(&completed_job_keys).await?;
+                    let memory_attachments = serde_json::to_value(memory_attachments)?;
+                    Some(attachment_maintenance::queue_health_with_memory(
+                        jobs,
+                        &memory_attachments,
+                    ))
+                } else {
+                    None
+                };
+                let voice_issues = voice_maintenance::voice_issues_with_edge_queue(
+                    &client,
+                    VoiceQuery {
+                        conversation_id: None,
+                        sender_wxid: None,
+                        after: None,
+                        before: None,
+                        cursor: None,
+                        limit: Some(voice_limit),
+                        order: Some("desc".to_string()),
+                        missing_only: None,
+                    },
+                    edge_queue,
+                )
+                .await?;
+                print_json(maintenance_data_health_report(
+                    status,
+                    attachment_queue,
+                    voice_issues,
+                    with_edge_queue,
+                    voice_limit,
+                    edge_queue_limit,
+                ))?;
+            }
             MaintenanceCommand::AttachmentQueueHealth {
                 edge_url,
                 edge_admin_token,
@@ -1794,6 +1880,239 @@ fn message_kind_expects_attachment(kind: &NormalizedKind) -> bool {
             | NormalizedKind::Emoji
             | NormalizedKind::File
     )
+}
+
+fn maintenance_data_health_report(
+    status: Value,
+    attachment_queue: Option<Value>,
+    voice_issues: Value,
+    edge_queue_checked: bool,
+    voice_limit: i64,
+    edge_queue_limit: u32,
+) -> Value {
+    let attachment_health = attachment_queue
+        .as_ref()
+        .and_then(|value| value.get("queue_health"))
+        .and_then(Value::as_str)
+        .unwrap_or("not_checked");
+    let completed_not_ingested_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["completed_not_ingested_count"]))
+        .unwrap_or(0);
+    let retryable_terminal_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["retryable_terminal_count"]))
+        .unwrap_or(0);
+    let duplicate_job_key_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["duplicate_job_key_count"]))
+        .unwrap_or(0);
+    let duplicate_message_key_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["duplicate_message_key_count"]))
+        .unwrap_or(0);
+    let active_attachment_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["active_count"]))
+        .unwrap_or(0);
+    let non_retryable_terminal_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["non_retryable_terminal_count"]))
+        .unwrap_or(0);
+    let voice_issue_count = value_u64_at(&voice_issues, &["issue_count"]);
+    let missing_attachment_count =
+        value_u64_at(&voice_issues, &["by_issue_type", "missing_attachment"]);
+    let asr_pending_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_pending"]);
+    let asr_failed_count = value_u64_at(&voice_issues, &["by_issue_type", "asr_failed"]);
+
+    let mut next_actions = Vec::<Value>::new();
+
+    if !edge_queue_checked {
+        next_actions.push(maintenance_action(
+            10,
+            "inspect_edge_attachment_queue",
+            vec!["maintenance", "data-health", "--with-edge-queue"],
+            "edge attachment queue was not checked, so media readiness is only partially known",
+            true,
+        ));
+    }
+    if duplicate_job_key_count > 0 || duplicate_message_key_count > 0 {
+        next_actions.push(maintenance_action(
+            20,
+            "investigate_attachment_queue_duplicates",
+            vec!["maintenance", "attachment-queue-health", "--limit", "1000"],
+            "duplicate edge attachment queue keys can make bulk retries unsafe",
+            true,
+        ));
+    }
+    if retryable_terminal_count > 0 {
+        next_actions.push(maintenance_action(
+            30,
+            "retry_failed_attachment_jobs",
+            vec![
+                "sync",
+                "attachment-retry",
+                "--status",
+                "failed",
+                "--limit",
+                "20",
+            ],
+            "failed edge attachment jobs may be retried deliberately before media analysis",
+            true,
+        ));
+    }
+    if completed_not_ingested_count > 0 {
+        next_actions.push(maintenance_action(
+            40,
+            "sync_completed_attachments",
+            vec!["sync", "attachments", "--limit", "50"],
+            "edge has completed attachment downloads that are not yet present in memory",
+            true,
+        ));
+    }
+    if active_attachment_count > 0 {
+        next_actions.push(maintenance_action(
+            50,
+            "wait_or_requeue_active_attachment_jobs",
+            vec!["sync", "attachment-requeue"],
+            "some attachment jobs are still pending, processing, or scheduled for retry",
+            false,
+        ));
+    }
+    if missing_attachment_count > 0 {
+        next_actions.push(maintenance_action(
+            60,
+            "repair_missing_voice_attachments",
+            vec!["sync", "attachment-repair", "--asset-type", "voice"],
+            "some voice messages still do not have synced audio attachments",
+            true,
+        ));
+    }
+    if asr_failed_count > 0 {
+        next_actions.push(maintenance_action(
+            70,
+            "inspect_failed_asr",
+            vec!["maintenance", "voice-issues", "--limit", "50"],
+            "some ASR attempts already failed; inspect provider or decoder errors before retrying",
+            true,
+        ));
+    }
+    if asr_pending_count > 0 {
+        next_actions.push(maintenance_action(
+            80,
+            "backfill_pending_asr",
+            vec!["maintenance", "asr-backfill", "--limit", "50"],
+            "some voice attachments are present but not transcribed yet",
+            true,
+        ));
+    }
+    if next_actions.is_empty() {
+        next_actions.push(maintenance_action(
+            100,
+            "ready_for_analysis",
+            vec!["query", "messages"],
+            "no blocking attachment or voice transcript maintenance issue was found in this bounded check",
+            false,
+        ));
+    }
+
+    let blocking_action_count = next_actions
+        .iter()
+        .filter(|action| {
+            action
+                .get("blocks_analysis")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let ready_for_analysis = blocking_action_count == 0 && edge_queue_checked;
+    let overall_health = if duplicate_job_key_count > 0
+        || duplicate_message_key_count > 0
+        || retryable_terminal_count > 0
+        || asr_failed_count > 0
+    {
+        "needs_attention"
+    } else if completed_not_ingested_count > 0 || missing_attachment_count > 0 {
+        "needs_attachment_sync"
+    } else if asr_pending_count > 0 {
+        "needs_asr"
+    } else if !edge_queue_checked {
+        "partial"
+    } else if non_retryable_terminal_count > 0 {
+        "ready_with_known_gaps"
+    } else {
+        "healthy"
+    };
+
+    serde_json::json!({
+        "ok": true,
+        "query_mode": "maintenance_data_health",
+        "overall_health": overall_health,
+        "ready_for_analysis": ready_for_analysis,
+        "confidence": if edge_queue_checked { "high" } else { "partial" },
+        "limits": {
+            "voice_limit": voice_limit,
+            "edge_queue_limit": edge_queue_limit,
+        },
+        "summary": {
+            "attachment_queue_checked": edge_queue_checked,
+            "attachment_queue_health": attachment_health,
+            "completed_not_ingested_count": completed_not_ingested_count,
+            "retryable_terminal_count": retryable_terminal_count,
+            "non_retryable_terminal_count": non_retryable_terminal_count,
+            "duplicate_job_key_count": duplicate_job_key_count,
+            "duplicate_message_key_count": duplicate_message_key_count,
+            "active_attachment_count": active_attachment_count,
+            "voice_issue_count": voice_issue_count,
+            "missing_voice_attachment_count": missing_attachment_count,
+            "asr_pending_count": asr_pending_count,
+            "asr_failed_count": asr_failed_count,
+            "blocking_action_count": blocking_action_count,
+        },
+        "next_actions": next_actions,
+        "status": status,
+        "attachment_queue": {
+            "included": edge_queue_checked,
+            "health": attachment_queue,
+        },
+        "voice": voice_issues,
+        "agent_notes": [
+            "run maintenance data-health before broad media or voice analysis when freshness matters",
+            "ready_for_analysis is high-confidence only when --with-edge-queue was used",
+            "next_actions are ordered so attachment sync and queue safety are handled before ASR",
+            "non-retryable unavailable or purged media may still leave known gaps even when analysis can continue"
+        ]
+    })
+}
+
+fn maintenance_action(
+    priority: u32,
+    action: &str,
+    recommended_cli: Vec<&str>,
+    reason: &str,
+    blocks_analysis: bool,
+) -> Value {
+    serde_json::json!({
+        "priority": priority,
+        "action": action,
+        "recommended_cli": recommended_cli,
+        "reason": reason,
+        "blocks_analysis": blocks_analysis,
+    })
+}
+
+fn value_u64_at(value: &Value, path: &[&str]) -> u64 {
+    let mut current = value;
+    for segment in path {
+        let Some(next) = current.get(*segment) else {
+            return 0;
+        };
+        current = next;
+    }
+    current
+        .as_u64()
+        .or_else(|| current.as_i64().and_then(|value| u64::try_from(value).ok()))
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -2903,6 +3222,61 @@ mod tests {
         assert_eq!(value["display_name_source"], "contact_remark");
         assert!(value["contact"].get("raw").is_none());
         assert!(value["chatroom_member"].get("raw").is_none());
+    }
+
+    #[test]
+    fn maintenance_data_health_prioritizes_attachment_sync_before_asr() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            Some(serde_json::json!({
+                "queue_health": "needs_sync",
+                "completed_not_ingested_count": 2,
+                "retryable_terminal_count": 0,
+                "non_retryable_terminal_count": 0,
+                "duplicate_job_key_count": 0,
+                "duplicate_message_key_count": 0,
+                "active_count": 0,
+            })),
+            serde_json::json!({
+                "issue_count": 3,
+                "by_issue_type": {
+                    "asr_pending": 3
+                }
+            }),
+            true,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "needs_attachment_sync");
+        assert_eq!(report["ready_for_analysis"], false);
+        assert_eq!(
+            report["next_actions"][0]["action"],
+            "sync_completed_attachments"
+        );
+        assert_eq!(report["next_actions"][1]["action"], "backfill_pending_asr");
+    }
+
+    #[test]
+    fn maintenance_data_health_marks_partial_without_edge_queue() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            None,
+            serde_json::json!({
+                "issue_count": 0,
+                "by_issue_type": {}
+            }),
+            false,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "partial");
+        assert_eq!(report["ready_for_analysis"], false);
+        assert_eq!(
+            report["next_actions"][0]["action"],
+            "inspect_edge_attachment_queue"
+        );
     }
 
     fn test_message(
