@@ -1679,6 +1679,13 @@ fn agent_message_query_guidance(
             ],
             false,
         ));
+        next_actions.push(agent_guidance_action(
+            21,
+            "repair_attachment_queue",
+            "run a bounded attachment queue repair before relying on missing media-like messages",
+            attachment_repair_cli(limit),
+            false,
+        ));
     }
 
     let voice_summary = voice_guidance_summary(voice);
@@ -1688,15 +1695,19 @@ fn agent_message_query_guidance(
             30,
             "inspect_voice_readiness",
             "some voice messages in this scope are missing audio, missing transcript, or have known transcript gaps",
-            vec![
-                "gewe-skill".to_string(),
-                "--json".to_string(),
-                "maintenance".to_string(),
-                "voice-issues".to_string(),
-                "--with-edge-queue".to_string(),
-                "--limit".to_string(),
-                limit.clamp(1, 500).to_string(),
-            ],
+            scoped_voice_issues_cli(query, limit),
+            false,
+        ));
+    }
+    let voice_missing_attachment_count =
+        value_usize_at(&voice_summary, &["missing_attachment_count"]);
+    let voice_asr_pending_count = value_usize_at(&voice_summary, &["asr_pending_count"]);
+    if voice_asr_pending_count > 0 && voice_missing_attachment_count == 0 {
+        next_actions.push(agent_guidance_action(
+            31,
+            "backfill_pending_asr",
+            "voice attachments are present but some transcripts are missing; run a bounded ASR backfill for the same scope",
+            scoped_asr_backfill_cli(query, limit),
             false,
         ));
     }
@@ -1781,6 +1792,7 @@ fn agent_message_query_guidance(
         "agent_notes": [
             "answer from the returned bounded window unless next_actions indicates a needed follow-up for freshness, pagination, attachments, voice, or identity",
             "continue_message_page preserves resolved stable ids; prefer it over re-resolving names when paginating",
+            "recommended maintenance commands preserve the current conversation, sender, and time window whenever the target command supports those filters",
             "inspect_attachment_readiness and inspect_voice_readiness are evidence-gathering actions, not automatic proof that data is lost",
             "warm_chatroom_identity is bounded to the resolved chatroom and avoids broad contact-list polling"
         ]
@@ -1828,6 +1840,68 @@ fn agent_messages_cli(query: &MessageQuery) -> Vec<String> {
     }
     push_cli_arg(&mut args, "--order", query.order.as_deref());
     args
+}
+
+fn scoped_voice_issues_cli(query: &MessageQuery, limit: i64) -> Vec<String> {
+    let mut args = vec![
+        "gewe-skill".to_string(),
+        "--json".to_string(),
+        "maintenance".to_string(),
+        "voice-issues".to_string(),
+        "--with-edge-queue".to_string(),
+    ];
+    push_cli_arg(
+        &mut args,
+        "--conversation-id",
+        query.conversation_id.as_deref(),
+    );
+    push_cli_arg(&mut args, "--sender-wxid", query.sender_wxid.as_deref());
+    push_cli_arg(&mut args, "--after", query.after.as_deref());
+    push_cli_arg(&mut args, "--before", query.before.as_deref());
+    push_cli_arg(&mut args, "--cursor", query.cursor.as_deref());
+    args.push("--limit".to_string());
+    args.push(limit.clamp(1, 500).to_string());
+    push_cli_arg(&mut args, "--order", query.order.as_deref());
+    args
+}
+
+fn scoped_asr_backfill_cli(query: &MessageQuery, limit: i64) -> Vec<String> {
+    let mut args = vec![
+        "gewe-skill".to_string(),
+        "--json".to_string(),
+        "maintenance".to_string(),
+        "asr-backfill".to_string(),
+    ];
+    push_cli_arg(
+        &mut args,
+        "--conversation-id",
+        query.conversation_id.as_deref(),
+    );
+    push_cli_arg(&mut args, "--sender-wxid", query.sender_wxid.as_deref());
+    push_cli_arg(&mut args, "--after", query.after.as_deref());
+    push_cli_arg(&mut args, "--before", query.before.as_deref());
+    push_cli_arg(&mut args, "--cursor", query.cursor.as_deref());
+    args.push("--limit".to_string());
+    args.push(limit.clamp(1, 100).to_string());
+    push_cli_arg(&mut args, "--order", query.order.as_deref());
+    args.push("--provider".to_string());
+    args.push("codex-asr".to_string());
+    args.push("--language".to_string());
+    args.push("zh".to_string());
+    args
+}
+
+fn attachment_repair_cli(limit: i64) -> Vec<String> {
+    vec![
+        "gewe-skill".to_string(),
+        "--json".to_string(),
+        "sync".to_string(),
+        "attachment-repair".to_string(),
+        "--backfill-limit".to_string(),
+        limit.clamp(20, 500).to_string(),
+        "--sync-limit".to_string(),
+        limit.clamp(20, 500).to_string(),
+    ]
 }
 
 fn push_cli_arg(args: &mut Vec<String>, name: &str, value: Option<&str>) {

@@ -46,7 +46,7 @@ gewe-skill --json query messages --conversation '<chatroom wording>' --q '<keywo
 
 If `query messages` returns `conversation_unresolved` or `sender_unresolved`, show the candidates and ask for a narrower clue instead of doing a broad read.
 
-`query messages` also returns `agent_guidance`. Use `agent_guidance.next_actions` to decide whether to paginate with the stable `--conversation-id` cursor command, inspect attachment readiness, inspect voice readiness, or warm chatroom identity before answering. Treat these as bounded follow-up choices for the same resolved scope, not as permission to do broad polling.
+`query messages` also returns `agent_guidance`. Use `agent_guidance.next_actions` to decide whether to paginate with the stable `--conversation-id` cursor command, run bounded attachment repair, inspect scoped voice readiness, run scoped ASR backfill, or warm chatroom identity before answering. Treat these as bounded follow-up choices for the same resolved scope, not as permission to do broad polling. Prefer the provided `recommended_cli` exactly because it preserves stable ids and time windows whenever the maintenance command supports them.
 
 `query messages` includes `attachments.summary` and `attachments.by_message_key` by default. Use these fields before calling `attachments list`: they are exact for the returned message window and work for older messages that are no longer in the recent attachment list. If `attachments.summary.attachment_expected_missing_count` is greater than zero, explain that those media-like messages currently have no stored attachment record, then use maintenance attachment checks before claiming the media is lost.
 
