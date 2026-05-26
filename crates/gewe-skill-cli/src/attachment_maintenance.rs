@@ -17,6 +17,19 @@ pub fn queue_health_with_memory(edge_jobs: &Value, memory_attachments: &Value) -
     queue_health_inner(edge_jobs, Some(memory_attachments))
 }
 
+pub fn completed_job_keys(edge_jobs: &Value) -> Vec<String> {
+    let mut keys = BTreeSet::<String>::new();
+    for job in extract_jobs(edge_jobs) {
+        let status = string_field(job, "status").unwrap_or_else(|| "unknown".to_string());
+        if status == STATUS_COMPLETED {
+            if let Some(job_key) = string_field(job, "job_key") {
+                keys.insert(job_key);
+            }
+        }
+    }
+    keys.into_iter().collect()
+}
+
 fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> Value {
     let jobs = extract_jobs(edge_jobs);
     let memory_index = memory_attachments.map(memory_attachment_index);
@@ -143,7 +156,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
             completed_not_ingested_count,
         ),
         "agent_notes": [
-            "completed_memory_checked means completed edge jobs were compared against recent memory attachment records in the inspected window",
+            "completed_memory_checked means completed edge jobs were compared against memory attachment records for the inspected job keys",
             "completed_not_ingested_count means edge has completed media that was not found in memory yet and should be synced before analysis",
             "failed jobs are retryable terminal jobs, but retry them intentionally instead of looping forever",
             "unavailable and purged jobs are non-retryable terminal evidence; explain them to the user unless explicitly asked to retry upstream",
@@ -379,5 +392,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|action| action["action"] == "sync_completed_attachments"));
+    }
+
+    #[test]
+    fn extracts_unique_completed_job_keys() {
+        let edge_jobs = json!({
+            "jobs": [
+                {"job_key": "b", "status": "completed"},
+                {"job_key": "a", "status": "completed"},
+                {"job_key": "a", "status": "completed"},
+                {"job_key": "pending", "status": "pending"}
+            ]
+        });
+
+        assert_eq!(completed_job_keys(&edge_jobs), vec!["a", "b"]);
     }
 }

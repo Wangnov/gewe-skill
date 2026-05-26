@@ -204,7 +204,7 @@ Prefer `maintenance voice-issues` before repair. It returns an Agent-readable ac
 
 Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
 
-Prefer `maintenance attachment-queue-health` when the user asks whether attachments are healthy across images, voice, video, emoji, and files. It returns counts by status and asset type, duplicate queue evidence, completed-but-not-ingested memory evidence, and Agent-readable next actions.
+Prefer `maintenance attachment-queue-health` when the user asks whether attachments are healthy across images, voice, video, emoji, and files. It returns counts by status and asset type, duplicate queue evidence, job-key-precise completed-but-not-ingested memory evidence, and Agent-readable next actions.
 
 For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment sync or repair before analyzing media.
 

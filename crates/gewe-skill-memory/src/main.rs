@@ -70,6 +70,11 @@ struct ContextQuery {
     after: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentJobKeyLookupRequest {
+    job_keys: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -208,6 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/attachments/recent",
             get(recent_attachments).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/attachments/by-job-keys",
+            post(attachments_by_job_keys).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -1562,6 +1574,48 @@ async fn recent_attachments(
             Some(record)
         })
         .collect::<Vec<_>>();
+    Ok(Json(ApiPage {
+        items,
+        next_cursor: None,
+    }))
+}
+
+async fn attachments_by_job_keys(
+    State(state): State<SharedState>,
+    Json(request): Json<AttachmentJobKeyLookupRequest>,
+) -> Result<Json<ApiPage<AttachmentRecord>>, ApiError> {
+    let mut seen = HashSet::<String>::new();
+    let mut items = Vec::<AttachmentRecord>::new();
+    for job_key in request
+        .job_keys
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .take(1000)
+    {
+        if !seen.insert(job_key.clone()) {
+            continue;
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT id, attachment_json
+            FROM attachments
+            WHERE job_key = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&job_key)
+        .fetch_optional(&state.db)
+        .await?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mut record =
+            serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
+        record.id = Some(row.get("id"));
+        items.push(record);
+    }
     Ok(Json(ApiPage {
         items,
         next_cursor: None,
@@ -3569,6 +3623,9 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
     migrate_attachments_allow_duplicate_sha(db).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_key)")
+        .execute(db)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_job_key ON attachments(job_key)")
         .execute(db)
         .await?;
     sqlx::query(
