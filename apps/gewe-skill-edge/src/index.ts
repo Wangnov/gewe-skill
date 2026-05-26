@@ -2,6 +2,7 @@
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const MAX_PREVIEW_CHARS = 500;
+const DOWNLOAD_ASSET_TYPES = ["image", "voice", "video", "emoji", "file"];
 
 export default {
   async fetch(request, env, ctx) {
@@ -463,7 +464,7 @@ async function handleAdmin(request, env, url) {
 async function retryDownloadJobs(env, url) {
   const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
   const status = url.searchParams.get("status") || "failed";
-  const assetType = url.searchParams.get("asset_type");
+  const assetType = normalizeAssetType(url.searchParams.get("asset_type"));
   const params = [status];
   let where = "status = ?";
 
@@ -511,10 +512,16 @@ async function handleAdminBackfillDownloadJobs(env, url) {
   }
   if (assetType) {
     where += ` AND ${assetTypeMessageWhere(assetType)}`;
+  } else {
+    where += ` AND (${DOWNLOAD_ASSET_TYPES.map(assetTypeMessageWhere).join(" OR ")})`;
   }
   if (!includeExisting) {
-    where += " AND NOT EXISTS (SELECT 1 FROM download_jobs d WHERE d.message_id = m.id AND d.asset_type = ?)";
-    params.push(assetType || "");
+    if (assetType) {
+      where += " AND NOT EXISTS (SELECT 1 FROM download_jobs d WHERE d.message_id = m.id AND d.asset_type = ?)";
+      params.push(assetType);
+    } else {
+      where += " AND NOT EXISTS (SELECT 1 FROM download_jobs d WHERE d.message_id = m.id)";
+    }
   }
 
   const rows = await env.DB.prepare(`
@@ -573,7 +580,7 @@ function normalizedFromMessageRow(row) {
 
 function normalizeAssetType(value) {
   const normalized = String(value || "").trim().toLowerCase();
-  return ["image", "voice", "video", "emoji", "file"].includes(normalized) ? normalized : null;
+  return DOWNLOAD_ASSET_TYPES.includes(normalized) ? normalized : null;
 }
 
 function assetTypeMessageWhere(assetType) {

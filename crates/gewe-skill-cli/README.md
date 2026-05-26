@@ -20,5 +20,5 @@ Maintenance commands are intentionally separated:
 gewe-skill --json ingest normalize --file callback.json --received-at 2026-05-26T00:00:00.000Z
 gewe-skill --json ingest file --file callback.json --received-at 2026-05-26T00:00:00.000Z
 gewe-skill --json sync edge --limit 100
-gewe-skill --json sync attachments --limit 50
+gewe-skill --json sync attachment-repair --sync-limit 50
 ```

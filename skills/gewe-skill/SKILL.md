@@ -195,25 +195,25 @@ If `voice.ready_without_completed_transcript` is greater than zero, run a bounde
 gewe-skill --json maintenance voice-issues --with-edge-queue --limit 50
 gewe-skill --json maintenance attachment-queue-health --limit 1000
 gewe-skill --json sync attachment-queue --asset-type voice --status failed --limit 20
-gewe-skill --json sync attachment-repair --asset-type voice --schema-version v1 --backfill-limit 100 --sync-limit 100
+gewe-skill --json sync attachment-repair --backfill-limit 100 --sync-limit 100
 gewe-skill --json maintenance voice-repair --limit 20 --provider codex-asr --language zh
 gewe-skill --json maintenance asr-backfill --limit 20 --provider codex-asr --language zh
 ```
 
 Prefer `maintenance voice-issues` before repair. It returns an Agent-readable action list:
 
-- `missing_attachment`: run `sync attachments` before ASR.
+- `missing_attachment`: run `sync attachment-repair` before ASR.
 - `asr_pending`: run bounded `voice transcribe` or `maintenance asr-backfill`.
 - `asr_failed`: retry only after the provider or decoder issue is fixed.
 - `asr_failed` with `retryable=false`: treat it as a known transcript gap and explain it; do not retry it in a loop.
 
-Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
+Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachment-repair --asset-type voice` first and then rerun `voice-repair`.
 
 Prefer `maintenance attachment-queue-health` when the user asks whether attachments are healthy across images, voice, video, emoji, and files. It returns counts by status and asset type, duplicate queue evidence, job-key-precise completed-but-not-ingested memory evidence, and Agent-readable next actions.
 
 Prefer `maintenance data-health --with-edge-queue` before broad analysis when the user cares about media, voice, freshness, or whether the archive is ready. It returns `overall_health`, `ready_for_analysis`, and ordered `next_actions` so attachment sync and queue safety happen before ASR.
 
-For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment sync or repair before analyzing media.
+For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. `sync attachment-repair` defaults to `--asset-type all` for image, voice, video, emoji, and file jobs; narrow it with `--asset-type voice` only when you intentionally want a voice-only repair. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment repair before analyzing media.
 
 When `attachment-queue-health` returns `retryable_terminal_jobs`, explain that these are failed jobs that may be retried deliberately after checking `last_error_summary`. When it returns `non_retryable_terminal_jobs`, explain unavailable/purged media as upstream or queue-retention evidence rather than as normal missing sync. Do not loop on `unavailable`, `purged`, or `skipped_not_file` unless the user explicitly asks for another upstream retry.
 
@@ -227,7 +227,7 @@ Use these only for trusted ingest, sync, or repair workflows:
 gewe-skill --json ingest normalize --file callback.json --received-at 2026-05-26T00:00:00.000Z
 gewe-skill --json ingest file --file callback.json --received-at 2026-05-26T00:00:00.000Z
 gewe-skill --json sync edge --limit 100
-gewe-skill --json sync attachments --limit 50
+gewe-skill --json sync attachment-repair --sync-limit 50
 gewe-skill --json sync chatroom-events --limit 500
 ```
 

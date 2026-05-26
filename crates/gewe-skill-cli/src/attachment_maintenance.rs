@@ -10,7 +10,8 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 const STATUS_PURGED: &str = "purged";
 const STATUS_SKIPPED_NOT_FILE: &str = "skipped_not_file";
 
-pub fn queue_health(edge_jobs: &Value) -> Value {
+#[cfg(test)]
+fn queue_health(edge_jobs: &Value) -> Value {
     queue_health_inner(edge_jobs, None)
 }
 

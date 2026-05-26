@@ -46,11 +46,11 @@ When the memory service is not publicly reachable, run pull sync on the server i
 
 ```bash
 gewe-skill --json sync edge
-gewe-skill --json sync attachments
+gewe-skill --json sync attachment-repair
 gewe-skill --json sync chatroom-events
 ```
 
-The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, chatroom events, attachment bytes, and recent identity data synchronized into memory.
+The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, chatroom events, attachment bytes, and recent identity data synchronized into memory. The attachment timer runs bounded `sync attachment-repair`, which backfills missing download jobs, requeues ready jobs, then pulls completed files into memory.
 
 ## Identity refresh
 

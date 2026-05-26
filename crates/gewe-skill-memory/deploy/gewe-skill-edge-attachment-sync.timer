@@ -1,5 +1,5 @@
 [Unit]
-Description=Run gewe-skill edge attachment sync every five minutes
+Description=Run gewe-skill edge attachment queue repair every five minutes
 
 [Timer]
 OnBootSec=60s

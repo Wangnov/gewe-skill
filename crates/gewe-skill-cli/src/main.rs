@@ -537,7 +537,7 @@ enum SyncCommand {
         edge_url: String,
         #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: String,
-        #[arg(long, default_value = "voice")]
+        #[arg(long, default_value = "all")]
         asset_type: String,
         #[arg(long)]
         schema_version: Option<String>,
@@ -584,17 +584,33 @@ enum SyncCommand {
         edge_url: String,
         #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: String,
-        #[arg(long, default_value = "voice")]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_REPAIR_ASSET_TYPE",
+            default_value = "all"
+        )]
         asset_type: String,
         #[arg(long)]
         schema_version: Option<String>,
         #[arg(long, default_value_t = false)]
         include_existing: bool,
-        #[arg(long, default_value_t = 100)]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_REPAIR_BACKFILL_LIMIT",
+            default_value_t = 100
+        )]
         backfill_limit: u32,
-        #[arg(long, default_value_t = 50)]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_REPAIR_SYNC_LIMIT",
+            default_value_t = 50
+        )]
         sync_limit: u32,
-        #[arg(long, default_value_t = 2_000)]
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_REPAIR_SETTLE_MS",
+            default_value_t = 2_000
+        )]
         settle_ms: u64,
         #[arg(
             long,
@@ -1183,7 +1199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let result = backfill_edge_download_jobs(
                     &edge_url,
                     &admin_token,
-                    asset_type,
+                    normalize_asset_type_filter(&asset_type),
                     schema_version,
                     include_existing,
                     limit,
@@ -1205,9 +1221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 asset_type,
                 limit,
             } => {
-                let result =
-                    retry_edge_download_jobs(&edge_url, &admin_token, status, asset_type, limit)
-                        .await?;
+                let result = retry_edge_download_jobs(
+                    &edge_url,
+                    &admin_token,
+                    status,
+                    normalize_asset_type_filter_opt(asset_type),
+                    limit,
+                )
+                .await?;
                 print_json(result)?;
             }
             SyncCommand::AttachmentRepair {
@@ -1226,7 +1247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &client,
                     &edge_url,
                     &admin_token,
-                    asset_type,
+                    normalize_asset_type_filter(&asset_type),
                     schema_version,
                     include_existing,
                     backfill_limit,
@@ -2012,51 +2033,6 @@ fn collect_message_speaker_wxids(messages: &[NormalizedMessage]) -> Vec<String> 
     wxids.into_iter().collect()
 }
 
-fn speaker_display_source(profile: &IdentityProfileResponse) -> &'static str {
-    if profile
-        .contact
-        .as_ref()
-        .and_then(|contact| contact.remark.as_deref())
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "contact_remark"
-    } else if profile
-        .chatroom_member
-        .as_ref()
-        .and_then(|member| member.display_name.as_deref())
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "chatroom_display_name"
-    } else if profile
-        .chatroom_member
-        .as_ref()
-        .and_then(|member| member.nickname.as_deref())
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "chatroom_nickname"
-    } else if profile
-        .contact
-        .as_ref()
-        .and_then(|contact| contact.nickname.as_deref())
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "contact_nickname"
-    } else if profile
-        .effective_display_name
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-    {
-        "effective_display_name"
-    } else {
-        "unresolved"
-    }
-}
-
 fn agent_attachment_block(
     included: bool,
     messages: &[NormalizedMessage],
@@ -2818,6 +2794,23 @@ fn attachment_cursor_overlap() -> i64 {
         .clamp(0, 5000)
 }
 
+fn normalize_asset_type_filter(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value == "all" || value == "*" {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_asset_type_filter_opt(value: Option<String>) -> Option<String> {
+    value.and_then(|value| normalize_asset_type_filter(&value))
+}
+
+fn asset_type_label(value: &Option<String>) -> String {
+    value.clone().unwrap_or_else(|| "all".to_string())
+}
+
 async fn edge_download_jobs(
     edge_url: &str,
     admin_token: &str,
@@ -2845,7 +2838,7 @@ async fn edge_download_jobs(
 async fn backfill_edge_download_jobs(
     edge_url: &str,
     admin_token: &str,
-    asset_type: String,
+    asset_type: Option<String>,
     schema_version: Option<String>,
     include_existing: bool,
     limit: u32,
@@ -2858,7 +2851,7 @@ async fn backfill_edge_download_jobs(
         "/admin/backfill-download-jobs",
         vec![
             ("limit", Some(limit.to_string())),
-            ("asset_type", Some(asset_type)),
+            ("asset_type", asset_type),
             ("schema_version", schema_version),
             (
                 "include_existing",
@@ -2910,7 +2903,7 @@ async fn repair_edge_attachment_queue(
     client: &GeweSkillClient,
     edge_url: &str,
     admin_token: &str,
-    asset_type: String,
+    asset_type: Option<String>,
     schema_version: Option<String>,
     include_existing: bool,
     backfill_limit: u32,
@@ -2926,7 +2919,7 @@ async fn repair_edge_attachment_queue(
         edge_url,
         admin_token,
         None,
-        Some(asset_type.clone()),
+        asset_type.clone(),
         None,
         queue_limit,
     )
@@ -2968,7 +2961,7 @@ async fn repair_edge_attachment_queue(
         edge_url,
         admin_token,
         None,
-        Some(asset_type.clone()),
+        asset_type.clone(),
         None,
         queue_limit,
     )
@@ -2984,7 +2977,7 @@ async fn repair_edge_attachment_queue(
     Ok(serde_json::json!({
         "ok": true,
         "query_mode": "sync_attachment_queue_repair",
-        "asset_type": asset_type,
+        "asset_type": asset_type_label(&asset_type),
         "schema_version": schema_version,
         "include_existing": include_existing,
         "settle_ms": settle_ms,
@@ -2997,6 +2990,7 @@ async fn repair_edge_attachment_queue(
         "after_queue_health": after_queue_health,
         "agent_hints": [
             "attachment-repair backfills missing edge jobs, requeues ready jobs, then pulls completed files into memory",
+            "asset_type=all covers image, voice, video, emoji, and file jobs",
             "after_queue_health is the authoritative repair outcome summary for Agent follow-up decisions",
             "if backfill queued jobs but sync wrote zero files, run attachment-repair again after the edge queue finishes processing",
             "use sync attachment-queue to inspect failed, unavailable, pending, retry_scheduled, and completed jobs before retrying terminal failures"
@@ -3168,6 +3162,17 @@ mod tests {
     }
 
     #[test]
+    fn asset_type_filter_treats_all_as_unfiltered() {
+        assert_eq!(normalize_asset_type_filter("all"), None);
+        assert_eq!(normalize_asset_type_filter("*"), None);
+        assert_eq!(
+            normalize_asset_type_filter(" Voice "),
+            Some("voice".to_string())
+        );
+        assert_eq!(asset_type_label(&None), "all");
+    }
+
+    #[test]
     fn edge_admin_url_builds_filtered_queue_url() {
         let url = edge_admin_url(
             "https://example.com/",
@@ -3285,8 +3290,6 @@ mod tests {
             }),
             aliases: Vec::new(),
         };
-
-        assert_eq!(speaker_display_source(&profile), "contact_remark");
 
         let value = agent_speaker_profile_value(&profile);
         assert_eq!(value["display_name_source"], "contact_remark");
