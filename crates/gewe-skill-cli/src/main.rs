@@ -1,4 +1,5 @@
 mod chatroom_events;
+mod voice_maintenance;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use gewe_skill_client::GeweSkillClient;
@@ -533,6 +534,11 @@ enum SyncCommand {
 enum MaintenanceCommand {
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
+    /// List actionable voice attachment and ASR maintenance issues.
+    VoiceIssues {
+        #[command(flatten)]
+        filters: VoiceFilterArgs,
+    },
     /// Refresh missing display memory for wxids seen in recent chatroom events.
     IdentityBackfill {
         #[arg(long, default_value_t = 500)]
@@ -999,6 +1005,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Maintenance { command } => match command {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
+            }
+            MaintenanceCommand::VoiceIssues { filters } => {
+                print_json(
+                    voice_maintenance::voice_issues(&client, voice_query(filters, None)).await?,
+                )?;
             }
             MaintenanceCommand::IdentityBackfill {
                 event_limit,

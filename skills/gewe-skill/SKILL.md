@@ -188,8 +188,15 @@ This first refreshes only chatrooms seen in recent events, then refreshes only s
 If `voice.ready_without_completed_transcript` is greater than zero, run a bounded ASR backfill:
 
 ```bash
+gewe-skill --json maintenance voice-issues --limit 50
 gewe-skill --json maintenance asr-backfill --limit 20 --provider codex-asr --language zh
 ```
+
+Prefer `maintenance voice-issues` before repair. It returns an Agent-readable action list:
+
+- `missing_attachment`: run `sync attachments` before ASR.
+- `asr_pending`: run bounded `voice transcribe` or `maintenance asr-backfill`.
+- `asr_failed`: retry only after the provider or decoder issue is fixed.
 
 The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
 
