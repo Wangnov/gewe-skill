@@ -1347,7 +1347,8 @@ async fn sync_edge_attachments(
     cursor_file: PathBuf,
     attachment_dir: PathBuf,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let cursor_overlap = attachment_cursor_overlap();
+    let configured_cursor_overlap = attachment_cursor_overlap();
+    let cursor_overlap = configured_cursor_overlap.min(i64::from(limit) / 2);
     let after_job_id = after_job_id
         .unwrap_or_else(|| (read_cursor(&cursor_file).unwrap_or(0) - cursor_overlap).max(0));
     let edge_url = edge_url.trim_end_matches('/');
@@ -1388,7 +1389,8 @@ async fn sync_edge_attachments(
         "after_job_id": after_job_id,
         "last_job_id": last_job_id,
         "next_after_job_id": manifest.next_after_job_id,
-        "cursor_overlap": cursor_overlap
+        "cursor_overlap": cursor_overlap,
+        "configured_cursor_overlap": configured_cursor_overlap
     }))
 }
 

@@ -144,15 +144,20 @@ async function handleAdmin(request, env, url) {
   if (request.method !== "GET") return json({ ok: false, error: "method_not_allowed" }, 405);
 
   if (url.pathname === "/admin/stats") {
-    const result = await env.DB.prepare(`
-      SELECT 'raw_events' AS name, COUNT(*) AS count FROM raw_events
-      UNION ALL SELECT 'messages', COUNT(*) FROM messages
-      UNION ALL SELECT 'download_jobs', COUNT(*) FROM download_jobs
-      UNION ALL SELECT 'webhook_checks', COUNT(*) FROM webhook_checks
-      UNION ALL SELECT 'chatroom_snapshots', COUNT(*) FROM chatroom_snapshots
-      UNION ALL SELECT 'chatroom_member_events', COUNT(*) FROM chatroom_member_events
-      UNION ALL SELECT 'chatroom_system_events', COUNT(*) FROM chatroom_system_events
-    `).all();
+    const totalTables = [
+      "raw_events",
+      "messages",
+      "download_jobs",
+      "webhook_checks",
+      "chatroom_snapshots",
+      "chatroom_member_events",
+      "chatroom_system_events"
+    ];
+    const totals = [];
+    for (const table of totalTables) {
+      const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${table}`).first();
+      totals.push({ name: table, count: Number(row?.count || 0) });
+    }
     const recent = await env.DB.prepare(`
       SELECT schema_version, msg_type, COUNT(*) AS count
       FROM raw_events
@@ -170,7 +175,7 @@ async function handleAdmin(request, env, url) {
     `).all();
     return json({
       ok: true,
-      totals: result.results || [],
+      totals,
       recent_24h: recent.results || [],
       download_job_statuses: downloadJobStatuses.results || []
     });
