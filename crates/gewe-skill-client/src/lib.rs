@@ -2,10 +2,10 @@
 
 use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
-    ConversationSummary, IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse,
-    IngestEventRequest, MessageContextResponse, MessageQuery, NormalizedMessage,
-    RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse,
-    VoiceWarmRequest, VoiceWarmResponse,
+    ConversationSummary, IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
+    IdentityResolveResponse, IngestEventRequest, MessageContextResponse, MessageQuery,
+    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
+    VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -180,6 +180,24 @@ impl GeweSkillClient {
         if let Some(limit) = limit {
             url.query_pairs_mut()
                 .append_pair("limit", &limit.to_string());
+        }
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
+    pub async fn identity_profile(
+        &self,
+        wxid: &str,
+        chatroom_id: Option<&str>,
+    ) -> Result<IdentityProfileResponse, ClientError> {
+        let mut url = self.url("api/identity/profile")?;
+        url.query_pairs_mut().append_pair("wxid", wxid);
+        if let Some(chatroom_id) = chatroom_id {
+            url.query_pairs_mut()
+                .append_pair("chatroom_id", chatroom_id);
         }
         let mut request = self.http.get(url);
         if let Some(token) = &self.read_token {

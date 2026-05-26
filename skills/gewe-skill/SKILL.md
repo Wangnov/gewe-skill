@@ -50,7 +50,10 @@ If `query messages` returns `conversation_unresolved` or `sender_unresolved`, sh
 
 ```bash
 gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --limit 10
+gewe-skill --json identity inspect --wxid '<wxid>' --chatroom-id '<chatroom_id>'
 ```
+
+Use `identity inspect` after resolving a person when the answer depends on current display rules. It returns the effective display name, contact remark/nickname/alias, room-scoped member card/nickname, and historical aliases.
 
 3. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
 
@@ -186,6 +189,7 @@ Do not use raw writes unless the user asked for that specific write.
 - Resolve names first, then read messages by stable ids.
 - Treat room-scoped member aliases as scoped to `chatroom_id`; the same display name may appear in multiple groups.
 - For chatroom members, prefer the user's contact remark when available, then room-scoped display/card names, then nicknames.
+- Use `identity inspect` when explaining why an old alias maps to a current person, especially when `identity resolve` selected a non-current alias.
 - Observed aliases from quoted messages are useful evidence, but may be historical. Current GeWe group member info has higher confidence for present state.
 - For group-card or nickname changes, preserve the original message text and avoid over-normalizing.
 - For files, images, voice, video, and emoji, mention whether the attachment was downloaded or only detected.

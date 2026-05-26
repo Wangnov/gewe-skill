@@ -246,6 +246,38 @@ pub struct IdentityResolveResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityContactProfile {
+    pub wxid: String,
+    pub nickname: Option<String>,
+    pub remark: Option<String>,
+    pub alias: Option<String>,
+    pub raw: Option<Value>,
+    pub last_seen_at: Option<Timestamp>,
+    pub updated_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityChatroomMemberProfile {
+    pub chatroom_id: String,
+    pub member_wxid: String,
+    pub display_name: Option<String>,
+    pub nickname: Option<String>,
+    pub is_current: bool,
+    pub raw: Option<Value>,
+    pub last_seen_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityProfileResponse {
+    pub entity_id: String,
+    pub chatroom_id: Option<String>,
+    pub effective_display_name: Option<String>,
+    pub contact: Option<IdentityContactProfile>,
+    pub chatroom_member: Option<IdentityChatroomMemberProfile>,
+    pub aliases: Vec<IdentityMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityRefreshRequest {
     pub full: Option<bool>,
     pub chatroom_id: Option<String>,

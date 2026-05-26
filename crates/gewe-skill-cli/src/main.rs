@@ -139,6 +139,13 @@ enum IdentityCommand {
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
+    /// Inspect current contact/member display memory and historical aliases for one wxid.
+    Inspect {
+        #[arg(long)]
+        wxid: String,
+        #[arg(long)]
+        chatroom_id: Option<String>,
+    },
     /// Refresh the local identity memory from GeWe read-only APIs.
     Refresh {
         #[arg(long)]
@@ -546,6 +553,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 print_json(response)?;
+            }
+            IdentityCommand::Inspect { wxid, chatroom_id } => {
+                print_json(
+                    client
+                        .identity_profile(&wxid, chatroom_id.as_deref())
+                        .await?,
+                )?;
             }
             IdentityCommand::Refresh {
                 full,

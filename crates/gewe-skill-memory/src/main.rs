@@ -9,7 +9,8 @@ use axum::{
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomMember,
-    ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IdentityMatch,
+    ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
+    IdentityChatroomMemberProfile, IdentityContactProfile, IdentityMatch, IdentityProfileResponse,
     IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
     MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
     VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord,
@@ -53,6 +54,12 @@ struct LimitQuery {
 struct SearchQuery {
     q: String,
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityProfileQuery {
+    wxid: String,
+    chatroom_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +176,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/identity/resolve",
             get(resolve_identity).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/identity/profile",
+            get(identity_profile).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -812,6 +826,190 @@ async fn query_identity_matches(
             last_seen_at: row.get("last_seen_at"),
         })
         .collect())
+}
+
+async fn identity_profile(
+    State(state): State<SharedState>,
+    Query(query): Query<IdentityProfileQuery>,
+) -> Result<Json<IdentityProfileResponse>, ApiError> {
+    let contact = identity_contact_profile(&state.db, &query.wxid).await?;
+    let chatroom_member = if let Some(chatroom_id) = query.chatroom_id.as_deref() {
+        identity_chatroom_member_profile(&state.db, chatroom_id, &query.wxid).await?
+    } else {
+        None
+    };
+    let aliases =
+        identity_alias_profiles(&state.db, &query.wxid, query.chatroom_id.as_deref()).await?;
+    let effective_display_name = effective_identity_display_name(&contact, &chatroom_member);
+
+    Ok(Json(IdentityProfileResponse {
+        entity_id: query.wxid,
+        chatroom_id: query.chatroom_id,
+        effective_display_name,
+        contact,
+        chatroom_member,
+        aliases,
+    }))
+}
+
+async fn identity_contact_profile(
+    db: &SqlitePool,
+    wxid: &str,
+) -> Result<Option<IdentityContactProfile>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT wxid, nickname, remark, alias, raw_json, last_seen_at, updated_at
+        FROM identity_contacts
+        WHERE wxid = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(wxid)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(|row| IdentityContactProfile {
+        wxid: row.get("wxid"),
+        nickname: row.get("nickname"),
+        remark: row.get("remark"),
+        alias: row.get("alias"),
+        raw: parse_json_value(row.get("raw_json")),
+        last_seen_at: row.get("last_seen_at"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+async fn identity_chatroom_member_profile(
+    db: &SqlitePool,
+    chatroom_id: &str,
+    wxid: &str,
+) -> Result<Option<IdentityChatroomMemberProfile>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT chatroom_id, member_wxid, display_name, nickname, is_current, raw_json, last_seen_at
+        FROM identity_chatroom_members
+        WHERE chatroom_id = ? AND member_wxid = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(chatroom_id)
+    .bind(wxid)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(|row| IdentityChatroomMemberProfile {
+        chatroom_id: row.get("chatroom_id"),
+        member_wxid: row.get("member_wxid"),
+        display_name: row.get("display_name"),
+        nickname: row.get("nickname"),
+        is_current: row.get::<i64, _>("is_current") != 0,
+        raw: parse_json_value(row.get("raw_json")),
+        last_seen_at: row.get("last_seen_at"),
+    }))
+}
+
+async fn identity_alias_profiles(
+    db: &SqlitePool,
+    wxid: &str,
+    chatroom_id: Option<&str>,
+) -> Result<Vec<IdentityMatch>, ApiError> {
+    let mut sql = String::from(
+        r#"
+        SELECT entity_type, entity_id, NULLIF(scope_key, '') AS chatroom_id, alias, source,
+               is_current, confidence, last_seen_at,
+               COALESCE(
+                 CASE
+                   WHEN entity_type = 'contact' THEN (
+                     SELECT COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), NULLIF(alias, ''))
+                     FROM identity_contacts WHERE wxid = entity_id
+                   )
+                   WHEN entity_type = 'chatroom_member' THEN COALESCE(
+                     (SELECT NULLIF(remark, '')
+                      FROM identity_contacts
+                      WHERE wxid = entity_id),
+                     (SELECT NULLIF(display_name, '')
+                      FROM identity_chatroom_members
+                      WHERE chatroom_id = scope_key AND member_wxid = entity_id),
+                     (SELECT NULLIF(nickname, '')
+                      FROM identity_chatroom_members
+                      WHERE chatroom_id = scope_key AND member_wxid = entity_id),
+                     (SELECT COALESCE(NULLIF(nickname, ''), NULLIF(alias, ''))
+                      FROM identity_contacts
+                      WHERE wxid = entity_id)
+                   )
+                 END,
+                 alias
+               ) AS display_name,
+               confidence + CASE WHEN is_current != 0 THEN 0.05 ELSE 0 END AS score
+        FROM identity_aliases
+        WHERE entity_id = ?
+        "#,
+    );
+    if chatroom_id.is_some() {
+        sql.push_str(" AND (scope_key = '' OR scope_key = ?)");
+    }
+    sql.push_str(" ORDER BY is_current DESC, confidence DESC, last_seen_at DESC");
+
+    let mut statement = sqlx::query(&sql).bind(wxid);
+    if let Some(chatroom_id) = chatroom_id {
+        statement = statement.bind(chatroom_id);
+    }
+    let rows = statement.fetch_all(db).await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| IdentityMatch {
+            entity_type: row.get("entity_type"),
+            entity_id: row.get("entity_id"),
+            chatroom_id: row.get("chatroom_id"),
+            display_name: row.get("display_name"),
+            alias: row.get("alias"),
+            source: row.get("source"),
+            is_current: row.get::<i64, _>("is_current") != 0,
+            score: row.get("score"),
+            last_seen_at: row.get("last_seen_at"),
+        })
+        .collect())
+}
+
+fn effective_identity_display_name(
+    contact: &Option<IdentityContactProfile>,
+    chatroom_member: &Option<IdentityChatroomMemberProfile>,
+) -> Option<String> {
+    contact
+        .as_ref()
+        .and_then(|item| non_empty_string(item.remark.as_deref()))
+        .or_else(|| {
+            chatroom_member
+                .as_ref()
+                .and_then(|item| non_empty_string(item.display_name.as_deref()))
+        })
+        .or_else(|| {
+            chatroom_member
+                .as_ref()
+                .and_then(|item| non_empty_string(item.nickname.as_deref()))
+        })
+        .or_else(|| {
+            contact
+                .as_ref()
+                .and_then(|item| non_empty_string(item.nickname.as_deref()))
+        })
+        .or_else(|| {
+            contact
+                .as_ref()
+                .and_then(|item| non_empty_string(item.alias.as_deref()))
+        })
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_json_value(value: Option<String>) -> Option<Value> {
+    serde_json::from_str(value.as_deref()?).ok()
 }
 
 async fn refresh_identity(
