@@ -17,6 +17,14 @@ Copy `.dev.vars.example` for local development and set production secrets throug
 
 `crates/gewe-skill-memory` is a Rust service intended to run on a small VPS or home server.
 
+On an OCI-style Linux host, install or update from GitHub Release assets:
+
+```bash
+sudo GEWE_SKILL_VERSION=v0.1.18 scripts/install-oci-memory-release.sh
+```
+
+This installs `gewe-skill-memory`, `gewe-skill`, the service unit, and the recommended sync/maintenance timers without compiling on the server.
+
 Recommended environment:
 
 ```bash

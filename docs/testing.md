@@ -4,9 +4,10 @@ The minimal local and CI gate is:
 
 ```bash
 cargo test --workspace --all-targets
+bash -n scripts/*.sh
 ```
 
-The GitHub CI workflow runs the same command on every push.
+The GitHub CI workflow runs the same checks on every push.
 
 Current coverage focuses on high-risk Agent-facing behavior:
 

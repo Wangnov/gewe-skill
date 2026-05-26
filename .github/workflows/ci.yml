@@ -28,6 +28,16 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets
 
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh
+
   edge:
     name: Cloudflare edge
     runs-on: ubuntu-latest
