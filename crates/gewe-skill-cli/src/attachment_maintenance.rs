@@ -8,6 +8,7 @@ const STATUS_PROCESSING: &str = "processing";
 const STATUS_RETRY_SCHEDULED: &str = "retry_scheduled";
 const STATUS_UNAVAILABLE: &str = "unavailable";
 const STATUS_PURGED: &str = "purged";
+const STATUS_SKIPPED_NOT_FILE: &str = "skipped_not_file";
 
 pub fn queue_health(edge_jobs: &Value) -> Value {
     queue_health_inner(edge_jobs, None)
@@ -45,6 +46,9 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
     let mut completed_ingested_count = 0u64;
     let mut completed_not_ingested_count = 0u64;
     let mut completed_not_ingested_jobs = Vec::<Value>::new();
+    let mut retryable_terminal_jobs = Vec::<Value>::new();
+    let mut non_retryable_terminal_jobs = Vec::<Value>::new();
+    let mut skipped_not_file_jobs = Vec::<Value>::new();
 
     for job in &jobs {
         let status = string_field(job, "status").unwrap_or_else(|| "unknown".to_string());
@@ -86,6 +90,35 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
                 }
             }
         }
+        if status == STATUS_FAILED && retryable_terminal_jobs.len() < 20 {
+            retryable_terminal_jobs.push(job_sample(
+                job,
+                job_key.as_deref(),
+                message_key.as_deref(),
+                &asset_type,
+                &status,
+            ));
+        }
+        if matches!(status.as_str(), STATUS_UNAVAILABLE | STATUS_PURGED)
+            && non_retryable_terminal_jobs.len() < 20
+        {
+            non_retryable_terminal_jobs.push(job_sample(
+                job,
+                job_key.as_deref(),
+                message_key.as_deref(),
+                &asset_type,
+                &status,
+            ));
+        }
+        if status == STATUS_SKIPPED_NOT_FILE && skipped_not_file_jobs.len() < 20 {
+            skipped_not_file_jobs.push(job_sample(
+                job,
+                job_key.as_deref(),
+                message_key.as_deref(),
+                &asset_type,
+                &status,
+            ));
+        }
     }
 
     for (key, count) in job_keys {
@@ -106,6 +139,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
     let completed_count = count_status(&by_status, STATUS_COMPLETED);
     let unavailable_count = count_status(&by_status, STATUS_UNAVAILABLE);
     let purged_count = count_status(&by_status, STATUS_PURGED);
+    let skipped_not_file_count = count_status(&by_status, STATUS_SKIPPED_NOT_FILE);
     let active_count = pending_count + processing_count + retry_scheduled_count;
     let non_retryable_terminal_count = unavailable_count + purged_count;
     let duplicate_job_key_count = duplicate_job_keys.len() as u64;
@@ -138,10 +172,14 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
         "active_count": active_count,
         "retryable_terminal_count": failed_count,
         "non_retryable_terminal_count": non_retryable_terminal_count,
+        "skipped_not_file_count": skipped_not_file_count,
         "completed_memory_checked": completed_memory_checked,
         "completed_ingested_count": completed_ingested_count,
         "completed_not_ingested_count": completed_not_ingested_count,
         "completed_not_ingested_jobs": completed_not_ingested_jobs,
+        "retryable_terminal_jobs": retryable_terminal_jobs,
+        "non_retryable_terminal_jobs": non_retryable_terminal_jobs,
+        "skipped_not_file_jobs": skipped_not_file_jobs,
         "duplicate_job_key_count": duplicate_job_key_count,
         "duplicate_message_key_count": duplicate_message_key_count,
         "duplicate_job_keys": duplicate_job_keys,
@@ -160,6 +198,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
             "completed_not_ingested_count means edge has completed media that was not found in memory yet and should be synced before analysis",
             "failed jobs are retryable terminal jobs, but retry them intentionally instead of looping forever",
             "unavailable and purged jobs are non-retryable terminal evidence; explain them to the user unless explicitly asked to retry upstream",
+            "skipped_not_file jobs are evidence that the source message did not contain a downloadable attachment for this queue type",
             "duplicate job keys indicate queue dedupe drift and should be investigated before bulk retrying"
         ]
     })
@@ -240,6 +279,80 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 
 fn count_status(by_status: &BTreeMap<String, u64>, status: &str) -> u64 {
     by_status.get(status).copied().unwrap_or(0)
+}
+
+fn job_sample(
+    job: &Value,
+    job_key: Option<&str>,
+    message_key: Option<&str>,
+    asset_type: &str,
+    status: &str,
+) -> Value {
+    let mut sample = json!({
+        "job_id": job.get("job_id").cloned().unwrap_or(Value::Null),
+        "job_key": job_key,
+        "message_key": message_key,
+        "asset_type": asset_type,
+        "status": status,
+        "attempts": job.get("attempts").cloned().unwrap_or(Value::Null),
+        "created_at": job.get("created_at").cloned().unwrap_or(Value::Null),
+        "updated_at": job.get("updated_at").cloned().unwrap_or(Value::Null),
+        "explanation": status_explanation(status),
+    });
+    if let Some(last_error) = last_error_summary(job) {
+        if let Some(object) = sample.as_object_mut() {
+            object.insert("last_error_summary".to_string(), Value::String(last_error));
+        }
+    }
+    sample
+}
+
+fn status_explanation(status: &str) -> &'static str {
+    match status {
+        STATUS_FAILED => {
+            "retryable terminal job; retry deliberately after checking the error instead of looping"
+        }
+        STATUS_UNAVAILABLE => {
+            "upstream reported this media is not currently downloadable; explain as unavailable unless the user asks to retry upstream"
+        }
+        STATUS_PURGED => {
+            "edge queue retained the terminal record, but the original downloadable payload is no longer recoverable from the queue"
+        }
+        STATUS_SKIPPED_NOT_FILE => {
+            "source message did not contain a downloadable attachment for this queue type"
+        }
+        STATUS_PENDING | STATUS_PROCESSING | STATUS_RETRY_SCHEDULED => {
+            "active job; wait for the edge worker or requeue stale jobs"
+        }
+        STATUS_COMPLETED => "completed job; confirm it exists in memory before analysis",
+        _ => "unknown attachment queue state; inspect the raw job before taking repair action",
+    }
+}
+
+fn last_error_summary(job: &Value) -> Option<String> {
+    let value = string_field(job, "last_error")?;
+    let first_line = value
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(value.trim());
+    Some(truncate_chars(first_line, 240))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return value.to_string();
+        };
+        output.push(ch);
+    }
+    if chars.next().is_some() {
+        output.push_str("...");
+    }
+    output
 }
 
 fn next_actions(
@@ -406,5 +519,37 @@ mod tests {
         });
 
         assert_eq!(completed_job_keys(&edge_jobs), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn reports_terminal_job_samples_with_explanations() {
+        let edge_jobs = json!({
+            "jobs": [
+                {"job_id": 1, "job_key": "failed", "message_key": "m1", "asset_type": "image", "status": "failed", "last_error": "temporary concurrency limit\nstack"},
+                {"job_id": 2, "job_key": "unavailable", "message_key": "m2", "asset_type": "voice", "status": "unavailable"},
+                {"job_id": 3, "job_key": "purged", "message_key": "m3", "asset_type": "video", "status": "purged"},
+                {"job_id": 4, "job_key": "skip", "message_key": "m4", "asset_type": "file", "status": "skipped_not_file"}
+            ]
+        });
+
+        let report = queue_health(&edge_jobs);
+
+        assert_eq!(report["retryable_terminal_jobs"][0]["job_key"], "failed");
+        assert_eq!(
+            report["retryable_terminal_jobs"][0]["last_error_summary"],
+            "temporary concurrency limit"
+        );
+        assert_eq!(
+            report["non_retryable_terminal_jobs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(report["skipped_not_file_count"], 1);
+        assert!(report["skipped_not_file_jobs"][0]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("did not contain"));
     }
 }

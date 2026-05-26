@@ -208,6 +208,8 @@ Prefer `maintenance attachment-queue-health` when the user asks whether attachme
 
 For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment sync or repair before analyzing media.
 
+When `attachment-queue-health` returns `retryable_terminal_jobs`, explain that these are failed jobs that may be retried deliberately after checking `last_error_summary`. When it returns `non_retryable_terminal_jobs`, explain unavailable/purged media as upstream or queue-retention evidence rather than as normal missing sync. Do not loop on `unavailable`, `purged`, or `skipped_not_file` unless the user explicitly asks for another upstream retry.
+
 When `voice-issues --with-edge-queue` returns `edge_queue_evidence.status=unavailable` or `purged`, explain that the edge queue already proved the upstream attachment is not currently downloadable. Do not keep retrying unavailable media unless the user explicitly asks for another upstream retry.
 
 The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
