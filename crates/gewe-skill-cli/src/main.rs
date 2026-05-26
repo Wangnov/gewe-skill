@@ -1,3 +1,4 @@
+mod attachment_maintenance;
 mod chatroom_events;
 mod voice_maintenance;
 
@@ -636,6 +637,25 @@ enum SyncCommand {
 enum MaintenanceCommand {
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
+    /// Inspect edge attachment queue health across all asset types.
+    AttachmentQueueHealth {
+        /// Edge worker base URL.
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        /// Edge admin token.
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        edge_admin_token: Option<String>,
+        /// Optional edge asset type filter, such as image, voice, video, emoji, or file.
+        #[arg(long)]
+        asset_type: Option<String>,
+        /// Maximum edge jobs to inspect.
+        #[arg(long, default_value_t = 1000)]
+        limit: u32,
+    },
     /// List actionable voice attachment and ASR maintenance issues.
     VoiceIssues {
         #[command(flatten)]
@@ -1216,6 +1236,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
             }
+            MaintenanceCommand::AttachmentQueueHealth {
+                edge_url,
+                edge_admin_token,
+                asset_type,
+                limit,
+            } => {
+                let admin_token = edge_admin_token.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--edge-admin-token or GEWE_SKILL_EDGE_ADMIN_TOKEN is required for attachment queue health"
+                    )
+                })?;
+                let jobs =
+                    edge_download_jobs(&edge_url, &admin_token, None, asset_type, None, limit)
+                        .await?;
+                let result = attachment_maintenance::queue_health(&jobs);
+                print_json(&result)?;
+            }
+
             MaintenanceCommand::VoiceIssues {
                 filters,
                 with_edge_queue,

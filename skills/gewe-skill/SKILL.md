@@ -189,6 +189,7 @@ If `voice.ready_without_completed_transcript` is greater than zero, run a bounde
 
 ```bash
 gewe-skill --json maintenance voice-issues --with-edge-queue --limit 50
+gewe-skill --json maintenance attachment-queue-health --limit 1000
 gewe-skill --json sync attachment-queue --asset-type voice --status failed --limit 20
 gewe-skill --json sync attachment-repair --asset-type voice --schema-version v1 --backfill-limit 100 --sync-limit 100
 gewe-skill --json maintenance voice-repair --limit 20 --provider codex-asr --language zh
@@ -202,6 +203,8 @@ Prefer `maintenance voice-issues` before repair. It returns an Agent-readable ac
 - `asr_failed`: retry only after the provider or decoder issue is fixed.
 
 Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
+
+Prefer `maintenance attachment-queue-health` when the user asks whether attachments are healthy across images, voice, video, emoji, and files. It returns counts by status and asset type, duplicate queue evidence, and Agent-readable next actions.
 
 For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory.
 
