@@ -577,6 +577,16 @@ mod tests {
                 entity_id: wxid.clone(),
                 chatroom_id: Some("123@chatroom".to_string()),
                 effective_display_name: Some("视频怪物".to_string()),
+                display_name_source: "chatroom_display_name".to_string(),
+                display_name_resolution: gewe_skill_types::IdentityDisplayNameResolution {
+                    selected_source: "chatroom_display_name".to_string(),
+                    selected_value: Some("视频怪物".to_string()),
+                    candidates: vec![gewe_skill_types::IdentityDisplayNameCandidate {
+                        source: "chatroom_display_name".to_string(),
+                        value: Some("视频怪物".to_string()),
+                        selected: true,
+                    }],
+                },
                 contact: None,
                 chatroom_member: None,
                 aliases: Vec::new(),

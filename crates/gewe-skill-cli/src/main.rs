@@ -1991,7 +1991,8 @@ fn agent_speaker_profile_value(profile: &IdentityProfileResponse) -> Value {
         "entity_id": profile.entity_id.clone(),
         "chatroom_id": profile.chatroom_id.clone(),
         "effective_display_name": profile.effective_display_name.clone(),
-        "display_name_source": speaker_display_source(profile),
+        "display_name_source": profile.display_name_source.clone(),
+        "display_name_resolution": profile.display_name_resolution.clone(),
         "contact": contact,
         "chatroom_member": chatroom_member,
         "aliases": profile.aliases.clone(),
@@ -3247,6 +3248,23 @@ mod tests {
             entity_id: "wxid_left".to_string(),
             chatroom_id: Some("room@chatroom".to_string()),
             effective_display_name: Some("左备注".to_string()),
+            display_name_source: "contact_remark".to_string(),
+            display_name_resolution: gewe_skill_types::IdentityDisplayNameResolution {
+                selected_source: "contact_remark".to_string(),
+                selected_value: Some("左备注".to_string()),
+                candidates: vec![
+                    gewe_skill_types::IdentityDisplayNameCandidate {
+                        source: "contact_remark".to_string(),
+                        value: Some("左备注".to_string()),
+                        selected: true,
+                    },
+                    gewe_skill_types::IdentityDisplayNameCandidate {
+                        source: "chatroom_display_name".to_string(),
+                        value: Some("左（今天你喝水了吗）".to_string()),
+                        selected: false,
+                    },
+                ],
+            },
             contact: Some(gewe_skill_types::IdentityContactProfile {
                 wxid: "wxid_left".to_string(),
                 nickname: Some("左".to_string()),
@@ -3272,6 +3290,10 @@ mod tests {
 
         let value = agent_speaker_profile_value(&profile);
         assert_eq!(value["display_name_source"], "contact_remark");
+        assert_eq!(
+            value["display_name_resolution"]["selected_source"],
+            "contact_remark"
+        );
         assert!(value["contact"].get("raw").is_none());
         assert!(value["chatroom_member"].get("raw").is_none());
     }

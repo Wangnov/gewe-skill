@@ -57,7 +57,7 @@ gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --lim
 gewe-skill --json identity inspect --wxid '<wxid>' --chatroom-id '<chatroom_id>'
 ```
 
-Use `identity inspect` after resolving a person when the answer depends on current display rules. It returns the effective display name, contact remark/nickname/alias, room-scoped member card/nickname, and historical aliases.
+Use `identity inspect` after resolving a person when the answer depends on current display rules. It returns the effective display name, `display_name_source`, `display_name_resolution.candidates`, contact remark/nickname/alias, room-scoped member card/nickname, and historical aliases. Explain names from `display_name_resolution`: contact remark wins first, then room-scoped group card/display name, then room-scoped nickname, then contact nickname, then contact alias.
 
 3. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
 

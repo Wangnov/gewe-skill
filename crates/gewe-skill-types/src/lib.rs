@@ -268,10 +268,26 @@ pub struct IdentityChatroomMemberProfile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityDisplayNameCandidate {
+    pub source: String,
+    pub value: Option<String>,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityDisplayNameResolution {
+    pub selected_source: String,
+    pub selected_value: Option<String>,
+    pub candidates: Vec<IdentityDisplayNameCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityProfileResponse {
     pub entity_id: String,
     pub chatroom_id: Option<String>,
     pub effective_display_name: Option<String>,
+    pub display_name_source: String,
+    pub display_name_resolution: IdentityDisplayNameResolution,
     pub contact: Option<IdentityContactProfile>,
     pub chatroom_member: Option<IdentityChatroomMemberProfile>,
     pub aliases: Vec<IdentityMatch>,

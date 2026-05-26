@@ -11,8 +11,9 @@ use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomEventWriteRequest,
     ChatroomEventWriteResponse, ChatroomMember, ChatroomMemberEvent, ChatroomSnapshot,
     ChatroomSystemEvent, ConversationSummary, IdentityChatroomMemberProfile,
-    IdentityContactProfile, IdentityEventBackfillRequest, IdentityEventBackfillResponse,
-    IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
+    IdentityContactProfile, IdentityDisplayNameCandidate, IdentityDisplayNameResolution,
+    IdentityEventBackfillRequest, IdentityEventBackfillResponse, IdentityMatch,
+    IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
     IdentityResolveResponse, IngestEventRequest, MessageContextResponse, MessageQuery,
     NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
     VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest, VoiceWarmResponse,
@@ -1072,12 +1073,16 @@ async fn identity_profile(
     };
     let aliases =
         identity_alias_profiles(&state.db, &query.wxid, query.chatroom_id.as_deref()).await?;
-    let effective_display_name = effective_identity_display_name(&contact, &chatroom_member);
+    let display_name_resolution = identity_display_name_resolution(&contact, &chatroom_member);
+    let effective_display_name = display_name_resolution.selected_value.clone();
+    let display_name_source = display_name_resolution.selected_source.clone();
 
     Ok(Json(IdentityProfileResponse {
         entity_id: query.wxid,
         chatroom_id: query.chatroom_id,
         effective_display_name,
+        display_name_source,
+        display_name_resolution,
         contact,
         chatroom_member,
         aliases,
@@ -1204,33 +1209,66 @@ async fn identity_alias_profiles(
         .collect())
 }
 
-fn effective_identity_display_name(
+fn identity_display_name_resolution(
     contact: &Option<IdentityContactProfile>,
     chatroom_member: &Option<IdentityChatroomMemberProfile>,
-) -> Option<String> {
-    contact
-        .as_ref()
-        .and_then(|item| non_empty_string(item.remark.as_deref()))
-        .or_else(|| {
+) -> IdentityDisplayNameResolution {
+    let raw_candidates = [
+        (
+            "contact_remark",
+            contact.as_ref().and_then(|item| item.remark.as_deref()),
+        ),
+        (
+            "chatroom_display_name",
             chatroom_member
                 .as_ref()
-                .and_then(|item| non_empty_string(item.display_name.as_deref()))
-        })
-        .or_else(|| {
+                .and_then(|item| item.display_name.as_deref()),
+        ),
+        (
+            "chatroom_nickname",
             chatroom_member
                 .as_ref()
-                .and_then(|item| non_empty_string(item.nickname.as_deref()))
+                .and_then(|item| item.nickname.as_deref()),
+        ),
+        (
+            "contact_nickname",
+            contact.as_ref().and_then(|item| item.nickname.as_deref()),
+        ),
+        (
+            "contact_alias",
+            contact.as_ref().and_then(|item| item.alias.as_deref()),
+        ),
+    ];
+    let selected_index = raw_candidates
+        .iter()
+        .position(|(_, value)| non_empty_string(*value).is_some());
+    let selected_source = selected_index
+        .and_then(|index| {
+            raw_candidates
+                .get(index)
+                .map(|(source, _)| (*source).to_string())
         })
-        .or_else(|| {
-            contact
-                .as_ref()
-                .and_then(|item| non_empty_string(item.nickname.as_deref()))
+        .unwrap_or_else(|| "unresolved".to_string());
+    let selected_value = selected_index.and_then(|index| {
+        raw_candidates
+            .get(index)
+            .and_then(|(_, value)| non_empty_string(*value))
+    });
+    let candidates = raw_candidates
+        .iter()
+        .enumerate()
+        .map(|(index, (source, value))| IdentityDisplayNameCandidate {
+            source: (*source).to_string(),
+            value: non_empty_string(*value),
+            selected: selected_index == Some(index),
         })
-        .or_else(|| {
-            contact
-                .as_ref()
-                .and_then(|item| non_empty_string(item.alias.as_deref()))
-        })
+        .collect();
+
+    IdentityDisplayNameResolution {
+        selected_source,
+        selected_value,
+        candidates,
+    }
 }
 
 fn non_empty_string(value: Option<&str>) -> Option<String> {
