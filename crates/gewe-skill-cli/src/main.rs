@@ -640,6 +640,18 @@ enum MaintenanceCommand {
     VoiceIssues {
         #[command(flatten)]
         filters: VoiceFilterArgs,
+        #[arg(long, default_value_t = false)]
+        with_edge_queue: bool,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        edge_admin_token: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        edge_queue_limit: u32,
     },
     /// Run a bounded ASR repair pass and return before/after voice issue counts.
     VoiceRepair {
@@ -1204,9 +1216,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
             }
-            MaintenanceCommand::VoiceIssues { filters } => {
+            MaintenanceCommand::VoiceIssues {
+                filters,
+                with_edge_queue,
+                edge_url,
+                edge_admin_token,
+                edge_queue_limit,
+            } => {
+                let edge_queue = if with_edge_queue {
+                    let Some(admin_token) = edge_admin_token else {
+                        return Err(
+                            "missing GEWE_SKILL_EDGE_ADMIN_TOKEN for --with-edge-queue".into()
+                        );
+                    };
+                    Some(
+                        edge_download_jobs(
+                            &edge_url,
+                            &admin_token,
+                            None,
+                            Some("voice".to_string()),
+                            None,
+                            edge_queue_limit,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
                 print_json(
-                    voice_maintenance::voice_issues(&client, voice_query(filters, None)).await?,
+                    voice_maintenance::voice_issues_with_edge_queue(
+                        &client,
+                        voice_query(filters, None),
+                        edge_queue,
+                    )
+                    .await?,
                 )?;
             }
             MaintenanceCommand::VoiceRepair {

@@ -188,7 +188,7 @@ This first refreshes only chatrooms seen in recent events, then refreshes only s
 If `voice.ready_without_completed_transcript` is greater than zero, run a bounded ASR backfill:
 
 ```bash
-gewe-skill --json maintenance voice-issues --limit 50
+gewe-skill --json maintenance voice-issues --with-edge-queue --limit 50
 gewe-skill --json sync attachment-queue --asset-type voice --status failed --limit 20
 gewe-skill --json sync attachment-repair --asset-type voice --schema-version v1 --backfill-limit 100 --sync-limit 100
 gewe-skill --json maintenance voice-repair --limit 20 --provider codex-asr --language zh
@@ -204,6 +204,8 @@ Prefer `maintenance voice-issues` before repair. It returns an Agent-readable ac
 Prefer `maintenance voice-repair` when the user asks to repair voice coverage. It runs a bounded ASR warm pass and returns before/after issue counts. It does not sync missing attachments; if `missing_attachment` remains, run `sync attachments` first and then rerun `voice-repair`.
 
 For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory.
+
+When `voice-issues --with-edge-queue` returns `edge_queue_evidence.status=unavailable` or `purged`, explain that the edge queue already proved the upstream attachment is not currently downloadable. Do not keep retrying unavailable media unless the user explicitly asks for another upstream retry.
 
 The server can also run the same ASR backfill in the background when `GEWE_SKILL_ASR_BACKGROUND_ENABLED=true`. Keep the background limit small and prefer `codex-asr`.
 
