@@ -2226,6 +2226,17 @@ async fn repair_edge_attachment_queue(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let http = reqwest::Client::new();
     let before = edge_admin_get_json(&http, edge_url, admin_token, "/admin/stats", vec![]).await?;
+    let queue_limit = backfill_limit.max(sync_limit).max(100);
+    let before_queue = edge_download_jobs(
+        edge_url,
+        admin_token,
+        None,
+        Some(asset_type.clone()),
+        None,
+        queue_limit,
+    )
+    .await?;
+    let before_queue_health = attachment_maintenance::queue_health(&before_queue);
     let backfill = backfill_edge_download_jobs(
         edge_url,
         admin_token,
@@ -2252,6 +2263,16 @@ async fn repair_edge_attachment_queue(
     )
     .await?;
     let after = edge_admin_get_json(&http, edge_url, admin_token, "/admin/stats", vec![]).await?;
+    let after_queue = edge_download_jobs(
+        edge_url,
+        admin_token,
+        None,
+        Some(asset_type.clone()),
+        None,
+        queue_limit,
+    )
+    .await?;
+    let after_queue_health = attachment_maintenance::queue_health(&after_queue);
 
     Ok(serde_json::json!({
         "ok": true,
@@ -2261,12 +2282,15 @@ async fn repair_edge_attachment_queue(
         "include_existing": include_existing,
         "settle_ms": settle_ms,
         "before": before,
+        "before_queue_health": before_queue_health,
         "backfill": backfill,
         "requeue": requeue,
         "sync": sync,
         "after": after,
+        "after_queue_health": after_queue_health,
         "agent_hints": [
             "attachment-repair backfills missing edge jobs, requeues ready jobs, then pulls completed files into memory",
+            "after_queue_health is the authoritative repair outcome summary for Agent follow-up decisions",
             "if backfill queued jobs but sync wrote zero files, run attachment-repair again after the edge queue finishes processing",
             "use sync attachment-queue to inspect failed, unavailable, pending, retry_scheduled, and completed jobs before retrying terminal failures"
         ]

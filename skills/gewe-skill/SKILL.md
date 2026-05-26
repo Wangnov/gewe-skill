@@ -206,7 +206,7 @@ Prefer `maintenance voice-repair` when the user asks to repair voice coverage. I
 
 Prefer `maintenance attachment-queue-health` when the user asks whether attachments are healthy across images, voice, video, emoji, and files. It returns counts by status and asset type, duplicate queue evidence, and Agent-readable next actions.
 
-For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory.
+For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary.
 
 When `voice-issues --with-edge-queue` returns `edge_queue_evidence.status=unavailable` or `purged`, explain that the edge queue already proved the upstream attachment is not currently downloadable. Do not keep retrying unavailable media unless the user explicitly asks for another upstream retry.
 
