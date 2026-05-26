@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomEventWriteRequest,
@@ -13,10 +14,11 @@ use gewe_skill_types::{
     ChatroomSystemEvent, ConversationSummary, IdentityChatroomMemberProfile,
     IdentityContactProfile, IdentityDisplayNameCandidate, IdentityDisplayNameResolution,
     IdentityEventBackfillRequest, IdentityEventBackfillResponse, IdentityMatch,
-    IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
-    IdentityResolveResponse, IngestEventRequest, MessageContextResponse, MessageQuery,
-    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
-    VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest, VoiceWarmResponse,
+    IdentityMemoryRecordStatus, IdentityMemoryStatus, IdentityProfileResponse,
+    IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
+    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
+    VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord,
+    VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -1076,6 +1078,12 @@ async fn identity_profile(
     let display_name_resolution = identity_display_name_resolution(&contact, &chatroom_member);
     let effective_display_name = display_name_resolution.selected_value.clone();
     let display_name_source = display_name_resolution.selected_source.clone();
+    let memory_status = identity_memory_status(
+        &contact,
+        &chatroom_member,
+        query.chatroom_id.is_some(),
+        &display_name_resolution,
+    );
 
     Ok(Json(IdentityProfileResponse {
         entity_id: query.wxid,
@@ -1083,6 +1091,7 @@ async fn identity_profile(
         effective_display_name,
         display_name_source,
         display_name_resolution,
+        memory_status,
         contact,
         chatroom_member,
         aliases,
@@ -1269,6 +1278,114 @@ fn identity_display_name_resolution(
         selected_value,
         candidates,
     }
+}
+
+fn identity_memory_status(
+    contact: &Option<IdentityContactProfile>,
+    chatroom_member: &Option<IdentityChatroomMemberProfile>,
+    chatroom_scoped: bool,
+    display_name_resolution: &IdentityDisplayNameResolution,
+) -> IdentityMemoryStatus {
+    let stale_after_days = identity_stale_after_days();
+    let now = Utc::now();
+    let contact_status = contact_record_status(contact.as_ref(), stale_after_days, now);
+    let chatroom_member_status = chatroom_scoped
+        .then(|| chatroom_member_record_status(chatroom_member.as_ref(), stale_after_days, now));
+
+    let mut reasons = Vec::<String>::new();
+    if !contact_status.present {
+        reasons.push("contact_missing".to_string());
+    } else if contact_status.stale {
+        reasons.push("contact_stale".to_string());
+    }
+    if let Some(status) = chatroom_member_status.as_ref() {
+        if !status.present {
+            reasons.push("chatroom_member_missing".to_string());
+        } else if chatroom_member
+            .as_ref()
+            .is_some_and(|member| !member.is_current)
+        {
+            reasons.push("chatroom_member_not_current".to_string());
+        } else if status.stale {
+            reasons.push("chatroom_member_stale".to_string());
+        }
+    }
+    if display_name_resolution.selected_source == "unresolved" {
+        reasons.push("display_name_unresolved".to_string());
+    }
+
+    let refresh_recommended = !reasons.is_empty();
+
+    IdentityMemoryStatus {
+        refresh_recommended,
+        reasons,
+        stale_after_days,
+        contact: contact_status,
+        chatroom_member: chatroom_member_status,
+    }
+}
+
+fn contact_record_status(
+    contact: Option<&IdentityContactProfile>,
+    stale_after_days: i64,
+    now: DateTime<Utc>,
+) -> IdentityMemoryRecordStatus {
+    let last_seen_at = contact.and_then(|contact| contact.last_seen_at.clone());
+    let updated_at = contact.and_then(|contact| contact.updated_at.clone());
+    identity_record_status(
+        contact.is_some(),
+        last_seen_at,
+        updated_at,
+        stale_after_days,
+        now,
+    )
+}
+
+fn chatroom_member_record_status(
+    member: Option<&IdentityChatroomMemberProfile>,
+    stale_after_days: i64,
+    now: DateTime<Utc>,
+) -> IdentityMemoryRecordStatus {
+    let last_seen_at = member.and_then(|member| member.last_seen_at.clone());
+    identity_record_status(member.is_some(), last_seen_at, None, stale_after_days, now)
+}
+
+fn identity_record_status(
+    present: bool,
+    last_seen_at: Option<String>,
+    updated_at: Option<String>,
+    stale_after_days: i64,
+    now: DateTime<Utc>,
+) -> IdentityMemoryRecordStatus {
+    let freshest_timestamp = updated_at.as_deref().or(last_seen_at.as_deref());
+    let age_days = freshest_timestamp.and_then(|value| timestamp_age_days(value, now));
+    let stale = present
+        && age_days
+            .map(|age_days| age_days >= stale_after_days)
+            .unwrap_or(false);
+    IdentityMemoryRecordStatus {
+        present,
+        stale,
+        refresh_recommended: !present || stale,
+        stale_after_days,
+        age_days,
+        last_seen_at,
+        updated_at,
+    }
+}
+
+fn timestamp_age_days(value: &str, now: DateTime<Utc>) -> Option<i64> {
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    Some((now - parsed.with_timezone(&Utc)).num_days().max(0))
+}
+
+fn identity_stale_after_days() -> i64 {
+    env::var("GEWE_SKILL_IDENTITY_STALE_AFTER_DAYS")
+        .ok()
+        .or_else(|| env::var("GEWE_SKILL_IDENTITY_STALE_DAYS").ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1)
+        .clamp(1, 365)
 }
 
 fn non_empty_string(value: Option<&str>) -> Option<String> {

@@ -282,12 +282,33 @@ pub struct IdentityDisplayNameResolution {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityMemoryRecordStatus {
+    pub present: bool,
+    pub stale: bool,
+    pub refresh_recommended: bool,
+    pub stale_after_days: i64,
+    pub age_days: Option<i64>,
+    pub last_seen_at: Option<Timestamp>,
+    pub updated_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityMemoryStatus {
+    pub refresh_recommended: bool,
+    pub reasons: Vec<String>,
+    pub stale_after_days: i64,
+    pub contact: IdentityMemoryRecordStatus,
+    pub chatroom_member: Option<IdentityMemoryRecordStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityProfileResponse {
     pub entity_id: String,
     pub chatroom_id: Option<String>,
     pub effective_display_name: Option<String>,
     pub display_name_source: String,
     pub display_name_resolution: IdentityDisplayNameResolution,
+    pub memory_status: IdentityMemoryStatus,
     pub contact: Option<IdentityContactProfile>,
     pub chatroom_member: Option<IdentityChatroomMemberProfile>,
     pub aliases: Vec<IdentityMatch>,

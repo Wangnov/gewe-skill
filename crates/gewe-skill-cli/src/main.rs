@@ -1716,16 +1716,25 @@ fn agent_message_query_guidance(
         speaker_block,
         &["summary", "missing_effective_display_count"],
     );
-    if missing_display_count > 0 {
+    let identity_refresh_recommended_count = value_usize_at(
+        speaker_block,
+        &["summary", "identity_refresh_recommended_count"],
+    );
+    if missing_display_count > 0 || identity_refresh_recommended_count > 0 {
         if let Some(conversation_id) = query
             .conversation_id
             .as_deref()
             .filter(|conversation_id| conversation_id.ends_with("@chatroom"))
         {
+            let reason = if identity_refresh_recommended_count > 0 {
+                "some speakers in this message window have missing, stale, not-current, or unresolved identity memory"
+            } else {
+                "some speakers in this message window do not have human-friendly display memory yet"
+            };
             next_actions.push(agent_guidance_action(
                 40,
                 "warm_chatroom_identity",
-                "some speakers in this message window do not have human-friendly display memory yet",
+                reason,
                 vec![
                     "gewe-skill".to_string(),
                     "--json".to_string(),
@@ -1787,6 +1796,7 @@ fn agent_message_query_guidance(
             "missing_attachment_count": missing_attachment_count,
             "voice": voice_summary,
             "missing_speaker_display_count": missing_display_count,
+            "identity_refresh_recommended_count": identity_refresh_recommended_count,
         },
         "next_actions": next_actions,
         "agent_notes": [
@@ -1794,7 +1804,8 @@ fn agent_message_query_guidance(
             "continue_message_page preserves resolved stable ids; prefer it over re-resolving names when paginating",
             "recommended maintenance commands preserve the current conversation, sender, and time window whenever the target command supports those filters",
             "inspect_attachment_readiness and inspect_voice_readiness are evidence-gathering actions, not automatic proof that data is lost",
-            "warm_chatroom_identity is bounded to the resolved chatroom and avoids broad contact-list polling"
+            "warm_chatroom_identity is bounded to the resolved chatroom and avoids broad contact-list polling",
+            "identity_refresh_recommended_count means at least one returned speaker has missing, stale, not-current, or unresolved contact/member memory"
         ]
     })
 }
@@ -2010,6 +2021,7 @@ async fn agent_speaker_block(
     let mut by_wxid = serde_json::Map::new();
     let mut lookup_errors = Vec::new();
     let mut missing_effective_display_count = 0usize;
+    let mut identity_refresh_recommended_count = 0usize;
 
     for wxid in &speaker_wxids {
         match client.identity_profile(wxid, chatroom_id).await {
@@ -2022,6 +2034,9 @@ async fn agent_speaker_block(
                     .is_empty()
                 {
                     missing_effective_display_count += 1;
+                }
+                if profile.memory_status.refresh_recommended {
+                    identity_refresh_recommended_count += 1;
                 }
                 let value = agent_speaker_profile_value(&profile);
                 by_wxid.insert(profile.entity_id.clone(), value);
@@ -2049,11 +2064,13 @@ async fn agent_speaker_block(
             "lookup_error_count": lookup_error_count,
             "messages_missing_sender_count": messages_missing_sender_count,
             "missing_effective_display_count": missing_effective_display_count,
+            "identity_refresh_recommended_count": identity_refresh_recommended_count,
             "chatroom_id": chatroom_id,
             "chatroom_scoped": chatroom_id.is_some(),
             "agent_notes": [
                 "use speakers.by_wxid[message.sender_wxid].effective_display_name for human-facing names",
                 "keep message.sender_wxid as the stable evidence id when explaining who said something",
+                "use speakers.by_wxid[message.sender_wxid].memory_status to decide whether bounded identity warm is needed",
                 "for chatrooms, display names prefer contact remark, then room-scoped card/display names, then nicknames"
             ]
         }
@@ -2088,6 +2105,7 @@ fn agent_speaker_profile_value(profile: &IdentityProfileResponse) -> Value {
         "effective_display_name": profile.effective_display_name.clone(),
         "display_name_source": profile.display_name_source.clone(),
         "display_name_resolution": profile.display_name_resolution.clone(),
+        "memory_status": profile.memory_status.clone(),
         "contact": contact,
         "chatroom_member": chatroom_member,
         "aliases": profile.aliases.clone(),
@@ -3212,6 +3230,39 @@ fn print_json(value: impl serde::Serialize) -> Result<(), serde_json::Error> {
 mod tests {
     use super::*;
 
+    fn test_identity_memory_status(
+        refresh_recommended: bool,
+    ) -> gewe_skill_types::IdentityMemoryStatus {
+        let reasons = if refresh_recommended {
+            vec!["contact_stale".to_string()]
+        } else {
+            Vec::new()
+        };
+        gewe_skill_types::IdentityMemoryStatus {
+            refresh_recommended,
+            reasons,
+            stale_after_days: 1,
+            contact: gewe_skill_types::IdentityMemoryRecordStatus {
+                present: true,
+                stale: refresh_recommended,
+                refresh_recommended,
+                stale_after_days: 1,
+                age_days: Some(if refresh_recommended { 2 } else { 0 }),
+                last_seen_at: Some("2026-05-26T00:00:00Z".to_string()),
+                updated_at: Some("2026-05-26T00:00:00Z".to_string()),
+            },
+            chatroom_member: Some(gewe_skill_types::IdentityMemoryRecordStatus {
+                present: true,
+                stale: false,
+                refresh_recommended: false,
+                stale_after_days: 1,
+                age_days: Some(0),
+                last_seen_at: Some("2026-05-27T00:00:00Z".to_string()),
+                updated_at: None,
+            }),
+        }
+    }
+
     #[test]
     fn attachment_cursor_stops_before_first_failed_item() {
         let cursor = attachment_sync_cursor_after_batch(
@@ -3344,6 +3395,7 @@ mod tests {
                     },
                 ],
             },
+            memory_status: test_identity_memory_status(false),
             contact: Some(gewe_skill_types::IdentityContactProfile {
                 wxid: "wxid_left".to_string(),
                 nickname: Some("左".to_string()),
@@ -3616,6 +3668,47 @@ mod tests {
             .unwrap()
             .iter()
             .any(|action| action["action"] == "inspect_voice_readiness"));
+        assert!(guidance["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "warm_chatroom_identity"));
+    }
+
+    #[test]
+    fn agent_message_guidance_warms_stale_identity_memory_without_missing_display_names() {
+        let mut message = test_message("m1", gewe_skill_types::NormalizedKind::Text);
+        message.received_at = "2026-05-26T02:00:00Z".to_string();
+        let messages = ApiPage {
+            items: vec![message],
+            next_cursor: None,
+        };
+        let query = MessageQuery {
+            conversation_id: Some("room@chatroom".to_string()),
+            limit: Some(5),
+            ..MessageQuery::default()
+        };
+        let attachment_block = serde_json::json!({
+            "summary": {
+                "attachment_expected_missing_count": 0
+            }
+        });
+        let speaker_block = serde_json::json!({
+            "summary": {
+                "missing_effective_display_count": 0,
+                "identity_refresh_recommended_count": 1
+            }
+        });
+
+        let guidance = agent_message_query_guidance(
+            &query,
+            &messages,
+            &attachment_block,
+            None,
+            &speaker_block,
+        );
+
+        assert_eq!(guidance["summary"]["identity_refresh_recommended_count"], 1);
         assert!(guidance["next_actions"]
             .as_array()
             .unwrap()

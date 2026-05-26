@@ -531,6 +531,32 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
+    fn test_identity_memory_status() -> gewe_skill_types::IdentityMemoryStatus {
+        gewe_skill_types::IdentityMemoryStatus {
+            refresh_recommended: false,
+            reasons: Vec::new(),
+            stale_after_days: 1,
+            contact: gewe_skill_types::IdentityMemoryRecordStatus {
+                present: true,
+                stale: false,
+                refresh_recommended: false,
+                stale_after_days: 1,
+                age_days: Some(0),
+                last_seen_at: Some("2026-05-27T00:00:00Z".to_string()),
+                updated_at: Some("2026-05-27T00:00:00Z".to_string()),
+            },
+            chatroom_member: Some(gewe_skill_types::IdentityMemoryRecordStatus {
+                present: true,
+                stale: false,
+                refresh_recommended: false,
+                stale_after_days: 1,
+                age_days: Some(0),
+                last_seen_at: Some("2026-05-27T00:00:00Z".to_string()),
+                updated_at: None,
+            }),
+        }
+    }
+
     #[test]
     fn event_type_filters_normalize_spacing_and_hyphens() {
         let filters = normalized_event_type_filters(&[
@@ -587,6 +613,7 @@ mod tests {
                         selected: true,
                     }],
                 },
+                memory_status: test_identity_memory_status(),
                 contact: None,
                 chatroom_member: None,
                 aliases: Vec::new(),
