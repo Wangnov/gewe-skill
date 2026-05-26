@@ -1,6 +1,6 @@
 ---
 name: gewe-skill
-description: Use GeWe-backed WeChat memory for read-only Agent analysis, search, summaries, and chatroom event inspection through the gewe-skill CLI/API.
+description: Use GeWe-backed WeChat memory for read-only Agent analysis, identity resolution, message window queries, summaries, and chatroom event inspection through the gewe-skill CLI/API.
 ---
 
 # gewe-skill
@@ -16,21 +16,14 @@ Use this skill when the user wants an Agent to inspect, search, summarize, or an
 - Treat `gewe-skill-memory` as the Agent-readable memory layer.
 - Never print bearer tokens, GeWe tokens, callback secrets, or raw private payloads unless the user explicitly asks for a narrow diagnostic excerpt.
 
-## Preferred access path
+## Command contract
 
-Use the CLI first:
+This CLI is Agent-first. Always use `--json`; stdout is the machine-readable result and stderr is for diagnostics.
+
+Start with:
 
 ```bash
-gewe-skill health
-gewe-skill recent --limit 20
-gewe-skill search --q '<keyword>' --limit 20
-gewe-skill conversations --limit 50
-gewe-skill resolve --q '<chatroom, contact, or room nickname>' --limit 10
-gewe-skill refresh-identity --chatroom-id '<chatroom_id>'
-gewe-skill attachments --limit 20
-gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
-gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 50
-gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 50
+gewe-skill --json doctor
 ```
 
 The CLI reads these environment variables:
@@ -41,58 +34,104 @@ GEWE_SKILL_READ_TOKEN=...
 GEWE_SKILL_WRITE_TOKEN=...
 ```
 
-Use write operations only for trusted ingest or repair workflows:
+## Normal read path
+
+1. Resolve human wording before reading messages:
 
 ```bash
-gewe-skill normalize --file callback.json --received-at 2026-05-26T00:00:00.000Z
-gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.000Z
+gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --limit 10
 ```
 
-## Common tasks
+2. If names look stale or missing, refresh only the needed identity scope:
 
-### Recent chat context
+```bash
+gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
+gewe-skill --json identity refresh --recent-chatrooms 20
+```
 
-1. Run `gewe-skill recent --limit 50`.
-2. Identify relevant `conversation_id`, sender, time, and message previews.
-3. Summarize with concrete timestamps and caveat if attachments are not loaded.
+3. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
 
-### Resolve names before reading messages
+```bash
+gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
+gewe-skill --json messages list --conversation-id '<conversation_id>' --after '<iso-time>' --before '<iso-time>' --limit 50
+gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-wxid '<wxid>' --limit 50
+gewe-skill --json messages list --conversation-id '<conversation_id>' --kind text --direction incoming --limit 50
+```
 
-1. Run `gewe-skill resolve --q '<user wording>' --limit 10` before assuming a group name, contact name, or room nickname.
-2. If the target is missing or stale, run `gewe-skill refresh-identity --recent-chatrooms 20`, or `gewe-skill refresh-identity --chatroom-id '<chatroom_id>'` when a room id is already known.
-3. Use the resolved `entity_id` as `conversation_id` for chatrooms, and use `chatroom_id` plus `entity_id` for room-scoped member nicknames.
-4. If multiple candidates remain, explain the candidates instead of guessing.
+4. Search within a scoped window instead of broad global search when the user named a group/person/time:
 
-### Conversation inventory
+```bash
+gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
+gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --after '<iso-time>' --limit 20
+```
 
-1. Run `gewe-skill conversations --limit 100`.
-2. Prefer rows with `display_name`; if the name is missing, run `gewe-skill refresh-identity --recent-chatrooms 20`.
-3. Use the returned `conversation_id` values for follow-up message/event queries.
+5. If a specific message matters, fetch nearby context:
 
-### Keyword search
+```bash
+gewe-skill --json messages context --message-key '<message_key>' --before 5 --after 5
+```
 
-1. Run `gewe-skill search --q '<keyword>' --limit 50`.
-2. Use exact timestamps, `conversation_id`, `sender_wxid`, and message text in the answer.
-3. If the result set is sparse, say that this is a keyword search over normalized text and may not include attachment-only content.
+## Conversation discovery
 
-### Chatroom member changes
+Use this when the user names a vague group or asks what data exists:
 
-1. Run `gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 100`.
-2. Run `gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 100`.
-3. Correlate snapshot diff events with SYSTEM XML events before making claims about who joined, left, was invited, or was removed.
+```bash
+gewe-skill --json conversations list --limit 100
+gewe-skill --json identity resolve --q '<name from user>' --limit 10
+```
 
-### Attachments
+Prefer `identity resolve` over keyword search for names. If multiple candidates remain, report the candidates and do not guess.
 
-1. Run `gewe-skill attachments --limit 20`.
-2. Use `kind`, `mime_type`, `size_bytes`, `message_key`, and `sha256` when referencing attachment evidence.
-3. Download bytes with `gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin` only when the user asks to inspect actual media or file content.
+## Chatroom member changes
+
+Use both event surfaces before claiming who joined, left, was removed, or renamed something:
+
+```bash
+gewe-skill --json chatrooms events --chatroom-id '<chatroom_id>' --limit 100
+gewe-skill --json chatrooms system-events --chatroom-id '<chatroom_id>' --limit 100
+gewe-skill --json chatrooms snapshots --chatroom-id '<chatroom_id>' --limit 20
+```
+
+Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
+
+## Attachments
+
+List attachment metadata first. Download bytes only when the user asks to inspect actual media or files:
+
+```bash
+gewe-skill --json attachments list --limit 20
+gewe-skill --json attachments list --message-key '<message_key>' --limit 50
+gewe-skill --json attachments download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
+```
+
+Mention whether media was downloaded or only detected.
+
+## Trusted maintenance path
+
+Use these only for trusted ingest, sync, or repair workflows:
+
+```bash
+gewe-skill --json ingest normalize --file callback.json --received-at 2026-05-26T00:00:00.000Z
+gewe-skill --json ingest file --file callback.json --received-at 2026-05-26T00:00:00.000Z
+gewe-skill --json sync edge --limit 100
+gewe-skill --json sync attachments --limit 50
+```
+
+## Raw escape hatch
+
+Use high-level commands first. If a read-only endpoint is not exposed yet, use:
+
+```bash
+gewe-skill --json request get --path /api/messages --query conversation_id=<conversation_id> --query limit=20
+```
+
+Do not use raw writes unless the user asked for that specific write.
 
 ## Interpretation rules
 
-- Prefer structured system events for actor/target names.
-- Prefer snapshot diff events for actual membership state changes.
-- Prefer identity resolution over keyword search when the user names a group or person.
-- If system events and snapshot diffs disagree, report the disagreement instead of guessing.
+- Resolve names first, then read messages by stable ids.
+- Treat room-scoped member aliases as scoped to `chatroom_id`; the same display name may appear in multiple groups.
+- Observed aliases from quoted messages are useful evidence, but may be historical. Current GeWe group member info has higher confidence for present state.
 - For group-card or nickname changes, preserve the original message text and avoid over-normalizing.
 - For files, images, voice, video, and emoji, mention whether the attachment was downloaded or only detected.
 

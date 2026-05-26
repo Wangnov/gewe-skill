@@ -11,7 +11,7 @@ use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomEventType, ChatroomMember, ChatroomMemberEvent,
     ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IdentityMatch,
     IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
-    NormalizedMessage, RawCallbackRequest,
+    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,12 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ContextQuery {
+    before: Option<i64>,
+    after: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -86,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
     init_db(&db).await?;
+    backfill_observed_identity_aliases(&db).await?;
 
     let state = Arc::new(AppState {
         db,
@@ -123,6 +130,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/messages",
+            get(list_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
             "/api/messages/recent",
             get(recent_messages).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -132,6 +146,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/messages/search",
             get(search_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/messages/{message_key}/context",
+            get(message_context).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -362,52 +383,110 @@ async fn recent_messages(
     State(state): State<SharedState>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
-    let limit = clamp_limit(query.limit);
-    let cursor = query
-        .cursor
-        .unwrap_or_else(|| "9999-12-31T23:59:59.999Z".to_string());
-    let rows = sqlx::query(
-        r#"
-        SELECT message_json
-        FROM messages
-        WHERE received_at < ?
-        ORDER BY received_at DESC, id DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(cursor)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?;
-    let items = rows
-        .iter()
-        .filter_map(|row| {
-            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok()
-        })
-        .collect::<Vec<_>>();
-    let next_cursor = items.last().map(|message| message.received_at.clone());
-    Ok(Json(ApiPage { items, next_cursor }))
+    let request = MessageQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+        ..MessageQuery::default()
+    };
+    list_messages_impl(&state.db, &request).await.map(Json)
 }
 
 async fn search_messages(
     State(state): State<SharedState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+    let request = MessageQuery {
+        q: Some(query.q),
+        limit: query.limit,
+        ..MessageQuery::default()
+    };
+    list_messages_impl(&state.db, &request).await.map(Json)
+}
+
+async fn list_messages(
+    State(state): State<SharedState>,
+    Query(query): Query<MessageQuery>,
+) -> Result<Json<ApiPage<NormalizedMessage>>, ApiError> {
+    list_messages_impl(&state.db, &query).await.map(Json)
+}
+
+async fn list_messages_impl(
+    db: &SqlitePool,
+    query: &MessageQuery,
+) -> Result<ApiPage<NormalizedMessage>, ApiError> {
     let limit = clamp_limit(query.limit);
-    let pattern = format!("%{}%", query.q);
-    let rows = sqlx::query(
-        r#"
-        SELECT message_json
-        FROM messages
-        WHERE content_text LIKE ?
-        ORDER BY received_at DESC, id DESC
-        LIMIT ?
-        "#,
-    )
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?;
+    let order = query
+        .order
+        .as_deref()
+        .unwrap_or("desc")
+        .to_ascii_lowercase();
+    let ascending = order == "asc";
+    let mut sql = String::from("SELECT message_json FROM messages WHERE 1 = 1");
+    let mut args = Vec::<String>::new();
+
+    if let Some(value) = query
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        sql.push_str(" AND conversation_id = ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query
+        .sender_wxid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        sql.push_str(" AND sender_wxid = ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.kind.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND lower(kind) = lower(?)");
+        args.push(value.to_string());
+    }
+    match query
+        .direction
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("incoming") => sql.push_str(" AND is_outgoing = 0"),
+        Some("outgoing") => sql.push_str(" AND is_outgoing != 0"),
+        _ => {}
+    }
+    if let Some(value) = query.after.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND received_at >= ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.before.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND received_at < ?");
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.cursor.as_deref().filter(|value| !value.is_empty()) {
+        if ascending {
+            sql.push_str(" AND received_at > ?");
+        } else {
+            sql.push_str(" AND received_at < ?");
+        }
+        args.push(value.to_string());
+    }
+    if let Some(value) = query.q.as_deref().filter(|value| !value.is_empty()) {
+        sql.push_str(" AND (content_text LIKE ? OR message_json LIKE ?)");
+        let pattern = format!("%{value}%");
+        args.push(pattern.clone());
+        args.push(pattern);
+    }
+    if ascending {
+        sql.push_str(" ORDER BY received_at ASC, id ASC LIMIT ?");
+    } else {
+        sql.push_str(" ORDER BY received_at DESC, id DESC LIMIT ?");
+    }
+
+    let mut statement = sqlx::query(&sql);
+    for arg in args {
+        statement = statement.bind(arg);
+    }
+    let rows = statement.bind(limit).fetch_all(db).await?;
     let items = rows
         .iter()
         .filter_map(|row| {
@@ -415,7 +494,109 @@ async fn search_messages(
         })
         .collect::<Vec<_>>();
     let next_cursor = items.last().map(|message| message.received_at.clone());
-    Ok(Json(ApiPage { items, next_cursor }))
+    Ok(ApiPage { items, next_cursor })
+}
+
+async fn message_context(
+    State(state): State<SharedState>,
+    Path(message_key): Path<String>,
+    Query(query): Query<ContextQuery>,
+) -> Result<Json<MessageContextResponse>, ApiError> {
+    let anchor_row = sqlx::query(
+        r#"
+        SELECT id, conversation_id, received_at, message_json
+        FROM messages
+        WHERE message_key = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&message_key)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some(anchor_row) = anchor_row else {
+        return Ok(Json(MessageContextResponse {
+            conversation_id: None,
+            message_key,
+            before: Vec::new(),
+            anchor: None,
+            after: Vec::new(),
+        }));
+    };
+    let anchor_id: i64 = anchor_row.get("id");
+    let conversation_id: Option<String> = anchor_row.get("conversation_id");
+    let received_at: String = anchor_row.get("received_at");
+    let anchor = serde_json::from_str::<NormalizedMessage>(anchor_row.get("message_json")).ok();
+    let before = context_rows(
+        &state.db,
+        conversation_id.as_deref(),
+        &received_at,
+        anchor_id,
+        "before",
+        clamp_limit(query.before),
+    )
+    .await?;
+    let after = context_rows(
+        &state.db,
+        conversation_id.as_deref(),
+        &received_at,
+        anchor_id,
+        "after",
+        clamp_limit(query.after),
+    )
+    .await?;
+    Ok(Json(MessageContextResponse {
+        conversation_id,
+        message_key,
+        before,
+        anchor,
+        after,
+    }))
+}
+
+async fn context_rows(
+    db: &SqlitePool,
+    conversation_id: Option<&str>,
+    received_at: &str,
+    anchor_id: i64,
+    side: &str,
+    limit: i64,
+) -> Result<Vec<NormalizedMessage>, ApiError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(Vec::new());
+    };
+    let (operator, order) = if side == "after" {
+        (">", "ASC")
+    } else {
+        ("<", "DESC")
+    };
+    let sql = format!(
+        r#"
+        SELECT message_json
+        FROM messages
+        WHERE conversation_id = ?
+          AND (received_at {operator} ? OR (received_at = ? AND id {operator} ?))
+        ORDER BY received_at {order}, id {order}
+        LIMIT ?
+        "#
+    );
+    let rows = sqlx::query(&sql)
+        .bind(conversation_id)
+        .bind(received_at)
+        .bind(received_at)
+        .bind(anchor_id)
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
+    let mut items = rows
+        .iter()
+        .filter_map(|row| {
+            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok()
+        })
+        .collect::<Vec<_>>();
+    if side == "before" {
+        items.reverse();
+    }
+    Ok(items)
 }
 
 async fn conversations(
@@ -985,6 +1166,34 @@ async fn project_message_identity(
                 true,
                 &message.received_at,
                 "message",
+            )
+            .await?;
+        }
+        for observed in observed_member_aliases_from_message(message) {
+            upsert_chatroom_member(
+                tx,
+                &observed.chatroom_id,
+                &observed.member_wxid,
+                None,
+                Some(&observed.display_name),
+                None,
+                None,
+                None,
+                true,
+                &message.received_at,
+                "message_observed_alias",
+            )
+            .await?;
+            upsert_alias(
+                tx,
+                &observed.display_name,
+                "chatroom_member",
+                &observed.member_wxid,
+                Some(&observed.chatroom_id),
+                "message_quote:refermsg_displayname",
+                false,
+                0.7,
+                &message.received_at,
             )
             .await?;
         }
@@ -1697,6 +1906,50 @@ fn sender_display_from_push_content(message: &NormalizedMessage) -> Option<Strin
     (!name.is_empty()).then_some(name.to_string())
 }
 
+struct ObservedMemberAlias {
+    chatroom_id: String,
+    member_wxid: String,
+    display_name: String,
+}
+
+fn observed_member_aliases_from_message(message: &NormalizedMessage) -> Vec<ObservedMemberAlias> {
+    let Some(xml) = &message.content_xml else {
+        return Vec::new();
+    };
+    let Some(refermsg) = extract_xml_tag(xml, "refermsg") else {
+        return Vec::new();
+    };
+    let Some(display_name) = extract_xml_tag(&refermsg, "displayname") else {
+        return Vec::new();
+    };
+    let Some(member_wxid) = extract_xml_tag(&refermsg, "chatusr") else {
+        return Vec::new();
+    };
+    let chatroom_id = extract_xml_tag(&refermsg, "fromusr")
+        .or_else(|| message.conversation_id.clone())
+        .unwrap_or_default();
+    if chatroom_id.is_empty() || member_wxid.is_empty() || display_name.is_empty() {
+        return Vec::new();
+    }
+    vec![ObservedMemberAlias {
+        chatroom_id,
+        member_wxid,
+        display_name,
+    }]
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = xml.find(&open)?;
+    let after_open = &xml[start..];
+    let close_bracket = after_open.find('>')?;
+    let content_start = start + close_bracket + 1;
+    let close = format!("</{tag}>");
+    let content_end = xml[content_start..].find(&close)? + content_start;
+    let value = xml[content_start..content_end].trim();
+    (!value.is_empty()).then_some(value.to_string())
+}
+
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query("PRAGMA journal_mode = WAL").execute(db).await?;
     sqlx::query("PRAGMA foreign_keys = ON").execute(db).await?;
@@ -1906,6 +2159,47 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+async fn backfill_observed_identity_aliases(db: &SqlitePool) -> Result<(), ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT message_json
+        FROM messages
+        WHERE message_json LIKE '%<refermsg>%'
+          AND message_json LIKE '%<displayname>%'
+          AND message_json LIKE '%<chatusr>%'
+        "#,
+    )
+    .fetch_all(db)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    for row in rows {
+        let Ok(message) =
+            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json"))
+        else {
+            continue;
+        };
+        for observed in observed_member_aliases_from_message(&message) {
+            upsert_alias(
+                &mut tx,
+                &observed.display_name,
+                "chatroom_member",
+                &observed.member_wxid,
+                Some(&observed.chatroom_id),
+                "message_quote:refermsg_displayname",
+                false,
+                0.7,
+                &message.received_at,
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 fn safe_attachment_path(root: &FsPath, object_key: &str) -> Option<PathBuf> {
     let relative = FsPath::new(object_key);
     if relative.is_absolute() || object_key.contains("..") {
@@ -1969,6 +2263,8 @@ impl From<std::io::Error> for ApiError {
         Self::Io(error)
     }
 }
+
+impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {

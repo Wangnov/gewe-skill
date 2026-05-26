@@ -3,7 +3,8 @@
 use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
     ConversationSummary, IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse,
-    IngestEventRequest, NormalizedMessage, RawCallbackRequest,
+    IngestEventRequest, MessageContextResponse, MessageQuery, NormalizedMessage,
+    RawCallbackRequest,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -99,6 +100,19 @@ impl GeweSkillClient {
         self.get_json("api/messages/recent", limit).await
     }
 
+    pub async fn messages(
+        &self,
+        query: &MessageQuery,
+    ) -> Result<ApiPage<NormalizedMessage>, ClientError> {
+        let mut url = self.url("api/messages")?;
+        append_message_query(&mut url, query);
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
     pub async fn search_messages(
         &self,
         query: &str,
@@ -109,6 +123,29 @@ impl GeweSkillClient {
         if let Some(limit) = limit {
             url.query_pairs_mut()
                 .append_pair("limit", &limit.to_string());
+        }
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
+    pub async fn message_context(
+        &self,
+        message_key: &str,
+        before: Option<u32>,
+        after: Option<u32>,
+    ) -> Result<MessageContextResponse, ClientError> {
+        let path = format!("api/messages/{message_key}/context");
+        let mut url = self.url(&path)?;
+        if let Some(before) = before {
+            url.query_pairs_mut()
+                .append_pair("before", &before.to_string());
+        }
+        if let Some(after) = after {
+            url.query_pairs_mut()
+                .append_pair("after", &after.to_string());
         }
         let mut request = self.http.get(url);
         if let Some(token) = &self.read_token {
@@ -235,5 +272,39 @@ impl GeweSkillClient {
         }
         let body = response.text().await.unwrap_or_default();
         Err(ClientError::Api { status, body })
+    }
+}
+
+fn append_message_query(url: &mut Url, query: &MessageQuery) {
+    let mut pairs = url.query_pairs_mut();
+    if let Some(value) = &query.q {
+        pairs.append_pair("q", value);
+    }
+    if let Some(value) = &query.conversation_id {
+        pairs.append_pair("conversation_id", value);
+    }
+    if let Some(value) = &query.sender_wxid {
+        pairs.append_pair("sender_wxid", value);
+    }
+    if let Some(value) = &query.kind {
+        pairs.append_pair("kind", value);
+    }
+    if let Some(value) = &query.direction {
+        pairs.append_pair("direction", value);
+    }
+    if let Some(value) = &query.after {
+        pairs.append_pair("after", value);
+    }
+    if let Some(value) = &query.before {
+        pairs.append_pair("before", value);
+    }
+    if let Some(value) = &query.cursor {
+        pairs.append_pair("cursor", value);
+    }
+    if let Some(value) = query.limit {
+        pairs.append_pair("limit", &value.to_string());
+    }
+    if let Some(value) = &query.order {
+        pairs.append_pair("order", value);
     }
 }

@@ -37,8 +37,8 @@ Put Caddy, Nginx, Cloudflare Tunnel, or Tailscale in front of the service depend
 When the memory service is not publicly reachable, run pull sync on the server instead of pushing from Cloudflare Workers:
 
 ```bash
-gewe-skill sync-edge
-gewe-skill sync-edge-attachments
+gewe-skill --json sync edge
+gewe-skill --json sync attachments
 ```
 
 The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, attachment bytes, and recent identity data synchronized into memory.
@@ -48,9 +48,9 @@ The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw ca
 The memory service can also call GeWe read-only APIs to build a durable identity index:
 
 ```bash
-gewe-skill refresh-identity --recent-chatrooms 20
-gewe-skill refresh-identity --chatroom-id '<chatroom_id>'
-gewe-skill resolve --q '<group or member name>'
+gewe-skill --json identity refresh --recent-chatrooms 20
+gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
+gewe-skill --json identity resolve --q '<group or member name>'
 ```
 
 Keep GeWe credentials only in the memory service environment. Agent runtimes should call `gewe-skill` through the local memory API instead of calling GeWe directly.

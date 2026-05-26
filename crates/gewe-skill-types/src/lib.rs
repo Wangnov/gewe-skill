@@ -99,6 +99,29 @@ pub struct NormalizedMessage {
     pub raw_content: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageQuery {
+    pub q: Option<String>,
+    pub conversation_id: Option<String>,
+    pub sender_wxid: Option<String>,
+    pub kind: Option<String>,
+    pub direction: Option<String>,
+    pub after: Option<Timestamp>,
+    pub before: Option<Timestamp>,
+    pub cursor: Option<Timestamp>,
+    pub limit: Option<i64>,
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageContextResponse {
+    pub conversation_id: Option<String>,
+    pub message_key: String,
+    pub before: Vec<NormalizedMessage>,
+    pub anchor: Option<NormalizedMessage>,
+    pub after: Vec<NormalizedMessage>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentRecord {
     pub id: Option<i64>,

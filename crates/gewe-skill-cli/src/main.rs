@@ -1,9 +1,10 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
-    AttachmentKind, AttachmentRecord, IdentityRefreshRequest, RawCallbackRequest,
+    AttachmentKind, AttachmentRecord, IdentityRefreshRequest, MessageQuery, RawCallbackRequest,
 };
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,20 +17,35 @@ use std::{
 #[command(
     name = "gewe-skill",
     version,
-    about = "Operate and query gewe-skill memory"
+    about = "Agent protocol CLI for GeWe-backed WeChat memory"
 )]
 struct Cli {
+    /// Always emit machine-readable JSON. This is the primary CLI surface.
+    #[arg(long, global = true, default_value_t = true)]
+    json: bool,
+
     #[arg(
         long,
+        global = true,
         env = "GEWE_SKILL_BASE_URL",
         default_value = "http://127.0.0.1:8788"
     )]
     base_url: String,
 
-    #[arg(long, env = "GEWE_SKILL_READ_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        global = true,
+        env = "GEWE_SKILL_READ_TOKEN",
+        hide_env_values = true
+    )]
     read_token: Option<String>,
 
-    #[arg(long, env = "GEWE_SKILL_WRITE_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        global = true,
+        env = "GEWE_SKILL_WRITE_TOKEN",
+        hide_env_values = true
+    )]
     write_token: Option<String>,
 
     #[command(subcommand)]
@@ -38,34 +54,72 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Check memory service health.
-    Health,
-    /// List recent normalized messages.
-    Recent {
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-    },
-    /// Search messages by keyword.
-    Search {
-        #[arg(long)]
-        q: String,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-    },
-    /// List conversations ordered by last message time.
+    /// Check CLI config, auth presence, and memory service reachability.
+    Doctor,
+    /// Discover and inspect conversations.
     Conversations {
+        #[command(subcommand)]
+        command: ConversationsCommand,
+    },
+    /// Resolve and refresh contacts, chatrooms, and room-scoped member aliases.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+    /// Read message windows for group chats and private chats.
+    Messages {
+        #[command(subcommand)]
+        command: MessagesCommand,
+    },
+    /// Inspect or download synced attachments.
+    Attachments {
+        #[command(subcommand)]
+        command: AttachmentsCommand,
+    },
+    /// Inspect chatroom snapshots and member/system events.
+    Chatrooms {
+        #[command(subcommand)]
+        command: ChatroomsCommand,
+    },
+    /// Trusted ingest and normalization operations.
+    Ingest {
+        #[command(subcommand)]
+        command: IngestCommand,
+    },
+    /// Pull evidence from the Cloudflare edge buffer into memory.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+    /// Raw read-only API escape hatch using configured auth.
+    Request {
+        #[command(subcommand)]
+        command: RequestCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConversationsCommand {
+    /// List conversations ordered by newest message.
+    List {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// Resolve a human name, chatroom name, alias, or room-scoped member display name.
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    /// Resolve human wording into stable chatroom/contact/member ids.
     Resolve {
         #[arg(long)]
         q: String,
+        #[arg(long)]
+        chatroom_id: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
-    /// Ask memory to refresh identity data from GeWe read-only APIs.
-    RefreshIdentity {
+    /// Refresh the local identity memory from GeWe read-only APIs.
+    Refresh {
         #[arg(long)]
         full: bool,
         #[arg(long)]
@@ -75,32 +129,134 @@ enum Command {
         #[arg(long)]
         recent_chatrooms: Option<i64>,
     },
-    /// List recent synced attachments.
-    Attachments {
+}
+
+#[derive(Debug, Subcommand)]
+enum MessagesCommand {
+    /// List a bounded message window with optional filters.
+    List {
+        #[command(flatten)]
+        filters: MessageFilterArgs,
+    },
+    /// Search message text/XML within an optional scoped window.
+    Search {
+        #[arg(long)]
+        q: String,
+        #[command(flatten)]
+        filters: MessageFilterArgs,
+    },
+    /// Read messages around a known message key.
+    Context {
+        #[arg(long)]
+        message_key: String,
+        #[arg(long, default_value_t = 5)]
+        before: u32,
+        #[arg(long, default_value_t = 5)]
+        after: u32,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct MessageFilterArgs {
+    #[arg(long)]
+    conversation_id: Option<String>,
+    #[arg(long)]
+    sender_wxid: Option<String>,
+    #[arg(long)]
+    kind: Option<String>,
+    #[arg(long, value_enum, default_value = "any")]
+    direction: Direction,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long, value_enum, default_value = "desc")]
+    order: Order,
+}
+
+#[derive(Debug, Clone, ValueEnum, PartialEq, Eq)]
+enum Direction {
+    Any,
+    Incoming,
+    Outgoing,
+}
+
+impl Direction {
+    fn query_value(&self) -> Option<String> {
+        match self {
+            Self::Any => None,
+            Self::Incoming => Some("incoming".to_string()),
+            Self::Outgoing => Some("outgoing".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Order {
+    Asc,
+    Desc,
+}
+
+impl Order {
+    fn query_value(&self) -> String {
+        match self {
+            Self::Asc => "asc".to_string(),
+            Self::Desc => "desc".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum AttachmentsCommand {
+    /// List recent synced attachment records.
+    List {
         #[arg(long, default_value_t = 20)]
         limit: u32,
+        #[arg(long)]
+        message_key: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
     },
-    /// Download one synced attachment from memory by sha256.
-    AttachmentDownload {
+    /// Download one synced attachment by sha256.
+    Download {
         #[arg(long)]
         sha256: String,
         #[arg(long)]
         output: PathBuf,
     },
-    /// List chatroom member diff events.
-    ChatroomEvents {
+}
+
+#[derive(Debug, Subcommand)]
+enum ChatroomsCommand {
+    /// List stored membership snapshots for a chatroom.
+    Snapshots {
         #[arg(long)]
         chatroom_id: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
-    /// List structured chatroom system events.
-    ChatroomSystemEvents {
+    /// List snapshot-diff member events for a chatroom.
+    Events {
         #[arg(long)]
         chatroom_id: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// List structured system events for a chatroom.
+    SystemEvents {
+        #[arg(long)]
+        chatroom_id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IngestCommand {
     /// Normalize a raw GeWe callback JSON file and print the ingest payload.
     Normalize {
         #[arg(long)]
@@ -109,14 +265,18 @@ enum Command {
         received_at: Option<String>,
     },
     /// Normalize a raw GeWe callback JSON file and send it to memory.
-    IngestFile {
+    File {
         #[arg(long)]
         file: PathBuf,
         #[arg(long)]
         received_at: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
     /// Pull raw events from gewe-skill-edge admin export and write them to memory.
-    SyncEdge {
+    Edge {
         #[arg(
             long,
             env = "GEWE_SKILL_EDGE_URL",
@@ -137,7 +297,7 @@ enum Command {
         cursor_file: PathBuf,
     },
     /// Pull completed attachments from gewe-skill-edge and store them locally.
-    SyncEdgeAttachments {
+    Attachments {
         #[arg(
             long,
             env = "GEWE_SKILL_EDGE_URL",
@@ -162,6 +322,17 @@ enum Command {
             default_value = "/opt/gewe-skill-memory/data/attachments"
         )]
         attachment_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RequestCommand {
+    /// GET a read-only memory API path with configured auth.
+    Get {
+        #[arg(long)]
+        path: String,
+        #[arg(long = "query")]
+        query_pairs: Vec<String>,
     },
 }
 
@@ -205,102 +376,260 @@ struct EdgeAttachment {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let client = build_client(&cli)?;
+    let raw_base_url = cli.base_url.clone();
+    let raw_read_token = cli.read_token.clone();
 
     match cli.command {
-        Command::Health => print_json(client.healthz().await?)?,
-        Command::Recent { limit } => print_json(client.recent_messages(Some(limit)).await?)?,
-        Command::Search { q, limit } => print_json(client.search_messages(&q, Some(limit)).await?)?,
-        Command::Conversations { limit } => print_json(client.conversations(Some(limit)).await?)?,
-        Command::Resolve { q, limit } => {
-            print_json(client.resolve_identity(&q, Some(limit)).await?)?
-        }
-        Command::RefreshIdentity {
-            full,
-            chatroom_id,
-            wxids,
-            recent_chatrooms,
-        } => {
-            let request = IdentityRefreshRequest {
-                full: Some(full),
-                chatroom_id,
-                wxids: (!wxids.is_empty()).then_some(wxids),
-                recent_chatrooms,
-            };
-            print_json(client.refresh_identity(&request).await?)?
-        }
-        Command::Attachments { limit } => {
-            print_json(client.recent_attachments(Some(limit)).await?)?
-        }
-        Command::AttachmentDownload { sha256, output } => {
-            let bytes = client.download_attachment(&sha256).await?;
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?;
+        Command::Doctor => print_json(doctor(&cli, &client).await?)?,
+        Command::Conversations { command } => match command {
+            ConversationsCommand::List { limit } => {
+                print_json(client.conversations(Some(limit)).await?)?
             }
-            fs::write(&output, &bytes)?;
-            print_json(serde_json::json!({
-                "ok": true,
-                "sha256": sha256,
-                "output": output,
-                "size_bytes": bytes.len()
-            }))?;
-        }
-        Command::ChatroomEvents { chatroom_id, limit } => {
-            print_json(client.chatroom_events(&chatroom_id, Some(limit)).await?)?
-        }
-        Command::ChatroomSystemEvents { chatroom_id, limit } => print_json(
-            client
-                .chatroom_system_events(&chatroom_id, Some(limit))
-                .await?,
-        )?,
-        Command::Normalize { file, received_at } => {
-            let payload = normalize_file(file, received_at)?;
-            print_json(payload)?;
-        }
-        Command::IngestFile { file, received_at } => {
-            let payload = normalize_file(file, received_at)?;
-            print_json(client.write_event(&payload).await?)?;
-        }
-        Command::SyncEdge {
-            edge_url,
-            admin_token,
-            after_raw_event_id,
-            limit,
-            cursor_file,
-        } => {
-            let result = sync_edge(
-                &client,
-                &edge_url,
-                &admin_token,
+        },
+        Command::Identity { command } => match command {
+            IdentityCommand::Resolve {
+                q,
+                chatroom_id,
+                limit,
+            } => {
+                let mut response = client.resolve_identity(&q, Some(limit)).await?;
+                if let Some(chatroom_id) = chatroom_id {
+                    response.items.retain(|item| {
+                        item.chatroom_id.as_deref() == Some(chatroom_id.as_str())
+                            || (item.entity_type == "chatroom" && item.entity_id == chatroom_id)
+                    });
+                }
+                print_json(response)?;
+            }
+            IdentityCommand::Refresh {
+                full,
+                chatroom_id,
+                wxids,
+                recent_chatrooms,
+            } => {
+                let request = IdentityRefreshRequest {
+                    full: Some(full),
+                    chatroom_id,
+                    wxids: (!wxids.is_empty()).then_some(wxids),
+                    recent_chatrooms,
+                };
+                print_json(client.refresh_identity(&request).await?)?;
+            }
+        },
+        Command::Messages { command } => match command {
+            MessagesCommand::List { filters } => {
+                print_json(client.messages(&message_query(None, filters)).await?)?;
+            }
+            MessagesCommand::Search { q, filters } => {
+                print_json(client.messages(&message_query(Some(q), filters)).await?)?;
+            }
+            MessagesCommand::Context {
+                message_key,
+                before,
+                after,
+            } => print_json(
+                client
+                    .message_context(&message_key, Some(before), Some(after))
+                    .await?,
+            )?,
+        },
+        Command::Attachments { command } => match command {
+            AttachmentsCommand::List {
+                limit,
+                message_key,
+                kind,
+            } => {
+                let mut page = client.recent_attachments(Some(limit)).await?;
+                if let Some(message_key) = message_key {
+                    page.items.retain(|item| item.message_key == message_key);
+                }
+                if let Some(kind) = kind {
+                    page.items
+                        .retain(|item| format!("{:?}", item.kind).eq_ignore_ascii_case(&kind));
+                }
+                print_json(page)?;
+            }
+            AttachmentsCommand::Download { sha256, output } => {
+                let bytes = client.download_attachment(&sha256).await?;
+                if let Some(parent) = output.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&output, &bytes)?;
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "sha256": sha256,
+                    "output": output,
+                    "size_bytes": bytes.len()
+                }))?;
+            }
+        },
+        Command::Chatrooms { command } => match command {
+            ChatroomsCommand::Snapshots { chatroom_id, limit } => {
+                print_json(client.chatroom_snapshots(&chatroom_id, Some(limit)).await?)?
+            }
+            ChatroomsCommand::Events { chatroom_id, limit } => {
+                print_json(client.chatroom_events(&chatroom_id, Some(limit)).await?)?
+            }
+            ChatroomsCommand::SystemEvents { chatroom_id, limit } => print_json(
+                client
+                    .chatroom_system_events(&chatroom_id, Some(limit))
+                    .await?,
+            )?,
+        },
+        Command::Ingest { command } => match command {
+            IngestCommand::Normalize { file, received_at } => {
+                let payload = normalize_file(file, received_at)?;
+                print_json(payload)?;
+            }
+            IngestCommand::File { file, received_at } => {
+                let payload = normalize_file(file, received_at)?;
+                print_json(client.write_event(&payload).await?)?;
+            }
+        },
+        Command::Sync { command } => match command {
+            SyncCommand::Edge {
+                edge_url,
+                admin_token,
                 after_raw_event_id,
                 limit,
                 cursor_file,
-            )
-            .await?;
-            print_json(result)?;
-        }
-        Command::SyncEdgeAttachments {
-            edge_url,
-            admin_token,
-            after_job_id,
-            limit,
-            cursor_file,
-            attachment_dir,
-        } => {
-            let result = sync_edge_attachments(
-                &client,
-                &edge_url,
-                &admin_token,
+            } => {
+                let result = sync_edge(
+                    &client,
+                    &edge_url,
+                    &admin_token,
+                    after_raw_event_id,
+                    limit,
+                    cursor_file,
+                )
+                .await?;
+                print_json(result)?;
+            }
+            SyncCommand::Attachments {
+                edge_url,
+                admin_token,
                 after_job_id,
                 limit,
                 cursor_file,
                 attachment_dir,
-            )
-            .await?;
-            print_json(result)?;
-        }
+            } => {
+                let result = sync_edge_attachments(
+                    &client,
+                    &edge_url,
+                    &admin_token,
+                    after_job_id,
+                    limit,
+                    cursor_file,
+                    attachment_dir,
+                )
+                .await?;
+                print_json(result)?;
+            }
+        },
+        Command::Request { command } => match command {
+            RequestCommand::Get { path, query_pairs } => {
+                print_json(
+                    raw_get(
+                        &raw_base_url,
+                        raw_read_token.as_deref(),
+                        &path,
+                        &query_pairs,
+                    )
+                    .await?,
+                )?;
+            }
+        },
     }
 
     Ok(())
+}
+
+fn message_query(q: Option<String>, filters: MessageFilterArgs) -> MessageQuery {
+    MessageQuery {
+        q,
+        conversation_id: filters.conversation_id,
+        sender_wxid: filters.sender_wxid,
+        kind: filters.kind,
+        direction: filters.direction.query_value(),
+        after: filters.after,
+        before: filters.before,
+        cursor: filters.cursor,
+        limit: Some(filters.limit),
+        order: Some(filters.order.query_value()),
+    }
+}
+
+async fn doctor(cli: &Cli, client: &GeweSkillClient) -> Result<Value, Box<dyn std::error::Error>> {
+    let health = client.healthz().await;
+    let read_probe = if cli.read_token.is_some() {
+        match client.conversations(Some(1)).await {
+            Ok(page) => serde_json::json!({ "ok": true, "sample_count": page.items.len() }),
+            Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+        }
+    } else {
+        serde_json::json!({ "ok": false, "error": "missing_read_token" })
+    };
+    Ok(serde_json::json!({
+        "ok": health.is_ok(),
+        "cli": {
+            "name": "gewe-skill",
+            "version": env!("CARGO_PKG_VERSION"),
+            "primary_surface": "agent_json"
+        },
+        "memory": {
+            "base_url": cli.base_url.as_str(),
+            "health": match health {
+                Ok(value) => serde_json::json!({ "ok": true, "response": value }),
+                Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+            },
+            "read_probe": read_probe
+        },
+        "auth": {
+            "read_token_available": cli.read_token.is_some(),
+            "write_token_available": cli.write_token.is_some(),
+            "read_token_source": auth_source("GEWE_SKILL_READ_TOKEN", cli.read_token.as_deref()),
+            "write_token_source": auth_source("GEWE_SKILL_WRITE_TOKEN", cli.write_token.as_deref())
+        }
+    }))
+}
+
+fn auth_source(env_name: &str, value: Option<&str>) -> &'static str {
+    if value.is_none() {
+        "missing"
+    } else if std::env::var_os(env_name).is_some() {
+        "env"
+    } else {
+        "flag"
+    }
+}
+
+async fn raw_get(
+    base_url: &str,
+    read_token: Option<&str>,
+    path: &str,
+    query_pairs: &[String],
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut url = Url::parse(base_url)?.join(path.trim_start_matches('/'))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for pair in query_pairs {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            pairs.append_pair(key, value);
+        }
+    }
+    let mut request = reqwest::Client::new().get(url);
+    if let Some(token) = read_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| Value::String(body));
+    Ok(serde_json::json!({
+        "ok": status.is_success(),
+        "status": status.as_u16(),
+        "body": parsed
+    }))
 }
 
 fn build_client(cli: &Cli) -> Result<GeweSkillClient, Box<dyn std::error::Error>> {

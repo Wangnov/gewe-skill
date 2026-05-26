@@ -26,7 +26,7 @@
 | gewe-skill-client | `crates/gewe-skill-client` | 访问记忆服务的 Rust SDK |
 | gewe-skill-types | `crates/gewe-skill-types` | 共享 DTO 和规范化数据结构 |
 | gewe-skill-core | `crates/gewe-skill-core` | 回调规范化、事件解析和差异计算逻辑 |
-| gewe-skill-cli | `crates/gewe-skill-cli` | 用于同步、补拉和检查的运维 CLI |
+| gewe-skill-cli | `crates/gewe-skill-cli` | 面向 Agent 和 Computer Use 的 JSON 查询协议 CLI |
 | gewe-skill | `skills/gewe-skill` | 通用 Agent Skill 使用说明 |
 
 ## 快速开始
@@ -60,11 +60,11 @@ cargo run -p gewe-skill-memory
 ```bash
 export GEWE_SKILL_BASE_URL='http://127.0.0.1:8788'
 export GEWE_SKILL_READ_TOKEN='local-read-token'
-cargo run -p gewe-skill-cli -- health
-cargo run -p gewe-skill-cli -- recent --limit 20
-cargo run -p gewe-skill-cli -- search --q '<keyword>' --limit 20
-cargo run -p gewe-skill-cli -- resolve --q '<group-or-member-name>' --limit 10
-cargo run -p gewe-skill-cli -- attachments --limit 20
+cargo run -p gewe-skill-cli -- --json doctor
+cargo run -p gewe-skill-cli -- --json conversations list --limit 20
+cargo run -p gewe-skill-cli -- --json identity resolve --q '<group-or-member-name>' --limit 10
+cargo run -p gewe-skill-cli -- --json messages list --conversation-id '<conversation_id>' --limit 50
+cargo run -p gewe-skill-cli -- --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
 ```
 
 ## 部署模型
@@ -96,13 +96,16 @@ GeWe -> gewe-skill-edge -> Cloudflare D1/R2/Queue -> gewe-skill-memory -> Agent 
 常用命令：
 
 ```bash
-gewe-skill recent --limit 50
-gewe-skill conversations --limit 100
-gewe-skill resolve --q '<chatroom/contact/member name>' --limit 10
-gewe-skill refresh-identity --recent-chatrooms 20
-gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 100
-gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 100
-gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
+gewe-skill --json doctor
+gewe-skill --json conversations list --limit 100
+gewe-skill --json identity resolve --q '<chatroom/contact/member name>' --limit 10
+gewe-skill --json identity refresh --recent-chatrooms 20
+gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
+gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-wxid '<wxid>' --after '<iso-time>' --before '<iso-time>' --limit 50
+gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
+gewe-skill --json chatrooms events --chatroom-id '<chatroom_id>' --limit 100
+gewe-skill --json chatrooms system-events --chatroom-id '<chatroom_id>' --limit 100
+gewe-skill --json attachments download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
 ```
 
 ## 安全边界

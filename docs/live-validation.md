@@ -31,7 +31,7 @@ Verified:
 - Memory `/healthz` returns `service = gewe-skill-memory`.
 - Agent read API returns recent real callback messages for expected app id `wx_uprGq1Pp7eCZ4gZpTRNpz`.
 - Agent attachment API returns synced real attachment metadata with non-null local memory `id`, edge job id, sha256, size, and MIME.
-- `gewe-skill attachment-download` successfully downloaded a real synced emoji attachment from memory to a local file on the server.
+- `gewe-skill --json attachments download` successfully downloaded a real synced emoji attachment from memory to a local file on the server.
 
 Known deployment note:
 
