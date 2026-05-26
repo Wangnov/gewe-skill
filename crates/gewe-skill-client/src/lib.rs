@@ -1,11 +1,11 @@
 //! Rust SDK for the `gewe-skill-memory` API.
 
 use gewe_skill_types::{
-    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
-    ConversationSummary, IdentityProfileResponse, IdentityRefreshRequest, IdentityRefreshResponse,
-    IdentityResolveResponse, IngestEventRequest, MessageContextResponse, MessageQuery,
-    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
-    VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
+    ApiPage, AttachmentRecord, ChatroomEventWriteRequest, ChatroomMemberEvent, ChatroomSnapshot,
+    ChatroomSystemEvent, ConversationSummary, IdentityProfileResponse, IdentityRefreshRequest,
+    IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest, MessageContextResponse,
+    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
+    VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -81,6 +81,13 @@ impl GeweSkillClient {
         request: &AttachmentRecord,
     ) -> Result<serde_json::Value, ClientError> {
         self.post_write_json("write/attachments", request).await
+    }
+
+    pub async fn write_chatroom_events(
+        &self,
+        request: &ChatroomEventWriteRequest,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json("write/chatroom-events", request).await
     }
 
     async fn post_write_json<T: serde::Serialize + ?Sized>(

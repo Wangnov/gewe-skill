@@ -457,6 +457,21 @@ enum SyncCommand {
         )]
         attachment_dir: PathBuf,
     },
+    /// Pull chatroom member/system events from gewe-skill-edge and write them to memory.
+    ChatroomEvents {
+        #[arg(
+            long,
+            env = "GEWE_SKILL_EDGE_URL",
+            default_value = "https://gewe-agent.wangnov-ai.com"
+        )]
+        edge_url: String,
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
+        admin_token: String,
+        #[arg(long)]
+        chatroom_id: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -498,6 +513,53 @@ struct EdgeExportEvent {
     raw_event_id: i64,
     received_at: String,
     body: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeChatroomMemberEventResponse {
+    events: Vec<EdgeChatroomMemberEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeChatroomMemberEvent {
+    id: i64,
+    received_at: String,
+    event_type: String,
+    chatroom_id: String,
+    member_wxid: Option<String>,
+    previous_chatroom_name: Option<String>,
+    current_chatroom_name: Option<String>,
+    previous_member_count: Option<i64>,
+    current_member_count: Option<i64>,
+    previous_snapshot_id: Option<i64>,
+    current_snapshot_id: Option<i64>,
+    details_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeChatroomSystemEventResponse {
+    events: Vec<EdgeChatroomSystemEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EdgeChatroomSystemEvent {
+    id: i64,
+    received_at: String,
+    event_type: String,
+    chatroom_id: String,
+    actor_wxid: Option<String>,
+    actor_name: Option<String>,
+    target_wxid: Option<String>,
+    target_name: Option<String>,
+    target_wxids_json: Option<String>,
+    target_names_json: Option<String>,
+    previous_value: Option<String>,
+    current_value: Option<String>,
+    template_text: Option<String>,
+    content_text: Option<String>,
+    raw_event_id: Option<i64>,
+    message_id: Option<i64>,
+    details_json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -834,6 +896,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     attachment_dir,
                 )
                 .await?;
+                print_json(result)?;
+            }
+            SyncCommand::ChatroomEvents {
+                edge_url,
+                admin_token,
+                chatroom_id,
+                limit,
+            } => {
+                let result =
+                    sync_chatroom_events(&client, &edge_url, &admin_token, chatroom_id, limit)
+                        .await?;
                 print_json(result)?;
             }
         },
@@ -1325,6 +1398,188 @@ async fn sync_edge(
         "last_raw_event_id": last_raw_event_id,
         "next_after_raw_event_id": export.next_after_raw_event_id
     }))
+}
+
+async fn sync_chatroom_events(
+    client: &GeweSkillClient,
+    edge_url: &str,
+    admin_token: &str,
+    chatroom_id: Option<String>,
+    limit: u32,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let edge_url = edge_url.trim_end_matches('/');
+    let http = reqwest::Client::new();
+
+    let mut member_url = reqwest::Url::parse(&format!("{edge_url}/admin/chatroom-events"))?;
+    member_url
+        .query_pairs_mut()
+        .append_pair("limit", &limit.to_string());
+    if let Some(chatroom_id) = chatroom_id.as_deref() {
+        member_url
+            .query_pairs_mut()
+            .append_pair("chatroom_id", chatroom_id);
+    }
+    let member_response: EdgeChatroomMemberEventResponse = http
+        .get(member_url)
+        .bearer_auth(admin_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut system_url = reqwest::Url::parse(&format!("{edge_url}/admin/chatroom-system-events"))?;
+    system_url
+        .query_pairs_mut()
+        .append_pair("limit", &limit.to_string());
+    if let Some(chatroom_id) = chatroom_id.as_deref() {
+        system_url
+            .query_pairs_mut()
+            .append_pair("chatroom_id", chatroom_id);
+    }
+    let system_response: EdgeChatroomSystemEventResponse = http
+        .get(system_url)
+        .bearer_auth(admin_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut failed = Vec::new();
+    let mut member_events = Vec::new();
+    for event in member_response.events {
+        match parse_chatroom_event_type(&event.event_type) {
+            Ok(event_type) => member_events.push(gewe_skill_types::ChatroomMemberEvent {
+                event_type,
+                chatroom_id: event.chatroom_id,
+                member_wxid: event.member_wxid,
+                previous_chatroom_name: event.previous_chatroom_name,
+                current_chatroom_name: event.current_chatroom_name,
+                previous_member_count: event.previous_member_count,
+                current_member_count: event.current_member_count,
+                received_at: event.received_at,
+                details: edge_event_details(
+                    event.details_json.as_deref(),
+                    event.id,
+                    &[
+                        ("previous_snapshot_id", event.previous_snapshot_id),
+                        ("current_snapshot_id", event.current_snapshot_id),
+                    ],
+                ),
+            }),
+            Err(error) => failed.push(serde_json::json!({
+                "kind": "member_event",
+                "edge_event_id": event.id,
+                "event_type": event.event_type,
+                "error": error.to_string()
+            })),
+        }
+    }
+
+    let mut system_events = Vec::new();
+    for event in system_response.events {
+        match parse_chatroom_event_type(&event.event_type) {
+            Ok(event_type) => system_events.push(gewe_skill_types::ChatroomSystemEvent {
+                event_type,
+                chatroom_id: event.chatroom_id,
+                actor_wxid: event.actor_wxid,
+                actor_name: event.actor_name,
+                target_wxid: event.target_wxid,
+                target_name: event.target_name,
+                target_wxids: parse_edge_string_vec(event.target_wxids_json.as_deref()),
+                target_names: parse_edge_string_vec(event.target_names_json.as_deref()),
+                previous_value: event.previous_value,
+                current_value: event.current_value,
+                template_text: event.template_text,
+                content_text: event.content_text,
+                received_at: event.received_at,
+                details: edge_event_details(
+                    event.details_json.as_deref(),
+                    event.id,
+                    &[
+                        ("raw_event_id", event.raw_event_id),
+                        ("message_id", event.message_id),
+                    ],
+                ),
+            }),
+            Err(error) => failed.push(serde_json::json!({
+                "kind": "system_event",
+                "edge_event_id": event.id,
+                "event_type": event.event_type,
+                "error": error.to_string()
+            })),
+        }
+    }
+
+    let member_event_count = member_events.len();
+    let system_event_count = system_events.len();
+    let write_response = client
+        .write_chatroom_events(&gewe_skill_types::ChatroomEventWriteRequest {
+            member_events,
+            system_events,
+        })
+        .await?;
+
+    Ok(serde_json::json!({
+        "ok": failed.is_empty(),
+        "member_events_scanned": member_event_count + failed.iter().filter(|item| item.get("kind").and_then(Value::as_str) == Some("member_event")).count(),
+        "system_events_scanned": system_event_count + failed.iter().filter(|item| item.get("kind").and_then(Value::as_str) == Some("system_event")).count(),
+        "member_events_written": member_event_count,
+        "system_events_written": system_event_count,
+        "failed_count": failed.len(),
+        "failed": failed,
+        "write_response": write_response
+    }))
+}
+
+fn parse_chatroom_event_type(
+    event_type: &str,
+) -> Result<gewe_skill_types::ChatroomEventType, serde_json::Error> {
+    serde_json::from_value(Value::String(event_type.to_string()))
+}
+
+fn edge_event_details(
+    details_json: Option<&str>,
+    edge_event_id: i64,
+    ids: &[(&str, Option<i64>)],
+) -> Value {
+    let details = parse_edge_json_value(details_json);
+    let mut object = match details {
+        Value::Object(object) => object,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut object = serde_json::Map::new();
+            object.insert("edge_original_details".to_string(), other);
+            object
+        }
+    };
+    object.insert(
+        "edge_event_id".to_string(),
+        serde_json::json!(edge_event_id),
+    );
+    for (key, value) in ids {
+        if let Some(value) = value {
+            object.insert((*key).to_string(), serde_json::json!(value));
+        }
+    }
+    Value::Object(object)
+}
+
+fn parse_edge_json_value(raw: Option<&str>) -> Value {
+    raw.and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn parse_edge_string_vec(raw: Option<&str>) -> Vec<String> {
+    match parse_edge_json_value(raw) {
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect(),
+        Value::String(value) if !value.is_empty() => vec![value],
+        _ => Vec::new(),
+    }
 }
 
 fn read_cursor(path: &PathBuf) -> Option<i64> {

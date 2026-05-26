@@ -8,13 +8,14 @@ use axum::{
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{
-    ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomMember,
-    ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary,
-    IdentityChatroomMemberProfile, IdentityContactProfile, IdentityMatch, IdentityProfileResponse,
-    IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
-    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
-    VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord,
-    VoiceWarmRequest, VoiceWarmResponse,
+    ApiPage, AttachmentKind, AttachmentRecord, ChatroomEventType, ChatroomEventWriteRequest,
+    ChatroomEventWriteResponse, ChatroomMember, ChatroomMemberEvent, ChatroomSnapshot,
+    ChatroomSystemEvent, ConversationSummary, IdentityChatroomMemberProfile,
+    IdentityContactProfile, IdentityMatch, IdentityProfileResponse, IdentityRefreshRequest,
+    IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest, MessageContextResponse,
+    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
+    VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest,
+    VoiceWarmResponse,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -137,6 +138,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/write/attachments",
             post(write_attachment).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/write/chatroom-events",
+            post(write_chatroom_events).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_write_token,
             )),
@@ -610,6 +618,28 @@ async fn write_ingest_request(
     Ok(Json(IngestResponse {
         ok: true,
         message_key: request.message.message_key,
+    }))
+}
+
+async fn write_chatroom_events(
+    State(state): State<SharedState>,
+    Json(request): Json<ChatroomEventWriteRequest>,
+) -> Result<Json<ChatroomEventWriteResponse>, ApiError> {
+    let member_events = request.member_events.len();
+    let system_events = request.system_events.len();
+    let mut tx = state.db.begin().await?;
+    for event in &request.member_events {
+        insert_chatroom_member_event(&mut tx, event).await?;
+    }
+    for event in &request.system_events {
+        insert_chatroom_system_event(&mut tx, event).await?;
+    }
+    tx.commit().await?;
+
+    Ok(Json(ChatroomEventWriteResponse {
+        ok: true,
+        member_events,
+        system_events,
     }))
 }
 
@@ -2645,6 +2675,13 @@ async fn insert_chatroom_member_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: &ChatroomMemberEvent,
 ) -> Result<(), ApiError> {
+    let event_key_suffix = edge_event_key(&event.details).unwrap_or_else(|| {
+        event
+            .member_wxid
+            .as_deref()
+            .unwrap_or("chatroom")
+            .to_string()
+    });
     sqlx::query(
         r#"
         INSERT INTO chatroom_member_events (event_key, event_type, chatroom_id, member_wxid, received_at, event_json)
@@ -2652,7 +2689,10 @@ async fn insert_chatroom_member_event(
         ON CONFLICT(event_key) DO UPDATE SET event_json = excluded.event_json
         "#,
     )
-    .bind(format!("{}:{}:{}", event.chatroom_id, event.received_at, event.member_wxid.as_deref().unwrap_or("chatroom")))
+    .bind(format!(
+        "{}:{}:{}",
+        event.chatroom_id, event.received_at, event_key_suffix
+    ))
     .bind(format!("{:?}", event.event_type))
     .bind(&event.chatroom_id)
     .bind(&event.member_wxid)
@@ -2667,6 +2707,13 @@ async fn insert_chatroom_system_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: &ChatroomSystemEvent,
 ) -> Result<(), ApiError> {
+    let event_key_suffix = edge_event_key(&event.details).unwrap_or_else(|| {
+        event
+            .content_text
+            .as_deref()
+            .unwrap_or("system")
+            .to_string()
+    });
     sqlx::query(
         r#"
         INSERT INTO chatroom_system_events (event_key, event_type, chatroom_id, actor_wxid, target_wxid, received_at, event_json)
@@ -2674,7 +2721,10 @@ async fn insert_chatroom_system_event(
         ON CONFLICT(event_key) DO UPDATE SET event_json = excluded.event_json
         "#,
     )
-    .bind(format!("{}:{}:{}", event.chatroom_id, event.received_at, event.content_text.as_deref().unwrap_or("system")))
+    .bind(format!(
+        "{}:{}:{}",
+        event.chatroom_id, event.received_at, event_key_suffix
+    ))
     .bind(format!("{:?}", event.event_type))
     .bind(&event.chatroom_id)
     .bind(&event.actor_wxid)
@@ -2684,6 +2734,13 @@ async fn insert_chatroom_system_event(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+fn edge_event_key(details: &Value) -> Option<String> {
+    details
+        .get("edge_event_id")
+        .and_then(Value::as_i64)
+        .map(|id| format!("edge:{id}"))
 }
 
 #[allow(clippy::too_many_arguments)]

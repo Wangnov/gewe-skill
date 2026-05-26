@@ -343,6 +343,19 @@ pub struct ChatroomSystemEvent {
     pub details: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatroomEventWriteRequest {
+    pub member_events: Vec<ChatroomMemberEvent>,
+    pub system_events: Vec<ChatroomSystemEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatroomEventWriteResponse {
+    pub ok: bool,
+    pub member_events: usize,
+    pub system_events: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestEventRequest {
     pub raw_event: RawEventEnvelope,
