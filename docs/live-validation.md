@@ -17,6 +17,8 @@ Environment:
 - Memory service: `gewe-skill-memory.service`
 - Raw callback sync: `gewe-skill-edge-sync.timer`
 - Attachment sync: `gewe-skill-edge-attachment-sync.timer`
+- Chatroom event sync: `gewe-skill-edge-chatroom-event-sync.timer`
+- Recent event identity backfill: `gewe-skill-identity-event-backfill.timer`
 
 Verified:
 
@@ -28,6 +30,8 @@ Verified:
 - `gewe-skill-memory.service` is `active`.
 - `gewe-skill-edge-sync.timer` is `active`.
 - `gewe-skill-edge-attachment-sync.timer` is `active`.
+- `gewe-skill-edge-chatroom-event-sync.timer` is `active`.
+- `gewe-skill-identity-event-backfill.timer` is `active`.
 - Memory `/healthz` returns `service = gewe-skill-memory`.
 - Agent read API returns recent real callback messages for expected app id `wx_uprGq1Pp7eCZ4gZpTRNpz`.
 - Agent attachment API returns synced real attachment metadata with non-null local memory `id`, edge job id, sha256, size, and MIME.

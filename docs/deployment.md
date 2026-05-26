@@ -39,9 +39,10 @@ When the memory service is not publicly reachable, run pull sync on the server i
 ```bash
 gewe-skill --json sync edge
 gewe-skill --json sync attachments
+gewe-skill --json sync chatroom-events
 ```
 
-The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, attachment bytes, and recent identity data synchronized into memory.
+The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, chatroom events, attachment bytes, and recent identity data synchronized into memory.
 
 ## Identity refresh
 
@@ -51,6 +52,9 @@ The memory service can also call GeWe read-only APIs to build a durable identity
 gewe-skill --json identity refresh --recent-chatrooms 20
 gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
 gewe-skill --json identity resolve --q '<group or member name>'
+gewe-skill --json maintenance identity-backfill --event-limit 500 --max-chatrooms 10 --max-wxids 100
 ```
 
 Keep GeWe credentials only in the memory service environment. Agent runtimes should call `gewe-skill` through the local memory API instead of calling GeWe directly.
+
+Prefer bounded maintenance over broad polling. `identity-backfill` scans recent chatroom events, refreshes only the related chatrooms, then refreshes only still-missing wxids.

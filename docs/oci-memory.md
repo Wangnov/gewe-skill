@@ -16,6 +16,16 @@ Systemd unit template:
 crates/gewe-skill-memory/deploy/gewe-skill-memory.service
 ```
 
+Recommended sync and maintenance timers:
+
+```text
+crates/gewe-skill-memory/deploy/gewe-skill-edge-sync.timer
+crates/gewe-skill-memory/deploy/gewe-skill-edge-attachment-sync.timer
+crates/gewe-skill-memory/deploy/gewe-skill-edge-chatroom-event-sync.timer
+crates/gewe-skill-memory/deploy/gewe-skill-identity-refresh.timer
+crates/gewe-skill-memory/deploy/gewe-skill-identity-event-backfill.timer
+```
+
 The service listens on `127.0.0.1:8788` by default. Put Caddy or another reverse proxy in front of it for HTTPS.
 
 Do not expose `/write/*` without a strong bearer token. Agent-facing `/api/*` should use a separate read token.

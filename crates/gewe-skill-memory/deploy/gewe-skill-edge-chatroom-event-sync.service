@@ -1,0 +1,17 @@
+[Unit]
+Description=gewe-skill edge chatroom event sync
+After=network-online.target gewe-skill-memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gewe-skill
+Group=gewe-skill
+WorkingDirectory=/opt/gewe-skill-memory
+EnvironmentFile=/opt/gewe-skill-memory/config/gewe-skill-memory.env
+ExecStart=/opt/gewe-skill-memory/bin/gewe-skill --json sync chatroom-events --limit 500
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gewe-skill-memory/data

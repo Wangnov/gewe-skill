@@ -1,0 +1,12 @@
+[Unit]
+Description=Run gewe-skill identity backfill from recent chatroom events every six hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+AccuracySec=10min
+Unit=gewe-skill-identity-event-backfill.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
