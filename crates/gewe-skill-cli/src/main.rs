@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
-use gewe_skill_types::{AttachmentKind, AttachmentRecord, RawCallbackRequest};
+use gewe_skill_types::{
+    AttachmentKind, AttachmentRecord, IdentityRefreshRequest, RawCallbackRequest,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,10 +26,10 @@ struct Cli {
     )]
     base_url: String,
 
-    #[arg(long, env = "GEWE_SKILL_READ_TOKEN")]
+    #[arg(long, env = "GEWE_SKILL_READ_TOKEN", hide_env_values = true)]
     read_token: Option<String>,
 
-    #[arg(long, env = "GEWE_SKILL_WRITE_TOKEN")]
+    #[arg(long, env = "GEWE_SKILL_WRITE_TOKEN", hide_env_values = true)]
     write_token: Option<String>,
 
     #[command(subcommand)]
@@ -54,6 +56,24 @@ enum Command {
     Conversations {
         #[arg(long, default_value_t = 50)]
         limit: u32,
+    },
+    /// Resolve a human name, chatroom name, alias, or room-scoped member display name.
+    Resolve {
+        #[arg(long)]
+        q: String,
+        #[arg(long, default_value_t = 10)]
+        limit: u32,
+    },
+    /// Ask memory to refresh identity data from GeWe read-only APIs.
+    RefreshIdentity {
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        chatroom_id: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        wxids: Vec<String>,
+        #[arg(long)]
+        recent_chatrooms: Option<i64>,
     },
     /// List recent synced attachments.
     Attachments {
@@ -103,7 +123,7 @@ enum Command {
             default_value = "https://gewe-agent.wangnov-ai.com"
         )]
         edge_url: String,
-        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN")]
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: String,
         #[arg(long)]
         after_raw_event_id: Option<i64>,
@@ -124,7 +144,7 @@ enum Command {
             default_value = "https://gewe-agent.wangnov-ai.com"
         )]
         edge_url: String,
-        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN")]
+        #[arg(long, env = "GEWE_SKILL_EDGE_ADMIN_TOKEN", hide_env_values = true)]
         admin_token: String,
         #[arg(long)]
         after_job_id: Option<i64>,
@@ -191,6 +211,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Recent { limit } => print_json(client.recent_messages(Some(limit)).await?)?,
         Command::Search { q, limit } => print_json(client.search_messages(&q, Some(limit)).await?)?,
         Command::Conversations { limit } => print_json(client.conversations(Some(limit)).await?)?,
+        Command::Resolve { q, limit } => {
+            print_json(client.resolve_identity(&q, Some(limit)).await?)?
+        }
+        Command::RefreshIdentity {
+            full,
+            chatroom_id,
+            wxids,
+            recent_chatrooms,
+        } => {
+            let request = IdentityRefreshRequest {
+                full: Some(full),
+                chatroom_id,
+                wxids: (!wxids.is_empty()).then_some(wxids),
+                recent_chatrooms,
+            };
+            print_json(client.refresh_identity(&request).await?)?
+        }
         Command::Attachments { limit } => {
             print_json(client.recent_attachments(Some(limit)).await?)?
         }

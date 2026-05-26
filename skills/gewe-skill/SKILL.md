@@ -25,6 +25,8 @@ gewe-skill health
 gewe-skill recent --limit 20
 gewe-skill search --q '<keyword>' --limit 20
 gewe-skill conversations --limit 50
+gewe-skill resolve --q '<chatroom, contact, or room nickname>' --limit 10
+gewe-skill refresh-identity --chatroom-id '<chatroom_id>'
 gewe-skill attachments --limit 20
 gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
 gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 50
@@ -54,10 +56,18 @@ gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.00
 2. Identify relevant `conversation_id`, sender, time, and message previews.
 3. Summarize with concrete timestamps and caveat if attachments are not loaded.
 
+### Resolve names before reading messages
+
+1. Run `gewe-skill resolve --q '<user wording>' --limit 10` before assuming a group name, contact name, or room nickname.
+2. If the target is missing or stale, run `gewe-skill refresh-identity --recent-chatrooms 20`, or `gewe-skill refresh-identity --chatroom-id '<chatroom_id>'` when a room id is already known.
+3. Use the resolved `entity_id` as `conversation_id` for chatrooms, and use `chatroom_id` plus `entity_id` for room-scoped member nicknames.
+4. If multiple candidates remain, explain the candidates instead of guessing.
+
 ### Conversation inventory
 
 1. Run `gewe-skill conversations --limit 100`.
-2. Use the returned `conversation_id` values for follow-up message/event queries.
+2. Prefer rows with `display_name`; if the name is missing, run `gewe-skill refresh-identity --recent-chatrooms 20`.
+3. Use the returned `conversation_id` values for follow-up message/event queries.
 
 ### Keyword search
 
@@ -81,6 +91,7 @@ gewe-skill ingest-file --file callback.json --received-at 2026-05-26T00:00:00.00
 
 - Prefer structured system events for actor/target names.
 - Prefer snapshot diff events for actual membership state changes.
+- Prefer identity resolution over keyword search when the user names a group or person.
 - If system events and snapshot diffs disagree, report the disagreement instead of guessing.
 - For group-card or nickname changes, preserve the original message text and avoid over-normalizing.
 - For files, images, voice, video, and emoji, mention whether the attachment was downloaded or only detected.

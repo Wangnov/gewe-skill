@@ -25,6 +25,9 @@ GEWE_SKILL_LISTEN='127.0.0.1:8788'
 GEWE_SKILL_WRITE_TOKEN='replace-with-random-write-token'
 GEWE_SKILL_READ_TOKEN='replace-with-random-read-token'
 GEWE_SKILL_ATTACHMENT_DIR='/opt/gewe-skill-memory/data/attachments'
+GEWE_SKILL_GEWE_BASE_URL='http://api.geweapi.com'
+GEWE_SKILL_GEWE_APP_ID='replace-with-gewe-app-id'
+GEWE_SKILL_GEWE_TOKEN='replace-with-gewe-token'
 ```
 
 Put Caddy, Nginx, Cloudflare Tunnel, or Tailscale in front of the service depending on your threat model.
@@ -38,4 +41,16 @@ gewe-skill sync-edge
 gewe-skill sync-edge-attachments
 ```
 
-The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks and attachment bytes synchronized from edge into memory.
+The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, attachment bytes, and recent identity data synchronized into memory.
+
+## Identity refresh
+
+The memory service can also call GeWe read-only APIs to build a durable identity index:
+
+```bash
+gewe-skill refresh-identity --recent-chatrooms 20
+gewe-skill refresh-identity --chatroom-id '<chatroom_id>'
+gewe-skill resolve --q '<group or member name>'
+```
+
+Keep GeWe credentials only in the memory service environment. Agent runtimes should call `gewe-skill` through the local memory API instead of calling GeWe directly.

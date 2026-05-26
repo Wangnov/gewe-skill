@@ -1,0 +1,12 @@
+[Unit]
+Description=Run gewe-skill identity refresh every six hours
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=6h
+AccuracySec=5min
+Unit=gewe-skill-identity-refresh.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

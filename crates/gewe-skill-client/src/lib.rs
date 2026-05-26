@@ -2,7 +2,8 @@
 
 use gewe_skill_types::{
     ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
-    ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest,
+    ConversationSummary, IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse,
+    IngestEventRequest, NormalizedMessage, RawCallbackRequest,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -121,6 +122,38 @@ impl GeweSkillClient {
         limit: Option<u32>,
     ) -> Result<ApiPage<ConversationSummary>, ClientError> {
         self.get_json("api/conversations", limit).await
+    }
+
+    pub async fn resolve_identity(
+        &self,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<IdentityResolveResponse, ClientError> {
+        let mut url = self.url("api/identity/resolve")?;
+        url.query_pairs_mut().append_pair("q", query);
+        if let Some(limit) = limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
+        }
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
+    pub async fn refresh_identity(
+        &self,
+        request: &IdentityRefreshRequest,
+    ) -> Result<IdentityRefreshResponse, ClientError> {
+        let response = self
+            .http
+            .post(self.url("api/identity/refresh")?)
+            .bearer_auth(self.read_token.as_deref().unwrap_or_default())
+            .json(request)
+            .send()
+            .await?;
+        Self::decode_response(response).await
     }
 
     pub async fn recent_attachments(

@@ -346,7 +346,8 @@ fn parse_v1_chatroom_snapshot(data: &Value, received_at: &str) -> Option<Chatroo
             let wxid = scalar_unwrapped(member.get("UserName"))?;
             Some(ChatroomMember {
                 wxid,
-                display_name: scalar_unwrapped(member.get("DisplayName")),
+                display_name: scalar_unwrapped(member.get("DisplayName"))
+                    .or_else(|| scalar_unwrapped(member.get("NickName"))),
                 flag: int_path(member, &["MemberFlag"]),
             })
         })

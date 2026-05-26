@@ -13,7 +13,8 @@
 - 在边缘侧短期保存原始回调证据。
 - 在边缘侧把附件下载并写入 R2。
 - 由 Rust 长期记忆服务持续拉取原始回调和附件内容。
-- 通过 CLI/API 查询消息、会话、群事件和附件。
+- 通过 CLI/API 查询消息、会话、群事件、身份记忆和附件。
+- 通过 GeWe 只读接口补全联系人、群资料、群成员和群名片索引。
 - 暂不开放微信发消息等写入或变更类 API。
 
 ## 项目组成
@@ -62,6 +63,7 @@ export GEWE_SKILL_READ_TOKEN='local-read-token'
 cargo run -p gewe-skill-cli -- health
 cargo run -p gewe-skill-cli -- recent --limit 20
 cargo run -p gewe-skill-cli -- search --q '<keyword>' --limit 20
+cargo run -p gewe-skill-cli -- resolve --q '<group-or-member-name>' --limit 10
 cargo run -p gewe-skill-cli -- attachments --limit 20
 ```
 
@@ -96,6 +98,8 @@ GeWe -> gewe-skill-edge -> Cloudflare D1/R2/Queue -> gewe-skill-memory -> Agent 
 ```bash
 gewe-skill recent --limit 50
 gewe-skill conversations --limit 100
+gewe-skill resolve --q '<chatroom/contact/member name>' --limit 10
+gewe-skill refresh-identity --recent-chatrooms 20
 gewe-skill chatroom-events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill chatroom-system-events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill attachment-download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin

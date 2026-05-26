@@ -1,0 +1,17 @@
+[Unit]
+Description=gewe-skill identity refresh from GeWe read-only APIs
+After=network-online.target gewe-skill-memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gewe-skill
+Group=gewe-skill
+WorkingDirectory=/opt/gewe-skill-memory
+EnvironmentFile=/opt/gewe-skill-memory/config/gewe-skill-memory.env
+ExecStart=/opt/gewe-skill-memory/bin/gewe-skill refresh-identity --recent-chatrooms 50
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gewe-skill-memory/data

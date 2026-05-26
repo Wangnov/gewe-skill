@@ -8,11 +8,14 @@ use axum::{
 };
 use gewe_skill_core::{diff_chatroom_snapshots, normalize_callback};
 use gewe_skill_types::{
-    ApiPage, AttachmentRecord, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
-    ConversationSummary, IngestEventRequest, NormalizedMessage, RawCallbackRequest,
+    ApiPage, AttachmentRecord, ChatroomEventType, ChatroomMember, ChatroomMemberEvent,
+    ChatroomSnapshot, ChatroomSystemEvent, ConversationSummary, IdentityMatch,
+    IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
+    NormalizedMessage, RawCallbackRequest,
 };
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{
     env,
@@ -29,6 +32,10 @@ struct AppState {
     attachment_dir: PathBuf,
     read_token: Option<String>,
     write_token: Option<String>,
+    gewe_base_url: String,
+    gewe_app_id: Option<String>,
+    gewe_token: Option<String>,
+    http: HttpClient,
 }
 
 type SharedState = Arc<AppState>;
@@ -84,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attachment_dir,
         read_token: env::var("GEWE_SKILL_READ_TOKEN").ok(),
         write_token: env::var("GEWE_SKILL_WRITE_TOKEN").ok(),
+        gewe_base_url: env_first(&["GEWE_SKILL_GEWE_BASE_URL", "GEWE_API_BASE_URL"])
+            .unwrap_or_else(|| "http://api.geweapi.com".to_string()),
+        gewe_app_id: env_first(&["GEWE_SKILL_GEWE_APP_ID", "GEWE_APP_ID", "APP_ID"]),
+        gewe_token: env_first(&["GEWE_SKILL_GEWE_TOKEN", "GEWE_TOKEN"]),
+        http: HttpClient::new(),
     });
 
     let app = Router::new()
@@ -126,6 +138,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/conversations",
             get(conversations).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/identity/resolve",
+            get(resolve_identity).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/identity/refresh",
+            post(refresh_identity).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -190,6 +216,10 @@ fn ensure_sqlite_parent(database_url: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| env::var(key).ok())
 }
 
 async fn shutdown_signal() {
@@ -297,6 +327,7 @@ async fn write_ingest_request(
     for event in &request.chatroom_system_events {
         insert_chatroom_system_event(&mut tx, event).await?;
     }
+    project_identity_from_ingest(&mut tx, &request).await?;
     tx.commit().await?;
 
     Ok(Json(IngestResponse {
@@ -395,7 +426,11 @@ async fn conversations(
         r#"
         SELECT conversation_id, MAX(is_group) AS is_group, MAX(received_at) AS last_message_at,
                COUNT(*) AS message_count,
-               SUBSTR((SELECT content_text FROM messages m2 WHERE m2.conversation_id = messages.conversation_id ORDER BY received_at DESC, id DESC LIMIT 1), 1, 160) AS preview
+               SUBSTR((SELECT content_text FROM messages m2 WHERE m2.conversation_id = messages.conversation_id ORDER BY received_at DESC, id DESC LIMIT 1), 1, 160) AS preview,
+               COALESCE(
+                 (SELECT display_name FROM identity_chatrooms c WHERE c.chatroom_id = messages.conversation_id),
+                 (SELECT COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), NULLIF(alias, '')) FROM identity_contacts p WHERE p.wxid = messages.conversation_id)
+               ) AS display_name
         FROM messages
         WHERE conversation_id IS NOT NULL
         GROUP BY conversation_id
@@ -410,7 +445,7 @@ async fn conversations(
         .iter()
         .map(|row| ConversationSummary {
             conversation_id: row.get("conversation_id"),
-            display_name: None,
+            display_name: row.get("display_name"),
             is_group: row.get::<i64, _>("is_group") != 0,
             last_message_at: row.get("last_message_at"),
             last_message_preview: row.get("preview"),
@@ -421,6 +456,151 @@ async fn conversations(
         items,
         next_cursor: None,
     }))
+}
+
+async fn resolve_identity(
+    State(state): State<SharedState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<IdentityResolveResponse>, ApiError> {
+    let limit = clamp_limit(query.limit);
+    let alias_key = normalize_alias(&query.q);
+    let like = format!("%{}%", query.q.trim());
+    let rows = sqlx::query(
+        r#"
+        SELECT entity_type, entity_id, NULLIF(scope_key, '') AS chatroom_id, alias, source,
+               is_current, confidence, last_seen_at,
+               COALESCE(
+                 CASE
+                   WHEN entity_type = 'chatroom' THEN (
+                     SELECT COALESCE(NULLIF(display_name, ''), NULLIF(remark, ''))
+                     FROM identity_chatrooms WHERE chatroom_id = entity_id
+                   )
+                   WHEN entity_type = 'contact' THEN (
+                     SELECT COALESCE(NULLIF(remark, ''), NULLIF(nickname, ''), NULLIF(alias, ''))
+                     FROM identity_contacts WHERE wxid = entity_id
+                   )
+                   WHEN entity_type = 'chatroom_member' THEN (
+                     SELECT COALESCE(NULLIF(display_name, ''), NULLIF(nickname, ''))
+                     FROM identity_chatroom_members
+                     WHERE chatroom_id = scope_key AND member_wxid = entity_id
+                   )
+                 END,
+                 alias
+               ) AS display_name,
+               ((CASE WHEN alias_key = ? THEN 1.0 ELSE 0.6 END) * confidence)
+                 + CASE WHEN is_current != 0 THEN 0.05 ELSE 0 END AS score
+        FROM identity_aliases
+        WHERE alias_key = ? OR alias LIKE ? OR entity_id = ?
+        ORDER BY score DESC, last_seen_at DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(&alias_key)
+    .bind(&alias_key)
+    .bind(&like)
+    .bind(query.q.trim())
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+    let items = rows
+        .iter()
+        .map(|row| IdentityMatch {
+            entity_type: row.get("entity_type"),
+            entity_id: row.get("entity_id"),
+            chatroom_id: row.get("chatroom_id"),
+            display_name: row.get("display_name"),
+            alias: row.get("alias"),
+            source: row.get("source"),
+            is_current: row.get::<i64, _>("is_current") != 0,
+            score: row.get("score"),
+            last_seen_at: row.get("last_seen_at"),
+        })
+        .collect();
+    Ok(Json(IdentityResolveResponse {
+        query: query.q,
+        items,
+    }))
+}
+
+async fn refresh_identity(
+    State(state): State<SharedState>,
+    Json(request): Json<IdentityRefreshRequest>,
+) -> Result<Json<IdentityRefreshResponse>, ApiError> {
+    let now = now_iso();
+    let mut response = IdentityRefreshResponse {
+        ok: true,
+        refreshed_chatrooms: 0,
+        refreshed_contacts: 0,
+        refreshed_members: 0,
+        errors: Vec::new(),
+    };
+
+    if request.full.unwrap_or(false) {
+        match refresh_contacts_list(&state, &now).await {
+            Ok((chatroom_ids, contact_count)) => {
+                response.refreshed_contacts += contact_count;
+                for chatroom_id in chatroom_ids {
+                    match refresh_chatroom_from_gewe(&state, &chatroom_id, &now).await {
+                        Ok(member_count) => {
+                            response.refreshed_chatrooms += 1;
+                            response.refreshed_members += member_count;
+                        }
+                        Err(error) => response.errors.push(json!({
+                            "chatroom_id": chatroom_id,
+                            "error": error.to_string()
+                        })),
+                    }
+                }
+            }
+            Err(error) => response.errors.push(json!({
+                "scope": "contacts_list",
+                "error": error.to_string()
+            })),
+        }
+    }
+
+    if let Some(chatroom_id) = &request.chatroom_id {
+        match refresh_chatroom_from_gewe(&state, chatroom_id, &now).await {
+            Ok(member_count) => {
+                response.refreshed_chatrooms += 1;
+                response.refreshed_members += member_count;
+            }
+            Err(error) => response.errors.push(json!({
+                "chatroom_id": chatroom_id,
+                "error": error.to_string()
+            })),
+        }
+    }
+
+    if let Some(wxids) = &request.wxids {
+        match refresh_contacts_detail(&state, wxids, &now, false).await {
+            Ok(count) => response.refreshed_contacts += count,
+            Err(error) => response.errors.push(json!({
+                "scope": "contacts_detail",
+                "error": error.to_string()
+            })),
+        }
+    }
+
+    if request.chatroom_id.is_none() && !request.full.unwrap_or(false) {
+        let limit = request.recent_chatrooms.unwrap_or(20).clamp(1, 200);
+        let chatroom_ids = recent_chatroom_ids(&state.db, limit).await?;
+        for chatroom_id in chatroom_ids {
+            match refresh_chatroom_from_gewe(&state, &chatroom_id, &now).await {
+                Ok(member_count) => {
+                    response.refreshed_chatrooms += 1;
+                    response.refreshed_members += member_count;
+                }
+                Err(error) => response.errors.push(json!({
+                    "chatroom_id": chatroom_id,
+                    "error": error.to_string()
+                })),
+            }
+        }
+    }
+
+    response.ok = response.errors.is_empty();
+    Ok(Json(response))
 }
 
 async fn recent_attachments(
@@ -582,6 +762,452 @@ async fn query_json_rows<T: serde::de::DeserializeOwned>(
         .collect())
 }
 
+async fn recent_chatroom_ids(db: &SqlitePool, limit: i64) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT conversation_id
+        FROM messages
+        WHERE is_group != 0 AND conversation_id IS NOT NULL
+        GROUP BY conversation_id
+        ORDER BY MAX(received_at) DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().map(|row| row.get("conversation_id")).collect())
+}
+
+async fn refresh_contacts_list(
+    state: &SharedState,
+    seen_at: &str,
+) -> Result<(Vec<String>, i64), ApiError> {
+    let data = gewe_post(state, "/gewe/v2/api/contacts/fetchContactsList", json!({})).await?;
+    let data = if data.is_object() {
+        data
+    } else {
+        gewe_post(
+            state,
+            "/gewe/v2/api/contacts/fetchContactsListCache",
+            json!({}),
+        )
+        .await?
+    };
+    let friends = data
+        .get("friends")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let chatrooms = data
+        .get("chatrooms")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut contact_count = 0;
+    for chunk in friends.chunks(50) {
+        contact_count += refresh_contacts_detail(state, chunk, seen_at, true).await?;
+    }
+    Ok((chatrooms, contact_count))
+}
+
+async fn refresh_contacts_detail(
+    state: &SharedState,
+    wxids: &[String],
+    seen_at: &str,
+    brief: bool,
+) -> Result<i64, ApiError> {
+    if wxids.is_empty() {
+        return Ok(0);
+    }
+    let path = if brief {
+        "/gewe/v2/api/contacts/getBriefInfo"
+    } else {
+        "/gewe/v2/api/contacts/getDetailInfo"
+    };
+    let data = gewe_post(state, path, json!({ "wxids": wxids })).await?;
+    let items = data.as_array().cloned().unwrap_or_default();
+    let mut tx = state.db.begin().await?;
+    let mut count = 0;
+    for item in items {
+        if apply_gewe_contact(&mut tx, &item, seen_at).await? {
+            count += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+async fn refresh_chatroom_from_gewe(
+    state: &SharedState,
+    chatroom_id: &str,
+    seen_at: &str,
+) -> Result<i64, ApiError> {
+    let data = gewe_post(
+        state,
+        "/gewe/v2/api/group/getChatroomInfo",
+        json!({ "chatroomId": chatroom_id }),
+    )
+    .await?;
+    let mut tx = state.db.begin().await?;
+    let member_count = apply_gewe_chatroom_info(&mut tx, &data, seen_at).await?;
+    tx.commit().await?;
+    Ok(member_count)
+}
+
+async fn gewe_post(state: &SharedState, path: &str, body: Value) -> Result<Value, ApiError> {
+    let token = state.gewe_token.as_deref().ok_or(ApiError::GeweConfig(
+        "missing GEWE_SKILL_GEWE_TOKEN or GEWE_TOKEN",
+    ))?;
+    let app_id = state.gewe_app_id.as_deref().ok_or(ApiError::GeweConfig(
+        "missing GEWE_SKILL_GEWE_APP_ID or GEWE_APP_ID",
+    ))?;
+    let mut payload = match body {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    payload.insert("appId".to_string(), Value::String(app_id.to_string()));
+    let url = format!(
+        "{}/{}",
+        state.gewe_base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let value: Value = state
+        .http
+        .post(url)
+        .header("X-GEWE-TOKEN", token)
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ret = value.get("ret").and_then(Value::as_i64);
+    if ret != Some(200) {
+        return Err(ApiError::Gewe(value.to_string()));
+    }
+    Ok(value.get("data").cloned().unwrap_or(Value::Null))
+}
+
+async fn project_identity_from_ingest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    request: &IngestEventRequest,
+) -> Result<(), ApiError> {
+    project_message_identity(tx, &request.message).await?;
+    if let Some(snapshot) = &request.chatroom_snapshot {
+        project_chatroom_snapshot(tx, snapshot).await?;
+    }
+    for event in &request.chatroom_member_events {
+        project_chatroom_member_event(tx, event).await?;
+    }
+    for event in &request.chatroom_system_events {
+        project_chatroom_system_event(tx, event).await?;
+    }
+    Ok(())
+}
+
+async fn project_message_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &NormalizedMessage,
+) -> Result<(), ApiError> {
+    let Some(conversation_id) = &message.conversation_id else {
+        return Ok(());
+    };
+    if message.is_group {
+        upsert_chatroom(
+            tx,
+            conversation_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &message.received_at,
+            "message",
+        )
+        .await?;
+        if let Some(sender_wxid) = &message.sender_wxid {
+            let display_name = sender_display_from_push_content(message);
+            upsert_chatroom_member(
+                tx,
+                conversation_id,
+                sender_wxid,
+                display_name.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                true,
+                &message.received_at,
+                "message",
+            )
+            .await?;
+        }
+    } else {
+        upsert_contact(
+            tx,
+            conversation_id,
+            None,
+            None,
+            None,
+            None,
+            &message.received_at,
+            "message",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn project_chatroom_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot: &ChatroomSnapshot,
+) -> Result<(), ApiError> {
+    let raw = serde_json::to_value(snapshot)?;
+    upsert_chatroom(
+        tx,
+        &snapshot.chatroom_id,
+        snapshot.chatroom_name.as_deref(),
+        None,
+        None,
+        Some(snapshot.member_count),
+        Some(&raw),
+        &snapshot.received_at,
+        "chatroom_snapshot",
+    )
+    .await?;
+    sqlx::query("UPDATE identity_chatroom_members SET is_current = 0 WHERE chatroom_id = ?")
+        .bind(&snapshot.chatroom_id)
+        .execute(&mut **tx)
+        .await?;
+    for member in &snapshot.members {
+        upsert_chatroom_member(
+            tx,
+            &snapshot.chatroom_id,
+            &member.wxid,
+            member.display_name.as_deref(),
+            None,
+            None,
+            member.flag,
+            Some(&serde_json::to_value(member)?),
+            true,
+            &snapshot.received_at,
+            "chatroom_snapshot",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn project_chatroom_member_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &ChatroomMemberEvent,
+) -> Result<(), ApiError> {
+    if let Some(name) = &event.current_chatroom_name {
+        upsert_chatroom(
+            tx,
+            &event.chatroom_id,
+            Some(name),
+            None,
+            None,
+            event.current_member_count,
+            None,
+            &event.received_at,
+            "chatroom_member_event",
+        )
+        .await?;
+    }
+    if let Some(member_wxid) = &event.member_wxid {
+        let member = event
+            .details
+            .get("member")
+            .and_then(|value| serde_json::from_value::<ChatroomMember>(value.clone()).ok());
+        let member_json = member
+            .as_ref()
+            .and_then(|item| serde_json::to_value(item).ok());
+        let is_current = !matches!(
+            event.event_type,
+            ChatroomEventType::MemberLeft | ChatroomEventType::MemberRemoved
+        );
+        upsert_chatroom_member(
+            tx,
+            &event.chatroom_id,
+            member_wxid,
+            member
+                .as_ref()
+                .and_then(|item| item.display_name.as_deref()),
+            None,
+            None,
+            member.as_ref().and_then(|item| item.flag),
+            member_json.as_ref(),
+            is_current,
+            &event.received_at,
+            "chatroom_member_event",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn project_chatroom_system_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    event: &ChatroomSystemEvent,
+) -> Result<(), ApiError> {
+    if matches!(event.event_type, ChatroomEventType::ChatroomNameChanged) {
+        upsert_chatroom(
+            tx,
+            &event.chatroom_id,
+            event.current_value.as_deref(),
+            None,
+            None,
+            None,
+            Some(&event.details),
+            &event.received_at,
+            "chatroom_system_event",
+        )
+        .await?;
+    }
+    if let Some(actor_wxid) = &event.actor_wxid {
+        upsert_chatroom_member(
+            tx,
+            &event.chatroom_id,
+            actor_wxid,
+            event.actor_name.as_deref(),
+            None,
+            None,
+            None,
+            Some(&event.details),
+            true,
+            &event.received_at,
+            "chatroom_system_event",
+        )
+        .await?;
+    }
+    for (idx, target_wxid) in event.target_wxids.iter().enumerate() {
+        let target_name = event.target_names.get(idx).map(String::as_str);
+        let is_current = !matches!(
+            event.event_type,
+            ChatroomEventType::MemberLeft | ChatroomEventType::MemberRemoved
+        );
+        upsert_chatroom_member(
+            tx,
+            &event.chatroom_id,
+            target_wxid,
+            target_name,
+            None,
+            None,
+            None,
+            Some(&event.details),
+            is_current,
+            &event.received_at,
+            "chatroom_system_event",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn apply_gewe_contact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    value: &Value,
+    seen_at: &str,
+) -> Result<bool, ApiError> {
+    let Some(wxid) = json_text(value, "userName") else {
+        return Ok(false);
+    };
+    upsert_contact(
+        tx,
+        &wxid,
+        json_text(value, "nickName").as_deref(),
+        json_text(value, "remark").as_deref(),
+        json_text(value, "alias").as_deref(),
+        Some(value),
+        seen_at,
+        "gewe_contact_info",
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn apply_gewe_chatroom_info(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    value: &Value,
+    seen_at: &str,
+) -> Result<i64, ApiError> {
+    let Some(chatroom_id) = json_text(value, "chatroomId") else {
+        return Ok(0);
+    };
+    let member_list = value
+        .get("memberList")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let display_name = json_text(value, "remark").or_else(|| json_text(value, "nickName"));
+    upsert_chatroom(
+        tx,
+        &chatroom_id,
+        display_name.as_deref(),
+        json_text(value, "remark").as_deref(),
+        json_text(value, "chatRoomOwner").as_deref(),
+        Some(member_list.len() as i64),
+        Some(value),
+        seen_at,
+        "gewe_chatroom_info",
+    )
+    .await?;
+    if let Some(nick_name) = json_text(value, "nickName") {
+        upsert_alias(
+            tx,
+            &nick_name,
+            "chatroom",
+            &chatroom_id,
+            None,
+            "gewe_chatroom_nickname",
+            true,
+            0.95,
+            seen_at,
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE identity_chatroom_members SET is_current = 0 WHERE chatroom_id = ?")
+        .bind(&chatroom_id)
+        .execute(&mut **tx)
+        .await?;
+    for member in &member_list {
+        let Some(wxid) = json_text(member, "wxid") else {
+            continue;
+        };
+        upsert_chatroom_member(
+            tx,
+            &chatroom_id,
+            &wxid,
+            json_text(member, "displayName").as_deref(),
+            json_text(member, "nickName").as_deref(),
+            json_text(member, "inviterUserName").as_deref(),
+            json_i64(member, "memberFlag"),
+            Some(member),
+            true,
+            seen_at,
+            "gewe_chatroom_info",
+        )
+        .await?;
+    }
+    Ok(member_list.len() as i64)
+}
+
 async fn insert_raw_event(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     request: &IngestEventRequest,
@@ -701,6 +1327,240 @@ async fn insert_chatroom_system_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn upsert_contact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    wxid: &str,
+    nickname: Option<&str>,
+    remark: Option<&str>,
+    alias: Option<&str>,
+    raw_json: Option<&Value>,
+    seen_at: &str,
+    source: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO identity_contacts (wxid, nickname, remark, alias, raw_json, last_seen_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(wxid) DO UPDATE SET
+          nickname = COALESCE(NULLIF(excluded.nickname, ''), identity_contacts.nickname),
+          remark = COALESCE(NULLIF(excluded.remark, ''), identity_contacts.remark),
+          alias = COALESCE(NULLIF(excluded.alias, ''), identity_contacts.alias),
+          raw_json = COALESCE(excluded.raw_json, identity_contacts.raw_json),
+          last_seen_at = excluded.last_seen_at,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(wxid)
+    .bind(nickname)
+    .bind(remark)
+    .bind(alias)
+    .bind(raw_json.map(Value::to_string))
+    .bind(seen_at)
+    .bind(seen_at)
+    .execute(&mut **tx)
+    .await?;
+    for (value, alias_source, confidence) in [
+        (remark, "contact_remark", 0.95),
+        (nickname, "contact_nickname", 0.85),
+        (alias, "contact_alias", 0.75),
+    ] {
+        if let Some(value) = value {
+            upsert_alias(
+                tx,
+                value,
+                "contact",
+                wxid,
+                None,
+                &format!("{source}:{alias_source}"),
+                true,
+                confidence,
+                seen_at,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_chatroom(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    chatroom_id: &str,
+    display_name: Option<&str>,
+    remark: Option<&str>,
+    owner_wxid: Option<&str>,
+    member_count: Option<i64>,
+    raw_json: Option<&Value>,
+    seen_at: &str,
+    source: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO identity_chatrooms (
+          chatroom_id, display_name, remark, owner_wxid, member_count, raw_json, last_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chatroom_id) DO UPDATE SET
+          display_name = COALESCE(NULLIF(excluded.display_name, ''), identity_chatrooms.display_name),
+          remark = COALESCE(NULLIF(excluded.remark, ''), identity_chatrooms.remark),
+          owner_wxid = COALESCE(NULLIF(excluded.owner_wxid, ''), identity_chatrooms.owner_wxid),
+          member_count = COALESCE(excluded.member_count, identity_chatrooms.member_count),
+          raw_json = COALESCE(excluded.raw_json, identity_chatrooms.raw_json),
+          last_seen_at = excluded.last_seen_at,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(chatroom_id)
+    .bind(display_name)
+    .bind(remark)
+    .bind(owner_wxid)
+    .bind(member_count)
+    .bind(raw_json.map(Value::to_string))
+    .bind(seen_at)
+    .bind(seen_at)
+    .execute(&mut **tx)
+    .await?;
+    if let Some(value) = display_name {
+        upsert_alias(
+            tx,
+            value,
+            "chatroom",
+            chatroom_id,
+            None,
+            source,
+            true,
+            0.95,
+            seen_at,
+        )
+        .await?;
+    }
+    if let Some(value) = remark {
+        upsert_alias(
+            tx,
+            value,
+            "chatroom",
+            chatroom_id,
+            None,
+            &format!("{source}:remark"),
+            true,
+            0.9,
+            seen_at,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_chatroom_member(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    chatroom_id: &str,
+    member_wxid: &str,
+    display_name: Option<&str>,
+    nickname: Option<&str>,
+    inviter_wxid: Option<&str>,
+    member_flag: Option<i64>,
+    raw_json: Option<&Value>,
+    is_current: bool,
+    seen_at: &str,
+    source: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO identity_chatroom_members (
+          chatroom_id, member_wxid, display_name, nickname, inviter_wxid, member_flag,
+          is_current, first_seen_at, last_seen_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chatroom_id, member_wxid) DO UPDATE SET
+          display_name = COALESCE(NULLIF(excluded.display_name, ''), identity_chatroom_members.display_name),
+          nickname = COALESCE(NULLIF(excluded.nickname, ''), identity_chatroom_members.nickname),
+          inviter_wxid = COALESCE(NULLIF(excluded.inviter_wxid, ''), identity_chatroom_members.inviter_wxid),
+          member_flag = COALESCE(excluded.member_flag, identity_chatroom_members.member_flag),
+          is_current = excluded.is_current,
+          last_seen_at = excluded.last_seen_at,
+          raw_json = COALESCE(excluded.raw_json, identity_chatroom_members.raw_json)
+        "#,
+    )
+    .bind(chatroom_id)
+    .bind(member_wxid)
+    .bind(display_name)
+    .bind(nickname)
+    .bind(inviter_wxid)
+    .bind(member_flag)
+    .bind(i64::from(is_current))
+    .bind(seen_at)
+    .bind(seen_at)
+    .bind(raw_json.map(Value::to_string))
+    .execute(&mut **tx)
+    .await?;
+    for (value, alias_source, confidence) in [
+        (display_name, "member_display_name", 0.95),
+        (nickname, "member_nickname", 0.8),
+    ] {
+        if let Some(value) = value {
+            upsert_alias(
+                tx,
+                value,
+                "chatroom_member",
+                member_wxid,
+                Some(chatroom_id),
+                &format!("{source}:{alias_source}"),
+                is_current,
+                confidence,
+                seen_at,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_alias(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    alias: &str,
+    entity_type: &str,
+    entity_id: &str,
+    chatroom_id: Option<&str>,
+    source: &str,
+    is_current: bool,
+    confidence: f64,
+    seen_at: &str,
+) -> Result<(), ApiError> {
+    let alias = alias.trim();
+    let alias_key = normalize_alias(alias);
+    if alias_key.is_empty() {
+        return Ok(());
+    }
+    let scope_key = chatroom_id.unwrap_or("");
+    sqlx::query(
+        r#"
+        INSERT INTO identity_aliases (
+          alias_key, alias, entity_type, entity_id, scope_key, source,
+          is_current, confidence, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(alias_key, entity_type, entity_id, scope_key, source) DO UPDATE SET
+          alias = excluded.alias,
+          is_current = excluded.is_current,
+          confidence = MAX(identity_aliases.confidence, excluded.confidence),
+          last_seen_at = excluded.last_seen_at
+        "#,
+    )
+    .bind(alias_key)
+    .bind(alias)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(scope_key)
+    .bind(source)
+    .bind(i64::from(is_current))
+    .bind(confidence)
+    .bind(seen_at)
+    .bind(seen_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn insert_attachment(db: &SqlitePool, record: &AttachmentRecord) -> Result<(), ApiError> {
     sqlx::query(
         r#"
@@ -739,6 +1599,45 @@ async fn insert_attachment(db: &SqlitePool, record: &AttachmentRecord) -> Result
 
 fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(50).clamp(1, 200)
+}
+
+fn normalize_alias(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<String>()
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn json_text(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| match item {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+}
+
+fn json_i64(value: &Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(|item| match item {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    })
+}
+
+fn sender_display_from_push_content(message: &NormalizedMessage) -> Option<String> {
+    let text = message.push_content.as_deref()?;
+    let (name, _) = text.split_once(':').or_else(|| text.split_once('：'))?;
+    let name = name.trim();
+    (!name.is_empty()).then_some(name.to_string())
 }
 
 async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -842,6 +1741,81 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_chatroom_system_events_chatroom_received ON chatroom_system_events(chatroom_id, received_at DESC)").execute(db).await?;
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS identity_contacts (
+          wxid TEXT PRIMARY KEY,
+          nickname TEXT,
+          remark TEXT,
+          alias TEXT,
+          raw_json TEXT,
+          last_seen_at TEXT,
+          updated_at TEXT
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS identity_chatrooms (
+          chatroom_id TEXT PRIMARY KEY,
+          display_name TEXT,
+          remark TEXT,
+          owner_wxid TEXT,
+          member_count INTEGER,
+          raw_json TEXT,
+          last_seen_at TEXT,
+          updated_at TEXT
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_identity_chatrooms_seen ON identity_chatrooms(last_seen_at DESC)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS identity_chatroom_members (
+          chatroom_id TEXT NOT NULL,
+          member_wxid TEXT NOT NULL,
+          display_name TEXT,
+          nickname TEXT,
+          inviter_wxid TEXT,
+          member_flag INTEGER,
+          is_current INTEGER NOT NULL DEFAULT 1,
+          first_seen_at TEXT,
+          last_seen_at TEXT,
+          raw_json TEXT,
+          PRIMARY KEY(chatroom_id, member_wxid)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_identity_members_member ON identity_chatroom_members(member_wxid, last_seen_at DESC)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_identity_members_chatroom ON identity_chatroom_members(chatroom_id, is_current)").execute(db).await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS identity_aliases (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          alias_key TEXT NOT NULL,
+          alias TEXT NOT NULL,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          scope_key TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL,
+          is_current INTEGER NOT NULL DEFAULT 1,
+          confidence REAL NOT NULL DEFAULT 0.6,
+          first_seen_at TEXT,
+          last_seen_at TEXT,
+          UNIQUE(alias_key, entity_type, entity_id, scope_key, source)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_identity_aliases_key ON identity_aliases(alias_key, is_current, confidence)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_identity_aliases_entity ON identity_aliases(entity_type, entity_id)").execute(db).await?;
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS attachments (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           edge_job_id INTEGER UNIQUE,
@@ -888,7 +1862,25 @@ enum ApiError {
     Sqlx(sqlx::Error),
     Serde(serde_json::Error),
     Core(gewe_skill_core::CoreError),
+    Http(reqwest::Error),
+    GeweConfig(&'static str),
+    Gewe(String),
     Io(std::io::Error),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Sqlx(error) => error.to_string(),
+            Self::Serde(error) => error.to_string(),
+            Self::Core(error) => error.to_string(),
+            Self::Http(error) => error.to_string(),
+            Self::GeweConfig(error) => error.to_string(),
+            Self::Gewe(error) => error.clone(),
+            Self::Io(error) => error.to_string(),
+        };
+        formatter.write_str(&message)
+    }
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -909,6 +1901,12 @@ impl From<gewe_skill_core::CoreError> for ApiError {
     }
 }
 
+impl From<reqwest::Error> for ApiError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error)
+    }
+}
+
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -921,6 +1919,9 @@ impl IntoResponse for ApiError {
             Self::Sqlx(error) => error.to_string(),
             Self::Serde(error) => error.to_string(),
             Self::Core(error) => error.to_string(),
+            Self::Http(error) => error.to_string(),
+            Self::GeweConfig(error) => error.to_string(),
+            Self::Gewe(error) => error,
             Self::Io(error) => error.to_string(),
         };
         (

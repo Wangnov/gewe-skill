@@ -129,6 +129,42 @@ pub struct ConversationSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityMatch {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub chatroom_id: Option<String>,
+    pub display_name: Option<String>,
+    pub alias: Option<String>,
+    pub source: Option<String>,
+    pub is_current: bool,
+    pub score: f64,
+    pub last_seen_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResolveResponse {
+    pub query: String,
+    pub items: Vec<IdentityMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityRefreshRequest {
+    pub full: Option<bool>,
+    pub chatroom_id: Option<String>,
+    pub wxids: Option<Vec<String>>,
+    pub recent_chatrooms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityRefreshResponse {
+    pub ok: bool,
+    pub refreshed_chatrooms: i64,
+    pub refreshed_contacts: i64,
+    pub refreshed_members: i64,
+    pub errors: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatroomMember {
     pub wxid: String,
     pub display_name: Option<String>,
