@@ -1936,12 +1936,12 @@ fn maintenance_data_health_report(
             true,
         ));
     }
-    if duplicate_job_key_count > 0 || duplicate_message_key_count > 0 {
+    if duplicate_job_key_count > 0 {
         next_actions.push(maintenance_action(
             20,
-            "investigate_attachment_queue_duplicates",
+            "investigate_attachment_queue_duplicate_jobs",
             vec!["maintenance", "attachment-queue-health", "--limit", "1000"],
-            "duplicate edge attachment queue keys can make bulk retries unsafe",
+            "duplicate edge attachment job keys can make bulk retries unsafe",
             true,
         ));
     }
@@ -2026,23 +2026,20 @@ fn maintenance_data_health_report(
         })
         .count();
     let ready_for_analysis = blocking_action_count == 0 && edge_queue_checked;
-    let overall_health = if duplicate_job_key_count > 0
-        || duplicate_message_key_count > 0
-        || retryable_terminal_count > 0
-        || asr_failed_count > 0
-    {
-        "needs_attention"
-    } else if completed_not_ingested_count > 0 || missing_attachment_count > 0 {
-        "needs_attachment_sync"
-    } else if asr_pending_count > 0 {
-        "needs_asr"
-    } else if !edge_queue_checked {
-        "partial"
-    } else if non_retryable_terminal_count > 0 {
-        "ready_with_known_gaps"
-    } else {
-        "healthy"
-    };
+    let overall_health =
+        if duplicate_job_key_count > 0 || retryable_terminal_count > 0 || asr_failed_count > 0 {
+            "needs_attention"
+        } else if completed_not_ingested_count > 0 || missing_attachment_count > 0 {
+            "needs_attachment_sync"
+        } else if asr_pending_count > 0 {
+            "needs_asr"
+        } else if !edge_queue_checked {
+            "partial"
+        } else if non_retryable_terminal_count > 0 {
+            "ready_with_known_gaps"
+        } else {
+            "healthy"
+        };
 
     serde_json::json!({
         "ok": true,
@@ -2062,6 +2059,7 @@ fn maintenance_data_health_report(
             "non_retryable_terminal_count": non_retryable_terminal_count,
             "duplicate_job_key_count": duplicate_job_key_count,
             "duplicate_message_key_count": duplicate_message_key_count,
+            "multi_job_message_key_count": duplicate_message_key_count,
             "active_attachment_count": active_attachment_count,
             "voice_issue_count": voice_issue_count,
             "missing_voice_attachment_count": missing_attachment_count,
@@ -2080,6 +2078,7 @@ fn maintenance_data_health_report(
             "run maintenance data-health before broad media or voice analysis when freshness matters",
             "ready_for_analysis is high-confidence only when --with-edge-queue was used",
             "next_actions are ordered so attachment sync and queue safety are handled before ASR",
+            "multi_job_message_key_count can be normal for attachment variants such as image hd/normal/thumb and does not block analysis by itself",
             "non-retryable unavailable or purged media may still leave known gaps even when analysis can continue"
         ]
     })
@@ -3277,6 +3276,34 @@ mod tests {
             report["next_actions"][0]["action"],
             "inspect_edge_attachment_queue"
         );
+    }
+
+    #[test]
+    fn maintenance_data_health_allows_message_key_repeats_for_attachment_variants() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            Some(serde_json::json!({
+                "queue_health": "has_unavailable",
+                "completed_not_ingested_count": 0,
+                "retryable_terminal_count": 0,
+                "non_retryable_terminal_count": 2,
+                "duplicate_job_key_count": 0,
+                "duplicate_message_key_count": 2,
+                "active_count": 0,
+            })),
+            serde_json::json!({
+                "issue_count": 0,
+                "by_issue_type": {}
+            }),
+            true,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "ready_with_known_gaps");
+        assert_eq!(report["ready_for_analysis"], true);
+        assert_eq!(report["summary"]["multi_job_message_key_count"], 2);
+        assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
     }
 
     fn test_message(
