@@ -36,7 +36,7 @@ GEWE_SKILL_WRITE_TOKEN=...
 
 ## Normal read path
 
-1. Prefer the composed Agent query when the user names a group, person, time window, or keyword. It resolves human wording first, then reads bounded messages and returns voice transcript evidence for the same scope:
+1. Prefer the composed Agent query when the user names a group, person, time window, keyword, or media. It resolves human wording first, then reads bounded messages and returns exact attachment evidence plus voice transcript evidence for the same scope:
 
 ```bash
 gewe-skill --json query messages --conversation '<chatroom/contact wording>' --limit 50
@@ -45,6 +45,8 @@ gewe-skill --json query messages --conversation '<chatroom wording>' --q '<keywo
 ```
 
 If `query messages` returns `conversation_unresolved` or `sender_unresolved`, show the candidates and ask for a narrower clue instead of doing a broad read.
+
+`query messages` includes `attachments.summary` and `attachments.by_message_key` by default. Use these fields before calling `attachments list`: they are exact for the returned message window and work for older messages that are no longer in the recent attachment list. If `attachments.summary.attachment_expected_missing_count` is greater than zero, explain that those media-like messages currently have no stored attachment record, then use maintenance attachment checks before claiming the media is lost.
 
 2. Use manual resolution when you need to inspect or disambiguate ids before reading messages:
 

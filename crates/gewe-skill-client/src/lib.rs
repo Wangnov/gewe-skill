@@ -267,6 +267,17 @@ impl GeweSkillClient {
         .await
     }
 
+    pub async fn attachments_by_message_keys(
+        &self,
+        message_keys: &[String],
+    ) -> Result<ApiPage<AttachmentRecord>, ClientError> {
+        self.post_read_json_as(
+            "api/attachments/by-message-keys",
+            &serde_json::json!({ "message_keys": message_keys }),
+        )
+        .await
+    }
+
     pub async fn download_attachment(&self, sha256: &str) -> Result<Vec<u8>, ClientError> {
         let path = format!("api/attachments/{sha256}/download");
         let mut request = self.http.get(self.url(&path)?);

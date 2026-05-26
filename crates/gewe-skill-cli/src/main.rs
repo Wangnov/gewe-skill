@@ -7,8 +7,8 @@ use gewe_skill_client::GeweSkillClient;
 use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, IdentityEventBackfillRequest, IdentityMatch,
-    IdentityRefreshRequest, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
-    VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
+    IdentityRefreshRequest, MessageQuery, NormalizedKind, NormalizedMessage, RawCallbackRequest,
+    VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -269,6 +269,9 @@ struct AgentMessageQueryArgs {
     /// Disable the companion voice query that returns transcript availability for the same scope.
     #[arg(long = "no-voice-transcripts", action = ArgAction::SetFalse, default_value_t = true)]
     voice_transcripts: bool,
+    /// Disable exact attachment lookup for the returned message window.
+    #[arg(long = "no-attachments", action = ArgAction::SetFalse, default_value_t = true)]
+    attachments: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1443,6 +1446,21 @@ async fn agent_query_messages(
         order: Some(args.order.query_value()),
     };
     let messages: ApiPage<NormalizedMessage> = client.messages(&query).await?;
+    let message_keys = messages
+        .items
+        .iter()
+        .map(|message| message.message_key.clone())
+        .collect::<Vec<_>>();
+    let attachments: Option<ApiPage<AttachmentRecord>> = if args.attachments {
+        Some(client.attachments_by_message_keys(&message_keys).await?)
+    } else {
+        None
+    };
+    let attachment_block = agent_attachment_block(
+        args.attachments,
+        &messages.items,
+        attachments.as_ref().map(|page| page.items.as_slice()),
+    );
     let voice: Option<ApiPage<VoiceItem>> = if args.voice_transcripts {
         Some(
             client
@@ -1472,12 +1490,125 @@ async fn agent_query_messages(
         },
         "message_query": query,
         "messages": messages,
+        "attachments": attachment_block,
         "voice": {
             "included": args.voice_transcripts,
             "items": voice.map(|page| page.items).unwrap_or_default()
         }
     }))
 }
+
+fn agent_attachment_block(
+    included: bool,
+    messages: &[NormalizedMessage],
+    attachments: Option<&[AttachmentRecord]>,
+) -> Value {
+    if !included {
+        return serde_json::json!({
+            "included": false,
+            "items": [],
+            "by_message_key": {},
+            "summary": {
+                "message_count": messages.len(),
+                "attachment_count": 0
+            }
+        });
+    }
+
+    let attachments = attachments.unwrap_or_default();
+    let mut by_message = std::collections::BTreeMap::<String, Vec<&AttachmentRecord>>::new();
+    let mut by_kind = std::collections::BTreeMap::<String, usize>::new();
+    for attachment in attachments {
+        by_message
+            .entry(attachment.message_key.clone())
+            .or_default()
+            .push(attachment);
+        *by_kind
+            .entry(attachment_kind_value(&attachment.kind).to_string())
+            .or_default() += 1;
+    }
+
+    let mut by_message_json = serde_json::Map::new();
+    for (message_key, items) in &by_message {
+        let mut kinds = std::collections::BTreeSet::<String>::new();
+        let mut sha256s = Vec::<String>::new();
+        for item in items {
+            kinds.insert(attachment_kind_value(&item.kind).to_string());
+            if let Some(sha256) = item.sha256.as_deref() {
+                if !sha256.is_empty() {
+                    sha256s.push(sha256.to_string());
+                }
+            }
+        }
+        sha256s.sort();
+        sha256s.dedup();
+        by_message_json.insert(
+            message_key.clone(),
+            serde_json::json!({
+                "count": items.len(),
+                "kinds": kinds.into_iter().collect::<Vec<_>>(),
+                "sha256s": sha256s,
+            }),
+        );
+    }
+
+    let attachment_expected_message_keys = messages
+        .iter()
+        .filter(|message| message_kind_expects_attachment(&message.kind))
+        .map(|message| message.message_key.clone())
+        .collect::<Vec<_>>();
+    let attachment_expected_missing_message_keys = attachment_expected_message_keys
+        .iter()
+        .filter(|message_key| !by_message.contains_key(*message_key))
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "included": true,
+        "items": attachments,
+        "by_message_key": by_message_json,
+        "summary": {
+            "message_count": messages.len(),
+            "attachment_count": attachments.len(),
+            "messages_with_attachments": by_message.len(),
+            "attachment_expected_message_count": attachment_expected_message_keys.len(),
+            "attachment_expected_missing_count": attachment_expected_message_keys
+                .iter()
+                .filter(|message_key| !by_message.contains_key(*message_key))
+                .count(),
+            "attachment_expected_missing_message_keys": attachment_expected_missing_message_keys,
+            "by_kind": by_kind,
+            "agent_notes": [
+                "attachments are looked up exactly by message_key for the returned message window",
+                "attachment_expected_missing_count means media-like messages in this window currently have no stored attachment record",
+                "voice transcript availability is reported separately under voice.items"
+            ]
+        }
+    })
+}
+
+fn attachment_kind_value(kind: &AttachmentKind) -> &'static str {
+    match kind {
+        AttachmentKind::Image => "image",
+        AttachmentKind::Voice => "voice",
+        AttachmentKind::Video => "video",
+        AttachmentKind::Emoji => "emoji",
+        AttachmentKind::File => "file",
+    }
+}
+
+fn message_kind_expects_attachment(kind: &NormalizedKind) -> bool {
+    matches!(
+        kind,
+        NormalizedKind::Image
+            | NormalizedKind::Voice
+            | NormalizedKind::Video
+            | NormalizedKind::Emoji
+            | NormalizedKind::File
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct QueryResolution {
     input: Option<String>,
@@ -2495,5 +2626,75 @@ mod tests {
             url,
             "https://example.com/admin/download-jobs?limit=20&status=failed&asset_type=voice"
         );
+    }
+
+    #[test]
+    fn agent_attachment_block_reports_exact_window_summary() {
+        let messages = vec![
+            test_message("m1", gewe_skill_types::NormalizedKind::Image),
+            test_message("m2", gewe_skill_types::NormalizedKind::Voice),
+            test_message("m3", gewe_skill_types::NormalizedKind::Text),
+        ];
+        let attachments = vec![AttachmentRecord {
+            id: Some(1),
+            edge_job_id: Some(10),
+            job_key: Some("job:m1:image".to_string()),
+            message_key: "m1".to_string(),
+            raw_event_dedupe_key: "raw:m1".to_string(),
+            appid: "app".to_string(),
+            account_wxid: None,
+            kind: AttachmentKind::Image,
+            variant: None,
+            source_url: None,
+            object_key: Some("attachments/image.bin".to_string()),
+            sha256: Some("sha".to_string()),
+            size_bytes: Some(3),
+            mime_type: Some("image/jpeg".to_string()),
+            created_at: "2026-05-26T00:00:00Z".to_string(),
+        }];
+
+        let block = agent_attachment_block(true, &messages, Some(&attachments));
+
+        assert_eq!(block["included"], true);
+        assert_eq!(block["summary"]["attachment_count"], 1);
+        assert_eq!(block["summary"]["messages_with_attachments"], 1);
+        assert_eq!(block["summary"]["attachment_expected_message_count"], 2);
+        assert_eq!(block["summary"]["attachment_expected_missing_count"], 1);
+        assert_eq!(
+            block["summary"]["attachment_expected_missing_message_keys"][0],
+            "m2"
+        );
+        assert_eq!(block["by_message_key"]["m1"]["kinds"][0], "image");
+    }
+
+    fn test_message(
+        message_key: &str,
+        kind: gewe_skill_types::NormalizedKind,
+    ) -> NormalizedMessage {
+        NormalizedMessage {
+            message_key: message_key.to_string(),
+            schema_version: gewe_skill_types::SchemaVersion::V1,
+            appid: "app".to_string(),
+            account_wxid: None,
+            kind,
+            type_name: None,
+            msg_id: None,
+            new_msg_id: None,
+            msg_type: None,
+            appmsg_type: None,
+            from_user: None,
+            to_user: None,
+            conversation_id: Some("room".to_string()),
+            sender_wxid: Some("sender".to_string()),
+            is_group: true,
+            is_outgoing: false,
+            wechat_created_at: None,
+            received_at: "2026-05-26T00:00:00Z".to_string(),
+            content_text: None,
+            content_xml: None,
+            push_content: None,
+            msg_source: None,
+            raw_content: None,
+        }
     }
 }

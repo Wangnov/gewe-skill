@@ -75,6 +75,11 @@ struct AttachmentJobKeyLookupRequest {
     job_keys: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentMessageKeyLookupRequest {
+    message_keys: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
@@ -220,6 +225,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/attachments/by-job-keys",
             post(attachments_by_job_keys).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/attachments/by-message-keys",
+            post(attachments_by_message_keys).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -1615,6 +1627,46 @@ async fn attachments_by_job_keys(
             serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
         record.id = Some(row.get("id"));
         items.push(record);
+    }
+    Ok(Json(ApiPage {
+        items,
+        next_cursor: None,
+    }))
+}
+
+async fn attachments_by_message_keys(
+    State(state): State<SharedState>,
+    Json(request): Json<AttachmentMessageKeyLookupRequest>,
+) -> Result<Json<ApiPage<AttachmentRecord>>, ApiError> {
+    let mut seen = HashSet::<String>::new();
+    let mut items = Vec::<AttachmentRecord>::new();
+    for message_key in request
+        .message_keys
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .take(1000)
+    {
+        if !seen.insert(message_key.clone()) {
+            continue;
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, attachment_json
+            FROM attachments
+            WHERE message_key = ?
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )
+        .bind(&message_key)
+        .fetch_all(&state.db)
+        .await?;
+        for row in rows {
+            let mut record =
+                serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
+            record.id = Some(row.get("id"));
+            items.push(record);
+        }
     }
     Ok(Json(ApiPage {
         items,
