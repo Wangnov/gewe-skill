@@ -1577,6 +1577,13 @@ async fn agent_query_messages(
     } else {
         None
     };
+    let agent_guidance = agent_message_query_guidance(
+        &query,
+        &messages,
+        &attachment_block,
+        voice.as_ref(),
+        &speaker_block,
+    );
 
     Ok(serde_json::json!({
         "ok": true,
@@ -1593,8 +1600,284 @@ async fn agent_query_messages(
         "voice": {
             "included": args.voice_transcripts,
             "items": voice.map(|page| page.items).unwrap_or_default()
-        }
+        },
+        "agent_guidance": agent_guidance
     }))
+}
+
+fn agent_message_query_guidance(
+    query: &MessageQuery,
+    messages: &ApiPage<NormalizedMessage>,
+    attachment_block: &Value,
+    voice: Option<&ApiPage<VoiceItem>>,
+    speaker_block: &Value,
+) -> Value {
+    let returned_count = messages.items.len();
+    let limit = query.limit.unwrap_or(50);
+    let oldest_received_at = messages
+        .items
+        .iter()
+        .map(|message| message.received_at.as_str())
+        .min()
+        .map(ToString::to_string);
+    let newest_received_at = messages
+        .items
+        .iter()
+        .map(|message| message.received_at.as_str())
+        .max()
+        .map(ToString::to_string);
+    let mut next_actions = Vec::<Value>::new();
+
+    if let Some(cursor) = messages.next_cursor.as_deref() {
+        let mut next_query = query.clone();
+        next_query.cursor = Some(cursor.to_string());
+        next_actions.push(agent_guidance_action(
+            10,
+            "continue_message_page",
+            "more messages are available for the same resolved scope",
+            agent_messages_cli(&next_query),
+            false,
+        ));
+    }
+
+    let missing_attachment_count = value_usize_at(
+        attachment_block,
+        &["summary", "attachment_expected_missing_count"],
+    );
+    if missing_attachment_count > 0 {
+        next_actions.push(agent_guidance_action(
+            20,
+            "inspect_attachment_readiness",
+            "some media-like messages in this returned window do not have synced attachment records",
+            vec![
+                "gewe-skill".to_string(),
+                "--json".to_string(),
+                "maintenance".to_string(),
+                "data-health".to_string(),
+                "--with-edge-queue".to_string(),
+            ],
+            false,
+        ));
+    }
+
+    let voice_summary = voice_guidance_summary(voice);
+    let voice_issue_count = value_usize_at(&voice_summary, &["issue_count"]);
+    if voice_issue_count > 0 {
+        next_actions.push(agent_guidance_action(
+            30,
+            "inspect_voice_readiness",
+            "some voice messages in this scope are missing audio, missing transcript, or have known transcript gaps",
+            vec![
+                "gewe-skill".to_string(),
+                "--json".to_string(),
+                "maintenance".to_string(),
+                "voice-issues".to_string(),
+                "--with-edge-queue".to_string(),
+                "--limit".to_string(),
+                limit.clamp(1, 500).to_string(),
+            ],
+            false,
+        ));
+    }
+
+    let missing_display_count = value_usize_at(
+        speaker_block,
+        &["summary", "missing_effective_display_count"],
+    );
+    if missing_display_count > 0 {
+        if let Some(conversation_id) = query
+            .conversation_id
+            .as_deref()
+            .filter(|conversation_id| conversation_id.ends_with("@chatroom"))
+        {
+            next_actions.push(agent_guidance_action(
+                40,
+                "warm_chatroom_identity",
+                "some speakers in this message window do not have human-friendly display memory yet",
+                vec![
+                    "gewe-skill".to_string(),
+                    "--json".to_string(),
+                    "identity".to_string(),
+                    "warm".to_string(),
+                    "--chatroom-id".to_string(),
+                    conversation_id.to_string(),
+                    "--recent-messages".to_string(),
+                    "200".to_string(),
+                    "--max-contacts".to_string(),
+                    "50".to_string(),
+                ],
+                false,
+            ));
+        }
+    }
+
+    if returned_count == 0 {
+        let mut broader_query = query.clone();
+        broader_query.q = None;
+        broader_query.sender_wxid = None;
+        broader_query.kind = None;
+        broader_query.direction = None;
+        broader_query.cursor = None;
+        next_actions.push(agent_guidance_action(
+            50,
+            "broaden_empty_message_query",
+            "this exact resolved scope returned no messages; broaden keyword, sender, kind, or direction before concluding absence",
+            agent_messages_cli(&broader_query),
+            false,
+        ));
+    }
+
+    if next_actions.is_empty() {
+        next_actions.push(agent_guidance_action(
+            100,
+            "answer_from_current_window",
+            "the returned bounded message window has no obvious follow-up maintenance requirement",
+            agent_messages_cli(query),
+            false,
+        ));
+    }
+
+    serde_json::json!({
+        "summary": {
+            "returned_message_count": returned_count,
+            "limit": limit,
+            "has_more": messages.next_cursor.is_some(),
+            "next_cursor": messages.next_cursor,
+            "oldest_received_at": oldest_received_at,
+            "newest_received_at": newest_received_at,
+            "query_is_scoped": query.conversation_id.is_some()
+                || query.sender_wxid.is_some()
+                || query.q.is_some()
+                || query.after.is_some()
+                || query.before.is_some()
+                || query.kind.is_some()
+                || query.direction.is_some(),
+            "missing_attachment_count": missing_attachment_count,
+            "voice": voice_summary,
+            "missing_speaker_display_count": missing_display_count,
+        },
+        "next_actions": next_actions,
+        "agent_notes": [
+            "answer from the returned bounded window unless next_actions indicates a needed follow-up for freshness, pagination, attachments, voice, or identity",
+            "continue_message_page preserves resolved stable ids; prefer it over re-resolving names when paginating",
+            "inspect_attachment_readiness and inspect_voice_readiness are evidence-gathering actions, not automatic proof that data is lost",
+            "warm_chatroom_identity is bounded to the resolved chatroom and avoids broad contact-list polling"
+        ]
+    })
+}
+
+fn agent_guidance_action(
+    priority: u32,
+    action: &str,
+    reason: &str,
+    recommended_cli: Vec<String>,
+    blocks_answer: bool,
+) -> Value {
+    serde_json::json!({
+        "priority": priority,
+        "action": action,
+        "reason": reason,
+        "recommended_cli": recommended_cli,
+        "blocks_answer": blocks_answer,
+    })
+}
+
+fn agent_messages_cli(query: &MessageQuery) -> Vec<String> {
+    let mut args = vec![
+        "gewe-skill".to_string(),
+        "--json".to_string(),
+        "query".to_string(),
+        "messages".to_string(),
+    ];
+    push_cli_arg(
+        &mut args,
+        "--conversation-id",
+        query.conversation_id.as_deref(),
+    );
+    push_cli_arg(&mut args, "--sender-wxid", query.sender_wxid.as_deref());
+    push_cli_arg(&mut args, "--q", query.q.as_deref());
+    push_cli_arg(&mut args, "--kind", query.kind.as_deref());
+    push_cli_arg(&mut args, "--direction", query.direction.as_deref());
+    push_cli_arg(&mut args, "--after", query.after.as_deref());
+    push_cli_arg(&mut args, "--before", query.before.as_deref());
+    push_cli_arg(&mut args, "--cursor", query.cursor.as_deref());
+    if let Some(limit) = query.limit {
+        args.push("--limit".to_string());
+        args.push(limit.to_string());
+    }
+    push_cli_arg(&mut args, "--order", query.order.as_deref());
+    args
+}
+
+fn push_cli_arg(args: &mut Vec<String>, name: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push(name.to_string());
+        args.push(value.to_string());
+    }
+}
+
+fn voice_guidance_summary(voice: Option<&ApiPage<VoiceItem>>) -> Value {
+    let Some(voice) = voice else {
+        return serde_json::json!({
+            "included": false,
+            "voice_count": 0,
+            "issue_count": 0,
+        });
+    };
+    let mut missing_attachment_count = 0usize;
+    let mut asr_pending_count = 0usize;
+    let mut asr_failed_count = 0usize;
+    let mut transcribed_count = 0usize;
+
+    for item in &voice.items {
+        let availability = item.availability.trim().to_ascii_lowercase();
+        let transcript_status = item
+            .transcript
+            .as_ref()
+            .map(|record| record.status.trim().to_ascii_lowercase());
+        if availability == "missing_attachment" || item.attachment.is_none() {
+            missing_attachment_count += 1;
+        } else if transcript_status.as_deref() == Some("completed") || availability == "transcribed"
+        {
+            transcribed_count += 1;
+        } else if transcript_status.as_deref() == Some("failed")
+            || availability == "asr_failed"
+            || availability == "failed"
+        {
+            asr_failed_count += 1;
+        } else {
+            asr_pending_count += 1;
+        }
+    }
+
+    serde_json::json!({
+        "included": true,
+        "voice_count": voice.items.len(),
+        "transcribed_count": transcribed_count,
+        "missing_attachment_count": missing_attachment_count,
+        "asr_pending_count": asr_pending_count,
+        "asr_failed_count": asr_failed_count,
+        "issue_count": missing_attachment_count + asr_pending_count + asr_failed_count,
+    })
+}
+
+fn value_usize_at(value: &Value, path: &[&str]) -> usize {
+    let mut current = value;
+    for segment in path {
+        let Some(next) = current.get(*segment) else {
+            return 0;
+        };
+        current = next;
+    }
+    current
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .or_else(|| {
+            current
+                .as_i64()
+                .and_then(|value| usize::try_from(value).ok())
+        })
+        .unwrap_or(0)
 }
 
 async fn agent_speaker_block(
@@ -3162,6 +3445,83 @@ mod tests {
         assert_eq!(report["summary"]["retryable_asr_failed_count"], 0);
         assert_eq!(report["summary"]["known_unavailable_asr_count"], 1);
         assert_eq!(report["next_actions"][0]["action"], "ready_for_analysis");
+    }
+
+    #[test]
+    fn agent_message_guidance_recommends_followups_for_agent_navigation() {
+        let mut first = test_message("m1", gewe_skill_types::NormalizedKind::Voice);
+        first.received_at = "2026-05-26T01:00:00Z".to_string();
+        let mut second = test_message("m2", gewe_skill_types::NormalizedKind::Text);
+        second.received_at = "2026-05-26T02:00:00Z".to_string();
+        let messages = ApiPage {
+            items: vec![first.clone(), second],
+            next_cursor: Some("2026-05-26T00:59:59Z".to_string()),
+        };
+        let query = MessageQuery {
+            conversation_id: Some("room@chatroom".to_string()),
+            limit: Some(2),
+            order: Some("desc".to_string()),
+            ..MessageQuery::default()
+        };
+        let attachment_block = serde_json::json!({
+            "summary": {
+                "attachment_expected_missing_count": 1
+            }
+        });
+        let voice = ApiPage {
+            items: vec![VoiceItem {
+                message: first,
+                attachment: None,
+                transcript: None,
+                availability: "missing_attachment".to_string(),
+                reason: Some("voice_attachment_not_synced".to_string()),
+            }],
+            next_cursor: None,
+        };
+        let speaker_block = serde_json::json!({
+            "summary": {
+                "missing_effective_display_count": 1
+            }
+        });
+
+        let guidance = agent_message_query_guidance(
+            &query,
+            &messages,
+            &attachment_block,
+            Some(&voice),
+            &speaker_block,
+        );
+
+        assert_eq!(guidance["summary"]["has_more"], true);
+        assert_eq!(guidance["summary"]["missing_attachment_count"], 1);
+        assert_eq!(guidance["summary"]["voice"]["missing_attachment_count"], 1);
+        assert_eq!(
+            guidance["next_actions"][0]["action"],
+            "continue_message_page"
+        );
+        assert_eq!(
+            guidance["next_actions"][0]["recommended_cli"][4],
+            "--conversation-id"
+        );
+        assert_eq!(
+            guidance["next_actions"][0]["recommended_cli"][6],
+            "--cursor"
+        );
+        assert!(guidance["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "inspect_attachment_readiness"));
+        assert!(guidance["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "inspect_voice_readiness"));
+        assert!(guidance["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "warm_chatroom_identity"));
     }
 
     fn test_message(
