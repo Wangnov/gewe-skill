@@ -9,7 +9,7 @@ Cloudflare Workers edge ingest for `gewe-skill`.
 - Persist raw callback JSON and downloaded attachments into R2.
 - Queue attachment downloads through Cloudflare Queues.
 - Keep only short TTL data at the edge; durable memory belongs to `gewe-skill-memory`.
-- Expose admin export endpoints for pull-based sync into `gewe-skill-memory`.
+- Expose admin export endpoints for pull-based snapshot, event, and attachment sync into `gewe-skill-memory`.
 
 ## Secrets
 

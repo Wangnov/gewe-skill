@@ -406,13 +406,18 @@ pub struct ChatroomSystemEvent {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatroomEventWriteRequest {
+    #[serde(default)]
+    pub snapshots: Vec<ChatroomSnapshot>,
+    #[serde(default)]
     pub member_events: Vec<ChatroomMemberEvent>,
+    #[serde(default)]
     pub system_events: Vec<ChatroomSystemEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatroomEventWriteResponse {
     pub ok: bool,
+    pub snapshots: usize,
     pub member_events: usize,
     pub system_events: usize,
 }

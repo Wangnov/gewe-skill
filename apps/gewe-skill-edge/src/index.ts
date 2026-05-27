@@ -332,7 +332,17 @@ async function handleAdmin(request, env, url) {
   if (url.pathname === "/admin/chatroom-snapshots") {
     const limit = clampInt(url.searchParams.get("limit"), 1, 100, 20);
     const chatroomId = url.searchParams.get("chatroom_id");
-    const rows = chatroomId
+    const useCursor = url.searchParams.has("after_id");
+    const afterId = clampInt(url.searchParams.get("after_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const rows = chatroomId && useCursor
+      ? await env.DB.prepare(`
+          SELECT id, received_at, chatroom_id, chatroom_name, chatroom_version, member_count, member_hash, members_json
+          FROM chatroom_snapshots
+          WHERE chatroom_id = ? AND id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(chatroomId, afterId, limit).all()
+      : chatroomId
       ? await env.DB.prepare(`
           SELECT id, received_at, chatroom_id, chatroom_name, chatroom_version, member_count, member_hash, members_json
           FROM chatroom_snapshots
@@ -340,13 +350,23 @@ async function handleAdmin(request, env, url) {
           ORDER BY id DESC
           LIMIT ?
         `).bind(chatroomId, limit).all()
+      : useCursor
+      ? await env.DB.prepare(`
+          SELECT id, received_at, chatroom_id, chatroom_name, chatroom_version, member_count, member_hash, members_json
+          FROM chatroom_snapshots
+          WHERE id > ?
+          ORDER BY id ASC
+          LIMIT ?
+        `).bind(afterId, limit).all()
       : await env.DB.prepare(`
           SELECT id, received_at, chatroom_id, chatroom_name, chatroom_version, member_count, member_hash, members_json
           FROM chatroom_snapshots
           ORDER BY id DESC
           LIMIT ?
         `).bind(limit).all();
-    return json({ ok: true, snapshots: rows.results || [] });
+    const snapshots = rows.results || [];
+    const nextAfterSnapshotId = snapshots.reduce((max, row) => Math.max(max, Number(row.id) || max), afterId);
+    return json({ ok: true, snapshots, next_after_snapshot_id: nextAfterSnapshotId });
   }
 
   if (url.pathname === "/admin/chatroom-events") {

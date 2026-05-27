@@ -14,6 +14,7 @@ ENV_FILE="$CONFIG_DIR/gewe-skill-memory.env"
 SYSTEMD_DIR="${GEWE_SKILL_SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_USER="${GEWE_SKILL_SERVICE_USER:-gewe-skill}"
 SERVICE_GROUP="${GEWE_SKILL_SERVICE_GROUP:-gewe-skill}"
+CLI_LINK="${GEWE_SKILL_CLI_LINK:-/usr/local/bin/gewe-skill}"
 
 usage() {
   cat <<'EOF'
@@ -28,6 +29,7 @@ Environment:
   GEWE_SKILL_SYSTEMD_DIR    systemd unit dir. Default: /etc/systemd/system
   GEWE_SKILL_SERVICE_USER   Service user. Default: gewe-skill
   GEWE_SKILL_SERVICE_GROUP  Service group. Default: gewe-skill
+  GEWE_SKILL_CLI_LINK       Optional CLI symlink for Agent users. Default: /usr/local/bin/gewe-skill
 EOF
 }
 
@@ -90,7 +92,9 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --gid "$SERVICE_GROUP" --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$INSTALL_DIR" "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR"
+install -d -o root -g root -m 0755 "$INSTALL_DIR" "$BIN_DIR"
+install -d -o root -g "$SERVICE_GROUP" -m 0750 "$CONFIG_DIR"
+install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$DATA_DIR"
 if [[ ! -f "$ENV_FILE" ]]; then
   install -o root -g "$SERVICE_GROUP" -m 0640 "$DEPLOY_DIR/gewe-skill-memory.env.example" "$ENV_FILE"
   echo "created example env file: $ENV_FILE" >&2
@@ -130,6 +134,10 @@ fi
 
 install -o root -g root -m 0755 "$cli_bin" "$BIN_DIR/gewe-skill"
 install -o root -g root -m 0755 "$memory_bin" "$BIN_DIR/gewe-skill-memory"
+if [[ -n "$CLI_LINK" ]]; then
+  install -d -o root -g root -m 0755 "$(dirname "$CLI_LINK")"
+  ln -sfn "$BIN_DIR/gewe-skill" "$CLI_LINK"
+fi
 
 unit_files=(
   gewe-skill-memory.service

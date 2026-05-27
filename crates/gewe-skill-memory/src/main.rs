@@ -659,9 +659,14 @@ async fn write_chatroom_events(
     State(state): State<SharedState>,
     Json(request): Json<ChatroomEventWriteRequest>,
 ) -> Result<Json<ChatroomEventWriteResponse>, ApiError> {
+    let snapshots = request.snapshots.len();
     let member_events = request.member_events.len();
     let system_events = request.system_events.len();
     let mut tx = state.db.begin().await?;
+    for snapshot in &request.snapshots {
+        let message_key = edge_snapshot_message_key(snapshot);
+        insert_chatroom_snapshot(&mut tx, &message_key, snapshot).await?;
+    }
     for event in &request.member_events {
         insert_chatroom_member_event(&mut tx, event).await?;
     }
@@ -672,9 +677,17 @@ async fn write_chatroom_events(
 
     Ok(Json(ChatroomEventWriteResponse {
         ok: true,
+        snapshots,
         member_events,
         system_events,
     }))
+}
+
+fn edge_snapshot_message_key(snapshot: &ChatroomSnapshot) -> String {
+    format!(
+        "edge-chatroom-snapshot:{}:{}:{}",
+        snapshot.chatroom_id, snapshot.received_at, snapshot.member_hash
+    )
 }
 
 async fn latest_chatroom_snapshot(
@@ -3150,9 +3163,29 @@ async fn insert_chatroom_snapshot(
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
+        DELETE FROM chatroom_snapshots
+        WHERE chatroom_id = ?
+          AND received_at = ?
+          AND member_hash = ?
+          AND message_key != ?
+        "#,
+    )
+    .bind(&snapshot.chatroom_id)
+    .bind(&snapshot.received_at)
+    .bind(&snapshot.member_hash)
+    .bind(message_key)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
         INSERT INTO chatroom_snapshots (message_key, chatroom_id, chatroom_name, member_count, member_hash, received_at, snapshot_json)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(message_key) DO UPDATE SET snapshot_json = excluded.snapshot_json
+        ON CONFLICT(message_key) DO UPDATE SET
+          chatroom_name = excluded.chatroom_name,
+          member_count = excluded.member_count,
+          member_hash = excluded.member_hash,
+          received_at = excluded.received_at,
+          snapshot_json = excluded.snapshot_json
         "#,
     )
     .bind(message_key)
