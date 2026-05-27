@@ -178,6 +178,14 @@ Start with a read-only status check before trusted ingest, sync, or repair workf
 gewe-skill --json maintenance status
 ```
 
+Before broad media, file, or voice analysis, prefer the Agent-oriented readiness report:
+
+```bash
+gewe-skill --json maintenance data-health --with-edge-queue
+```
+
+If it reports `stale_active_attachment_count` greater than zero, run the recommended bounded `sync attachment-requeue` before concluding that the queue is merely waiting. A healthy queue may have short-lived active jobs, but old pending, processing, or overdue retry-scheduled jobs are treated as stale maintenance items.
+
 Use the status output to decide whether the problem is missing callbacks, missing synced attachments, missing voice transcripts, stale identity memory, or chatroom event coverage.
 
 If chatroom event answers still show raw wxids instead of names, run a bounded identity backfill over recent chatroom events:

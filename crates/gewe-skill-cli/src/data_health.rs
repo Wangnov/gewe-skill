@@ -33,6 +33,14 @@ pub(crate) fn maintenance_data_health_report(
         .as_ref()
         .map(|value| value_u64_at(value, &["active_count"]))
         .unwrap_or(0);
+    let stale_active_attachment_count = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["stale_active_count"]))
+        .unwrap_or(0);
+    let stale_active_after_minutes = attachment_queue
+        .as_ref()
+        .map(|value| value_u64_at(value, &["stale_active_after_minutes"]))
+        .unwrap_or(0);
     let non_retryable_terminal_count = attachment_queue
         .as_ref()
         .map(|value| value_u64_at(value, &["non_retryable_terminal_count"]))
@@ -95,6 +103,15 @@ pub(crate) fn maintenance_data_health_report(
             true,
         ));
     }
+    if stale_active_attachment_count > 0 {
+        next_actions.push(maintenance_action(
+            35,
+            "requeue_stale_active_attachment_jobs",
+            vec!["sync", "attachment-requeue"],
+            "some active edge attachment jobs appear stale and should be requeued before media analysis",
+            true,
+        ));
+    }
     if completed_not_ingested_count > 0 {
         next_actions.push(maintenance_action(
             40,
@@ -104,7 +121,7 @@ pub(crate) fn maintenance_data_health_report(
             true,
         ));
     }
-    if active_attachment_count > 0 {
+    if active_attachment_count > stale_active_attachment_count {
         next_actions.push(maintenance_action(
             50,
             "wait_or_requeue_active_attachment_jobs",
@@ -162,6 +179,7 @@ pub(crate) fn maintenance_data_health_report(
     let ready_for_analysis = blocking_action_count == 0 && edge_queue_checked;
     let overall_health = if duplicate_job_key_count > 0
         || retryable_terminal_count > 0
+        || stale_active_attachment_count > 0
         || retryable_asr_failed_count > 0
     {
         "needs_attention"
@@ -200,6 +218,8 @@ pub(crate) fn maintenance_data_health_report(
             "duplicate_message_key_count": duplicate_message_key_count,
             "multi_job_message_key_count": duplicate_message_key_count,
             "active_attachment_count": active_attachment_count,
+            "stale_active_attachment_count": stale_active_attachment_count,
+            "stale_active_after_minutes": stale_active_after_minutes,
             "voice_issue_count": voice_issue_count,
             "missing_voice_attachment_count": missing_attachment_count,
             "retryable_missing_voice_attachment_count": retryable_missing_attachment_count,
@@ -221,6 +241,7 @@ pub(crate) fn maintenance_data_health_report(
             "run maintenance data-health before broad media or voice analysis when freshness matters",
             "ready_for_analysis is high-confidence only when --with-edge-queue was used",
             "next_actions are ordered so attachment sync and queue safety are handled before ASR",
+            "stale active attachment jobs are treated as attention items because a healthy queue should not keep old pending, processing, or overdue retry_scheduled jobs forever",
             "multi_job_message_key_count can be normal for attachment variants such as image hd/normal/thumb and does not block analysis by itself",
             "non-retryable unavailable or purged media may still leave known gaps even when analysis can continue",
             "non-retryable ASR decoder failures are known transcript gaps and do not block broader analysis"

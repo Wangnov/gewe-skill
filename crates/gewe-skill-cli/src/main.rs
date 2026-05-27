@@ -3461,6 +3461,39 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_data_health_blocks_stale_active_attachment_jobs() {
+        let report = maintenance_data_health_report(
+            serde_json::json!({"ok": true}),
+            Some(serde_json::json!({
+                "queue_health": "needs_attention",
+                "completed_not_ingested_count": 0,
+                "retryable_terminal_count": 0,
+                "stale_active_count": 1,
+                "stale_active_after_minutes": 30,
+                "non_retryable_terminal_count": 0,
+                "duplicate_job_key_count": 0,
+                "duplicate_message_key_count": 0,
+                "active_count": 1,
+            })),
+            serde_json::json!({
+                "issue_count": 0,
+                "by_issue_type": {}
+            }),
+            true,
+            200,
+            1000,
+        );
+
+        assert_eq!(report["overall_health"], "needs_attention");
+        assert_eq!(report["ready_for_analysis"], false);
+        assert_eq!(report["summary"]["stale_active_attachment_count"], 1);
+        assert_eq!(
+            report["next_actions"][0]["action"],
+            "requeue_stale_active_attachment_jobs"
+        );
+    }
+
+    #[test]
     fn maintenance_data_health_marks_partial_without_edge_queue() {
         let report = maintenance_data_health_report(
             serde_json::json!({"ok": true}),

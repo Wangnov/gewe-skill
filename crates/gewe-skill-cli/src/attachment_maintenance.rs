@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,12 +51,17 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
     let mut retryable_terminal_jobs = Vec::<Value>::new();
     let mut non_retryable_terminal_jobs = Vec::<Value>::new();
     let mut skipped_not_file_jobs = Vec::<Value>::new();
+    let mut stale_active_jobs = Vec::<Value>::new();
+    let stale_active_after_minutes = stale_active_after_minutes();
+    let now = Utc::now();
+    let mut stale_active_count = 0u64;
 
     for job in &jobs {
         let status = string_field(job, "status").unwrap_or_else(|| "unknown".to_string());
         let asset_type = string_field(job, "asset_type").unwrap_or_else(|| "unknown".to_string());
         let job_key = string_field(job, "job_key");
         let message_key = string_field(job, "message_key");
+        let active_age_minutes = active_job_age_minutes(job, &status, now);
 
         statuses_seen.insert(status.clone());
         asset_types_seen.insert(asset_type.clone());
@@ -120,6 +126,24 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
                 &status,
             ));
         }
+        if is_active_status(&status)
+            && active_age_minutes
+                .map(|age_minutes| age_minutes >= stale_active_after_minutes)
+                .unwrap_or(false)
+        {
+            stale_active_count += 1;
+            if stale_active_jobs.len() < 20 {
+                stale_active_jobs.push(stale_active_job_sample(
+                    job,
+                    job_key.as_deref(),
+                    message_key.as_deref(),
+                    &asset_type,
+                    &status,
+                    active_age_minutes,
+                    stale_active_after_minutes,
+                ));
+            }
+        }
     }
 
     for (key, count) in job_keys {
@@ -148,7 +172,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
 
     let completed_memory_checked = memory_index.is_some();
 
-    let health = if failed_count > 0 || duplicate_job_key_count > 0 {
+    let health = if failed_count > 0 || duplicate_job_key_count > 0 || stale_active_count > 0 {
         "needs_attention"
     } else if active_count > 0 {
         "in_progress"
@@ -171,6 +195,8 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
         "by_asset_status": by_asset_status,
         "completed_count": completed_count,
         "active_count": active_count,
+        "stale_active_count": stale_active_count,
+        "stale_active_after_minutes": stale_active_after_minutes,
         "retryable_terminal_count": failed_count,
         "non_retryable_terminal_count": non_retryable_terminal_count,
         "skipped_not_file_count": skipped_not_file_count,
@@ -181,6 +207,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
         "retryable_terminal_jobs": retryable_terminal_jobs,
         "non_retryable_terminal_jobs": non_retryable_terminal_jobs,
         "skipped_not_file_jobs": skipped_not_file_jobs,
+        "stale_active_jobs": stale_active_jobs,
         "duplicate_job_key_count": duplicate_job_key_count,
         "duplicate_message_key_count": duplicate_message_key_count,
         "duplicate_job_keys": duplicate_job_keys,
@@ -188,6 +215,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
         "next_actions": next_actions(
             completed_count,
             active_count,
+            stale_active_count,
             failed_count,
             non_retryable_terminal_count,
             duplicate_job_key_count,
@@ -198,6 +226,7 @@ fn queue_health_inner(edge_jobs: &Value, memory_attachments: Option<&Value>) -> 
             "completed_memory_checked means completed edge jobs were compared against memory attachment records for the inspected job keys",
             "completed_not_ingested_count means edge has completed media that was not found in memory yet and should be synced before analysis",
             "failed jobs are retryable terminal jobs, but retry them intentionally instead of looping forever",
+            "stale active jobs are pending, processing, or retry_scheduled jobs whose active timestamp is older than stale_active_after_minutes",
             "unavailable and purged jobs are non-retryable terminal evidence; explain them to the user unless explicitly asked to retry upstream",
             "skipped_not_file jobs are evidence that the source message did not contain a downloadable attachment for this queue type",
             "duplicate job keys indicate queue dedupe drift and should be investigated before bulk retrying"
@@ -308,6 +337,36 @@ fn job_sample(
     sample
 }
 
+fn stale_active_job_sample(
+    job: &Value,
+    job_key: Option<&str>,
+    message_key: Option<&str>,
+    asset_type: &str,
+    status: &str,
+    active_age_minutes: Option<i64>,
+    stale_active_after_minutes: i64,
+) -> Value {
+    let mut sample = job_sample(job, job_key, message_key, asset_type, status);
+    if let Some(object) = sample.as_object_mut() {
+        object.insert(
+            "active_age_minutes".to_string(),
+            active_age_minutes.map_or(Value::Null, Value::from),
+        );
+        object.insert(
+            "active_reference_at".to_string(),
+            active_reference_timestamp(job, status).map_or(Value::Null, Value::String),
+        );
+        object.insert(
+            "stale_active_after_minutes".to_string(),
+            Value::from(stale_active_after_minutes),
+        );
+        if let Some(next_retry_at) = string_field(job, "next_retry_at") {
+            object.insert("next_retry_at".to_string(), Value::String(next_retry_at));
+        }
+    }
+    sample
+}
+
 fn status_explanation(status: &str) -> &'static str {
     match status {
         STATUS_FAILED => {
@@ -328,6 +387,43 @@ fn status_explanation(status: &str) -> &'static str {
         STATUS_COMPLETED => "completed job; confirm it exists in memory before analysis",
         _ => "unknown attachment queue state; inspect the raw job before taking repair action",
     }
+}
+
+fn is_active_status(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_PENDING | STATUS_PROCESSING | STATUS_RETRY_SCHEDULED
+    )
+}
+
+fn active_job_age_minutes(job: &Value, status: &str, now: DateTime<Utc>) -> Option<i64> {
+    let timestamp = active_reference_timestamp(job, status)?;
+    timestamp_age_minutes(&timestamp, now)
+}
+
+fn active_reference_timestamp(job: &Value, status: &str) -> Option<String> {
+    if status == STATUS_RETRY_SCHEDULED {
+        string_field(job, "next_retry_at")
+            .or_else(|| string_field(job, "updated_at"))
+            .or_else(|| string_field(job, "created_at"))
+    } else {
+        string_field(job, "updated_at")
+            .or_else(|| string_field(job, "created_at"))
+            .or_else(|| string_field(job, "next_retry_at"))
+    }
+}
+
+fn timestamp_age_minutes(value: &str, now: DateTime<Utc>) -> Option<i64> {
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    Some((now - parsed.with_timezone(&Utc)).num_minutes().max(0))
+}
+
+fn stale_active_after_minutes() -> i64 {
+    std::env::var("GEWE_SKILL_ATTACHMENT_STALE_ACTIVE_AFTER_MINUTES")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 1_440)
 }
 
 fn last_error_summary(job: &Value) -> Option<String> {
@@ -359,6 +455,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 fn next_actions(
     completed_count: u64,
     active_count: u64,
+    stale_active_count: u64,
     failed_count: u64,
     non_retryable_terminal_count: u64,
     duplicate_job_key_count: u64,
@@ -383,7 +480,16 @@ fn next_actions(
         }));
     }
 
-    if active_count > 0 {
+    if stale_active_count > 0 {
+        actions.push(json!({
+            "action": "requeue_stale_active_jobs",
+            "priority": "high",
+            "recommended_cli": ["sync", "attachment-requeue"],
+            "reason": "some pending, processing, or retry_scheduled jobs are older than the stale active threshold"
+        }));
+    }
+
+    if active_count > stale_active_count {
         actions.push(json!({
             "action": "wait_or_requeue_active_jobs",
             "priority": "normal",
@@ -459,6 +565,60 @@ mod tests {
             .unwrap()
             .iter()
             .any(|action| action["action"] == "retry_failed_jobs_intentionally"));
+    }
+
+    #[test]
+    fn flags_stale_active_jobs_as_attention() {
+        let input = json!({
+            "jobs": [
+                {
+                    "job_key": "stale-pending",
+                    "message_key": "m1",
+                    "asset_type": "voice",
+                    "status": "pending",
+                    "updated_at": "2000-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let report = queue_health(&input);
+
+        assert_eq!(report["queue_health"], "needs_attention");
+        assert_eq!(report["active_count"], 1);
+        assert_eq!(report["stale_active_count"], 1);
+        assert_eq!(report["stale_active_jobs"][0]["job_key"], "stale-pending");
+        assert!(report["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "requeue_stale_active_jobs"));
+    }
+
+    #[test]
+    fn future_retry_scheduled_job_is_active_but_not_stale() {
+        let input = json!({
+            "jobs": [
+                {
+                    "job_key": "future-retry",
+                    "message_key": "m1",
+                    "asset_type": "image",
+                    "status": "retry_scheduled",
+                    "updated_at": "2000-01-01T00:00:00Z",
+                    "next_retry_at": "2999-01-01T00:00:00Z"
+                }
+            ]
+        });
+
+        let report = queue_health(&input);
+
+        assert_eq!(report["queue_health"], "in_progress");
+        assert_eq!(report["active_count"], 1);
+        assert_eq!(report["stale_active_count"], 0);
+        assert!(report["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "wait_or_requeue_active_jobs"));
     }
 
     #[test]

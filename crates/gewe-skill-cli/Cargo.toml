@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+chrono.workspace = true
 gewe-skill-client = { path = "../gewe-skill-client" }
 gewe-skill-core = { path = "../gewe-skill-core" }
 gewe-skill-types = { path = "../gewe-skill-types" }

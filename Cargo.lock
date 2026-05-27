@@ -596,6 +596,7 @@ dependencies = [
 name = "gewe-skill-cli"
 version = "0.1.43"
 dependencies = [
+ "chrono",
  "clap",
  "gewe-skill-client",
  "gewe-skill-core",
