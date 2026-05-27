@@ -684,6 +684,17 @@ enum MaintenanceCommand {
         #[arg(long, default_value_t = 1000)]
         edge_queue_limit: u32,
     },
+    /// Check recent speaker identity memory without broad contact polling.
+    IdentityHealth {
+        #[command(flatten)]
+        filters: MessageFilterArgs,
+        /// Maximum unique speaker scopes to inspect from the returned message window.
+        #[arg(long, default_value_t = 100)]
+        max_speakers: usize,
+        /// Include compact per-speaker profile details in the output.
+        #[arg(long, default_value_t = false)]
+        include_profiles: bool,
+    },
     /// Inspect edge attachment queue health across all asset types.
     AttachmentQueueHealth {
         /// Edge worker base URL.
@@ -1351,6 +1362,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     voice_limit,
                     edge_queue_limit,
                 ))?;
+            }
+            MaintenanceCommand::IdentityHealth {
+                filters,
+                max_speakers,
+                include_profiles,
+            } => {
+                print_json(
+                    maintenance_identity_health(
+                        &client,
+                        message_query(None, filters),
+                        max_speakers,
+                        include_profiles,
+                    )
+                    .await?,
+                )?;
             }
             MaintenanceCommand::AttachmentQueueHealth {
                 edge_url,
@@ -2142,6 +2168,314 @@ fn agent_speaker_profile_value(profile: &IdentityProfileResponse) -> Value {
         "contact": contact,
         "chatroom_member": chatroom_member,
         "aliases": profile.aliases.clone(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct IdentitySpeakerScope {
+    chatroom_id: Option<String>,
+    wxid: String,
+}
+
+#[derive(Debug, Clone)]
+struct IdentityProfileLookup {
+    scope: IdentitySpeakerScope,
+    profile: Option<IdentityProfileResponse>,
+    error: Option<String>,
+}
+
+async fn maintenance_identity_health(
+    client: &GeweSkillClient,
+    query: MessageQuery,
+    max_speakers: usize,
+    include_profiles: bool,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let max_speakers = max_speakers.clamp(1, 500);
+    let messages = client.messages(&query).await?;
+    let scopes = collect_message_speaker_scopes(
+        &messages.items,
+        query.conversation_id.as_deref(),
+        max_speakers,
+    );
+    let mut lookups = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        match client
+            .identity_profile(&scope.wxid, scope.chatroom_id.as_deref())
+            .await
+        {
+            Ok(profile) => lookups.push(IdentityProfileLookup {
+                scope,
+                profile: Some(profile),
+                error: None,
+            }),
+            Err(error) => lookups.push(IdentityProfileLookup {
+                scope,
+                profile: None,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(identity_health_report_from_lookups(
+        &query,
+        &messages,
+        lookups,
+        max_speakers,
+        include_profiles,
+    ))
+}
+
+fn collect_message_speaker_scopes(
+    messages: &[NormalizedMessage],
+    fallback_conversation_id: Option<&str>,
+    max_speakers: usize,
+) -> Vec<IdentitySpeakerScope> {
+    let mut scopes = std::collections::BTreeSet::new();
+    for message in messages {
+        let Some(wxid) = message.sender_wxid.as_deref().map(str::trim) else {
+            continue;
+        };
+        if wxid.is_empty() || wxid.ends_with("@chatroom") {
+            continue;
+        }
+        let chatroom_id = message
+            .conversation_id
+            .as_deref()
+            .or(fallback_conversation_id)
+            .filter(|conversation_id| conversation_id.ends_with("@chatroom"))
+            .map(ToString::to_string);
+        scopes.insert(IdentitySpeakerScope {
+            chatroom_id,
+            wxid: wxid.to_string(),
+        });
+        if scopes.len() >= max_speakers {
+            break;
+        }
+    }
+    scopes.into_iter().collect()
+}
+
+fn identity_health_report_from_lookups(
+    query: &MessageQuery,
+    messages: &ApiPage<NormalizedMessage>,
+    lookups: Vec<IdentityProfileLookup>,
+    max_speakers: usize,
+    include_profiles: bool,
+) -> Value {
+    let speaker_scope_count = lookups.len();
+    let mut issues = Vec::<Value>::new();
+    let mut profiles = Vec::<Value>::new();
+    let mut lookup_errors = Vec::<Value>::new();
+    let mut chatroom_issue_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut direct_issue_wxids = Vec::<String>::new();
+    let mut missing_effective_display_count = 0usize;
+    let mut refresh_recommended_count = 0usize;
+    let mut contact_missing_count = 0usize;
+    let mut contact_stale_count = 0usize;
+    let mut chatroom_member_missing_count = 0usize;
+    let mut chatroom_member_stale_count = 0usize;
+    let mut chatroom_member_not_current_count = 0usize;
+
+    for lookup in lookups {
+        let scope = lookup.scope;
+        if let Some(error) = lookup.error {
+            lookup_errors.push(serde_json::json!({
+                "wxid": scope.wxid,
+                "chatroom_id": scope.chatroom_id,
+                "error": error,
+            }));
+            continue;
+        }
+        let Some(profile) = lookup.profile else {
+            continue;
+        };
+        let missing_effective_display = profile
+            .effective_display_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+            || profile.display_name_source == "unresolved";
+        if missing_effective_display {
+            missing_effective_display_count += 1;
+        }
+        if profile.memory_status.refresh_recommended {
+            refresh_recommended_count += 1;
+        }
+        if !profile.memory_status.contact.present {
+            contact_missing_count += 1;
+        }
+        if profile.memory_status.contact.stale {
+            contact_stale_count += 1;
+        }
+        if let Some(member_status) = profile.memory_status.chatroom_member.as_ref() {
+            if !member_status.present {
+                chatroom_member_missing_count += 1;
+            }
+            if member_status.stale {
+                chatroom_member_stale_count += 1;
+            }
+        }
+        let chatroom_member_not_current = profile
+            .chatroom_member
+            .as_ref()
+            .is_some_and(|member| !member.is_current);
+        if chatroom_member_not_current {
+            chatroom_member_not_current_count += 1;
+        }
+
+        let has_issue = missing_effective_display
+            || profile.memory_status.refresh_recommended
+            || chatroom_member_not_current;
+        if has_issue {
+            if let Some(chatroom_id) = scope.chatroom_id.as_ref() {
+                *chatroom_issue_counts
+                    .entry(chatroom_id.clone())
+                    .or_default() += 1;
+            } else if !direct_issue_wxids.iter().any(|item| item == &scope.wxid) {
+                direct_issue_wxids.push(scope.wxid.clone());
+            }
+            issues.push(serde_json::json!({
+                "wxid": scope.wxid,
+                "chatroom_id": scope.chatroom_id,
+                "effective_display_name": profile.effective_display_name.clone(),
+                "display_name_source": profile.display_name_source.clone(),
+                "memory_reasons": profile.memory_status.reasons.clone(),
+                "refresh_recommended": profile.memory_status.refresh_recommended,
+                "missing_effective_display": missing_effective_display,
+                "chatroom_member_not_current": chatroom_member_not_current,
+            }));
+        }
+        if include_profiles {
+            profiles.push(agent_speaker_profile_value(&profile));
+        }
+    }
+
+    let mut next_actions = Vec::<Value>::new();
+    for (chatroom_id, issue_count) in chatroom_issue_counts.iter().take(5) {
+        next_actions.push(serde_json::json!({
+            "priority": 20,
+            "action": "warm_chatroom_identity",
+            "reason": "recent speakers in this chatroom have missing, stale, not-current, or unresolved identity memory",
+            "chatroom_id": chatroom_id,
+            "issue_count": issue_count,
+            "recommended_cli": [
+                "gewe-skill",
+                "--json",
+                "identity",
+                "warm",
+                "--chatroom-id",
+                chatroom_id,
+                "--recent-messages",
+                "200",
+                "--max-contacts",
+                "50"
+            ],
+            "blocks_name_sensitive_analysis": true
+        }));
+    }
+    if !direct_issue_wxids.is_empty() {
+        let wxids = direct_issue_wxids
+            .iter()
+            .take(50)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        next_actions.push(serde_json::json!({
+            "priority": 30,
+            "action": "refresh_contact_identity",
+            "reason": "recent direct or unscoped speakers have missing, stale, or unresolved contact identity memory",
+            "wxid_count": direct_issue_wxids.len(),
+            "recommended_cli": [
+                "gewe-skill",
+                "--json",
+                "identity",
+                "refresh",
+                "--wxids",
+                wxids
+            ],
+            "blocks_name_sensitive_analysis": true
+        }));
+    }
+    if !lookup_errors.is_empty() {
+        next_actions.push(serde_json::json!({
+            "priority": 40,
+            "action": "retry_identity_health",
+            "reason": "some local identity profile lookups failed",
+            "recommended_cli": [
+                "gewe-skill",
+                "--json",
+                "maintenance",
+                "identity-health"
+            ],
+            "blocks_name_sensitive_analysis": false
+        }));
+    }
+    if next_actions.is_empty() {
+        next_actions.push(serde_json::json!({
+            "priority": 100,
+            "action": "ready_identity_memory",
+            "reason": "recent speaker identity memory is present enough for name-sensitive analysis in this bounded window",
+            "recommended_cli": [
+                "gewe-skill",
+                "--json",
+                "query",
+                "messages"
+            ],
+            "blocks_name_sensitive_analysis": false
+        }));
+    }
+
+    let blocking_action_count = next_actions
+        .iter()
+        .filter(|action| {
+            action
+                .get("blocks_name_sensitive_analysis")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let ready_for_name_sensitive_analysis = blocking_action_count == 0 && lookup_errors.is_empty();
+    let overall_health = if blocking_action_count > 0 {
+        "needs_identity_warm"
+    } else if !lookup_errors.is_empty() {
+        "partial"
+    } else {
+        "healthy"
+    };
+
+    serde_json::json!({
+        "ok": true,
+        "query_mode": "maintenance_identity_health",
+        "overall_health": overall_health,
+        "ready_for_name_sensitive_analysis": ready_for_name_sensitive_analysis,
+        "summary": {
+            "message_count": messages.items.len(),
+            "has_more": messages.next_cursor.is_some(),
+            "next_cursor": messages.next_cursor,
+            "speaker_scope_count": speaker_scope_count,
+            "max_speakers": max_speakers,
+            "issue_count": issues.len(),
+            "lookup_error_count": lookup_errors.len(),
+            "missing_effective_display_count": missing_effective_display_count,
+            "refresh_recommended_count": refresh_recommended_count,
+            "contact_missing_count": contact_missing_count,
+            "contact_stale_count": contact_stale_count,
+            "chatroom_member_missing_count": chatroom_member_missing_count,
+            "chatroom_member_stale_count": chatroom_member_stale_count,
+            "chatroom_member_not_current_count": chatroom_member_not_current_count,
+            "blocking_action_count": blocking_action_count,
+        },
+        "message_query": query,
+        "issues": issues,
+        "lookup_errors": lookup_errors,
+        "profiles": profiles,
+        "next_actions": next_actions,
+        "agent_notes": [
+            "identity-health only reads local messages and local identity profiles; it does not poll the full contact list",
+            "for chatroom-scoped issues, prefer the recommended bounded identity warm command instead of full identity refresh",
+            "ready_for_name_sensitive_analysis means recent speaker names are sufficiently explainable in this bounded window",
+            "identity issues do not block message reading, but they do block confident name-sensitive conclusions"
+        ]
     })
 }
 
@@ -3357,6 +3691,50 @@ mod tests {
         }
     }
 
+    fn test_identity_profile(
+        wxid: &str,
+        chatroom_id: Option<&str>,
+        refresh_recommended: bool,
+    ) -> IdentityProfileResponse {
+        IdentityProfileResponse {
+            entity_id: wxid.to_string(),
+            chatroom_id: chatroom_id.map(ToString::to_string),
+            effective_display_name: Some("测试成员".to_string()),
+            display_name_source: "chatroom_display_name".to_string(),
+            display_name_resolution: gewe_skill_types::IdentityDisplayNameResolution {
+                selected_source: "chatroom_display_name".to_string(),
+                selected_value: Some("测试成员".to_string()),
+                candidates: vec![gewe_skill_types::IdentityDisplayNameCandidate {
+                    source: "chatroom_display_name".to_string(),
+                    value: Some("测试成员".to_string()),
+                    selected: true,
+                }],
+            },
+            memory_status: test_identity_memory_status(refresh_recommended),
+            contact: Some(gewe_skill_types::IdentityContactProfile {
+                wxid: wxid.to_string(),
+                nickname: Some("测试昵称".to_string()),
+                remark: None,
+                alias: None,
+                raw: None,
+                last_seen_at: Some("2026-05-26T00:00:00Z".to_string()),
+                updated_at: Some("2026-05-26T00:00:00Z".to_string()),
+            }),
+            chatroom_member: chatroom_id.map(|chatroom_id| {
+                gewe_skill_types::IdentityChatroomMemberProfile {
+                    chatroom_id: chatroom_id.to_string(),
+                    member_wxid: wxid.to_string(),
+                    display_name: Some("测试成员".to_string()),
+                    nickname: Some("测试昵称".to_string()),
+                    is_current: true,
+                    raw: None,
+                    last_seen_at: Some("2026-05-27T00:00:00Z".to_string()),
+                }
+            }),
+            aliases: Vec::new(),
+        }
+    }
+
     #[test]
     fn attachment_cursor_stops_before_first_failed_item() {
         let cursor = attachment_sync_cursor_after_batch(
@@ -3464,6 +3842,76 @@ mod tests {
         let wxids = collect_message_speaker_wxids(&[first, second, duplicate, missing]);
 
         assert_eq!(wxids, vec!["wxid_a".to_string(), "wxid_b".to_string()]);
+    }
+
+    #[test]
+    fn collect_message_speaker_scopes_preserves_chatroom_scope() {
+        let mut first = test_message("m1", gewe_skill_types::NormalizedKind::Text);
+        first.sender_wxid = Some("wxid_a".to_string());
+        first.conversation_id = Some("room_a@chatroom".to_string());
+        let mut second = test_message("m2", gewe_skill_types::NormalizedKind::Text);
+        second.sender_wxid = Some("wxid_a".to_string());
+        second.conversation_id = Some("room_b@chatroom".to_string());
+        let mut duplicate = test_message("m3", gewe_skill_types::NormalizedKind::Text);
+        duplicate.sender_wxid = Some("wxid_a".to_string());
+        duplicate.conversation_id = Some("room_a@chatroom".to_string());
+
+        let scopes = collect_message_speaker_scopes(&[first, second, duplicate], None, 10);
+
+        assert_eq!(scopes.len(), 2);
+        assert!(scopes.iter().any(|scope| {
+            scope.wxid == "wxid_a" && scope.chatroom_id.as_deref() == Some("room_a@chatroom")
+        }));
+        assert!(scopes.iter().any(|scope| {
+            scope.wxid == "wxid_a" && scope.chatroom_id.as_deref() == Some("room_b@chatroom")
+        }));
+    }
+
+    #[test]
+    fn identity_health_recommends_bounded_chatroom_warm_for_stale_speakers() {
+        let mut message = test_message("m1", gewe_skill_types::NormalizedKind::Text);
+        message.sender_wxid = Some("wxid_a".to_string());
+        message.conversation_id = Some("room@chatroom".to_string());
+        let messages = ApiPage {
+            items: vec![message],
+            next_cursor: None,
+        };
+        let query = MessageQuery {
+            conversation_id: Some("room@chatroom".to_string()),
+            limit: Some(50),
+            order: Some("desc".to_string()),
+            ..MessageQuery::default()
+        };
+        let report = identity_health_report_from_lookups(
+            &query,
+            &messages,
+            vec![IdentityProfileLookup {
+                scope: IdentitySpeakerScope {
+                    chatroom_id: Some("room@chatroom".to_string()),
+                    wxid: "wxid_a".to_string(),
+                },
+                profile: Some(test_identity_profile("wxid_a", Some("room@chatroom"), true)),
+                error: None,
+            }],
+            100,
+            false,
+        );
+
+        assert_eq!(report["overall_health"], "needs_identity_warm");
+        assert_eq!(report["ready_for_name_sensitive_analysis"], false);
+        assert_eq!(report["summary"]["refresh_recommended_count"], 1);
+        assert_eq!(
+            report["next_actions"][0]["action"],
+            "warm_chatroom_identity"
+        );
+        assert_eq!(
+            report["next_actions"][0]["recommended_cli"][4],
+            "--chatroom-id"
+        );
+        assert_eq!(
+            report["next_actions"][0]["recommended_cli"][5],
+            "room@chatroom"
+        );
     }
 
     #[test]

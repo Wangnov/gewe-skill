@@ -188,6 +188,14 @@ If it reports `stale_active_attachment_count` greater than zero, run the recomme
 
 Use the status output to decide whether the problem is missing callbacks, missing synced attachments, missing voice transcripts, stale identity memory, or chatroom event coverage.
 
+Before name-sensitive analysis over recent speakers, use the bounded identity health report. It reads local message/profile memory only and does not poll the full contact list:
+
+```bash
+gewe-skill --json maintenance identity-health --conversation-id '<chatroom_id>' --limit 100
+```
+
+If it returns `overall_health=needs_identity_warm`, run the recommended `identity warm` command for the affected chatroom before confidently explaining current remarks, group cards, nicknames, joins/leaves, or who said what. This keeps refresh scoped to the chatroom and recent active speakers.
+
 If chatroom event answers still show raw wxids instead of names, run a bounded identity backfill over recent chatroom events:
 
 ```bash
