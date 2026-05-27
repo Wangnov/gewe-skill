@@ -3038,11 +3038,12 @@ async fn repair_edge_attachment_queue(
         tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     }
 
+    let sync_after_job_id = read_cursor(&cursor_file);
     let sync = sync_edge_attachments(
         client,
         edge_url,
         admin_token,
-        None,
+        sync_after_job_id,
         sync_limit,
         cursor_file,
         attachment_dir,
@@ -3077,12 +3078,14 @@ async fn repair_edge_attachment_queue(
         "before_queue_health": before_queue_health,
         "backfill": backfill,
         "requeue": requeue,
+        "sync_after_job_id": sync_after_job_id,
         "sync": sync,
         "after": after,
         "after_queue_health": after_queue_health,
         "agent_hints": [
             "attachment-repair backfills missing edge jobs, requeues ready jobs, then pulls completed files into memory",
             "asset_type=all covers image, voice, video, emoji, and file jobs",
+            "attachment-repair sync starts from the current attachment cursor so fresh completed jobs are not hidden behind the overlap window",
             "after_queue_health is the authoritative repair outcome summary for Agent follow-up decisions",
             "if backfill queued jobs but sync wrote zero files, run attachment-repair again after the edge queue finishes processing",
             "use sync attachment-queue to inspect failed, unavailable, pending, retry_scheduled, and completed jobs before retrying terminal failures"
