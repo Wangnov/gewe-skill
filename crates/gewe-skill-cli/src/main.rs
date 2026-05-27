@@ -1605,6 +1605,8 @@ async fn agent_query_messages(
         voice.as_ref(),
         &speaker_block,
     );
+    let resolution_summary =
+        agent_query_resolution_summary(&conversation, &sender, &query, &messages);
 
     Ok(serde_json::json!({
         "ok": true,
@@ -1614,6 +1616,7 @@ async fn agent_query_messages(
             "conversation": conversation.to_json(),
             "sender": sender.to_json(),
         },
+        "resolution_summary": resolution_summary,
         "message_query": query,
         "messages": messages,
         "speakers": speaker_block,
@@ -1777,9 +1780,35 @@ fn agent_message_query_guidance(
             false,
         ));
     }
+    let followup_action_count = next_actions
+        .iter()
+        .filter_map(|action| action.get("action").and_then(Value::as_str))
+        .filter(|action| {
+            *action != "continue_message_page" && *action != "answer_from_current_window"
+        })
+        .count();
+    let blocking_followup_count = next_actions
+        .iter()
+        .filter(|action| {
+            action
+                .get("blocks_answer")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let answer_readiness = if returned_count == 0 {
+        "empty_needs_broaden"
+    } else if blocking_followup_count > 0 {
+        "blocked_by_followup"
+    } else if followup_action_count > 0 {
+        "answer_with_followups"
+    } else {
+        "ready_current_window"
+    };
 
     serde_json::json!({
         "summary": {
+            "answer_readiness": answer_readiness,
             "returned_message_count": returned_count,
             "limit": limit,
             "has_more": messages.next_cursor.is_some(),
@@ -1797,9 +1826,13 @@ fn agent_message_query_guidance(
             "voice": voice_summary,
             "missing_speaker_display_count": missing_display_count,
             "identity_refresh_recommended_count": identity_refresh_recommended_count,
+            "followup_action_count": followup_action_count,
+            "blocking_followup_count": blocking_followup_count,
         },
         "next_actions": next_actions,
         "agent_notes": [
+            "answer_readiness=ready_current_window means the current bounded window is safe to answer from; answer_readiness=answer_with_followups means answer with caveats or run the recommended bounded follow-up first if the user needs completeness",
+            "answer_readiness=empty_needs_broaden means the exact query returned no messages, so broaden the scoped query before saying nothing exists",
             "answer from the returned bounded window unless next_actions indicates a needed follow-up for freshness, pagination, attachments, voice, or identity",
             "continue_message_page preserves resolved stable ids; prefer it over re-resolving names when paginating",
             "recommended maintenance commands preserve the current conversation, sender, and time window whenever the target command supports those filters",
@@ -2290,6 +2323,64 @@ impl QueryResolution {
             "candidates": self.candidates.clone(),
         })
     }
+
+    fn summary_json(&self) -> Value {
+        let selected = self.selected.as_ref();
+        serde_json::json!({
+            "input": self.input.clone(),
+            "id": self.id.clone(),
+            "source": self.source,
+            "resolved": self.id.is_some(),
+            "candidate_count": self.candidates.len(),
+            "selected_entity_type": selected.map(|item| item.entity_type.clone()),
+            "selected_display_name": selected.and_then(|item| item.display_name.clone()),
+            "selected_alias": selected.and_then(|item| item.alias.clone()),
+            "selected_score": selected.map(|item| item.score),
+            "selected_is_current": selected.map(|item| item.is_current),
+        })
+    }
+}
+
+fn agent_query_resolution_summary(
+    conversation: &QueryResolution,
+    sender: &QueryResolution,
+    query: &MessageQuery,
+    messages: &ApiPage<NormalizedMessage>,
+) -> Value {
+    let conversation_kind = query.conversation_id.as_deref().map(|conversation_id| {
+        if conversation_id.ends_with("@chatroom") {
+            "chatroom"
+        } else {
+            "direct"
+        }
+    });
+    serde_json::json!({
+        "conversation": conversation.summary_json(),
+        "sender": sender.summary_json(),
+        "scope": {
+            "conversation_id": query.conversation_id.clone(),
+            "conversation_kind": conversation_kind,
+            "sender_wxid": query.sender_wxid.clone(),
+            "q": query.q.clone(),
+            "kind": query.kind.clone(),
+            "direction": query.direction.clone(),
+            "after": query.after.clone(),
+            "before": query.before.clone(),
+            "cursor": query.cursor.clone(),
+            "limit": query.limit,
+            "order": query.order.clone(),
+        },
+        "result_window": {
+            "returned_message_count": messages.items.len(),
+            "has_more": messages.next_cursor.is_some(),
+            "next_cursor": messages.next_cursor.clone(),
+        },
+        "agent_notes": [
+            "Use conversation.id and sender.id as stable evidence in answers; display names can change over time.",
+            "If source=identity, selected_display_name is the human-readable match that was chosen for the stable id.",
+            "If resolved=false and execution still happened, the query was intentionally allowed to run unresolved."
+        ]
+    })
 }
 
 pub(crate) async fn resolve_conversation_for_query(
@@ -3680,8 +3771,13 @@ mod tests {
         );
 
         assert_eq!(guidance["summary"]["has_more"], true);
+        assert_eq!(
+            guidance["summary"]["answer_readiness"],
+            "answer_with_followups"
+        );
         assert_eq!(guidance["summary"]["missing_attachment_count"], 1);
         assert_eq!(guidance["summary"]["voice"]["missing_attachment_count"], 1);
+        assert_eq!(guidance["summary"]["blocking_followup_count"], 0);
         assert_eq!(
             guidance["next_actions"][0]["action"],
             "continue_message_page"
@@ -3750,6 +3846,52 @@ mod tests {
             .unwrap()
             .iter()
             .any(|action| action["action"] == "warm_chatroom_identity"));
+    }
+
+    #[test]
+    fn agent_query_resolution_summary_explains_selected_stable_scope() {
+        let selected = IdentityMatch {
+            entity_type: "chatroom".to_string(),
+            entity_id: "room@chatroom".to_string(),
+            chatroom_id: Some("room@chatroom".to_string()),
+            display_name: Some("DuckCoding技术喝水交流群".to_string()),
+            alias: Some("DuckCoding".to_string()),
+            source: Some("chatroom".to_string()),
+            is_current: true,
+            score: 1.0,
+            last_seen_at: None,
+        };
+        let conversation = QueryResolution::from_identity(
+            Some("DuckCoding技术喝水交流群".to_string()),
+            Some("room@chatroom".to_string()),
+            Some(selected.clone()),
+            vec![selected],
+        );
+        let sender = QueryResolution::exact(Some("wxid_sender".to_string()));
+        let query = MessageQuery {
+            conversation_id: Some("room@chatroom".to_string()),
+            sender_wxid: Some("wxid_sender".to_string()),
+            limit: Some(5),
+            order: Some("desc".to_string()),
+            ..MessageQuery::default()
+        };
+        let messages = ApiPage {
+            items: vec![test_message("m1", gewe_skill_types::NormalizedKind::Text)],
+            next_cursor: Some("2026-05-26T00:00:00Z".to_string()),
+        };
+
+        let summary = agent_query_resolution_summary(&conversation, &sender, &query, &messages);
+
+        assert_eq!(summary["conversation"]["resolved"], true);
+        assert_eq!(summary["conversation"]["id"], "room@chatroom");
+        assert_eq!(
+            summary["conversation"]["selected_display_name"],
+            "DuckCoding技术喝水交流群"
+        );
+        assert_eq!(summary["scope"]["conversation_kind"], "chatroom");
+        assert_eq!(summary["scope"]["sender_wxid"], "wxid_sender");
+        assert_eq!(summary["result_window"]["returned_message_count"], 1);
+        assert_eq!(summary["result_window"]["has_more"], true);
     }
 
     fn test_message(
