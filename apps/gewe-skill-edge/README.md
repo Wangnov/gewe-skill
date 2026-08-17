@@ -6,7 +6,7 @@ Cloudflare Workers edge ingest for `gewe-skill`.
 
 - Receive GeWe callback events.
 - Normalize V1/V2 callback payloads into a short-term D1 buffer.
-- Persist raw callback JSON and downloaded attachments into R2.
+- Persist complete raw callback JSON verbatim and downloaded attachments into R2.
 - Queue attachment downloads through Cloudflare Queues.
 - Keep only short TTL data at the edge; durable memory belongs to `gewe-skill-memory`.
 - Expose admin export endpoints for pull-based snapshot, event, and attachment sync into `gewe-skill-memory`.
@@ -20,6 +20,10 @@ Create local `.dev.vars` from `.dev.vars.example` and set Cloudflare secrets for
 - `ADMIN_API_KEY`
 
 Never commit real tokens or app identifiers.
+
+Raw callbacks are intentionally stored without field redaction or length truncation. Treat D1,
+R2, the admin export endpoint, and the durable memory service as part of the same trusted
+security boundary.
 
 ## Sync model
 

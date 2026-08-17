@@ -52,25 +52,24 @@ async function handleCallback(request, env, ctx) {
   try {
     body = JSON.parse(bodyText || "{}");
   } catch (_error) {
-    await recordWebhookCheck(env, bodyText.slice(0, 5000), sourceIp, userAgent);
+    await recordWebhookCheck(env, bodyText, sourceIp, userAgent);
     return json({ ok: true, stored: "webhook_check", reason: "invalid_json" });
   }
 
   const normalized = normalizeCallback(body, receivedAt);
   if (!normalized.appid || !normalized.dedupeKey) {
-    await recordWebhookCheck(env, bodyText.slice(0, 5000), sourceIp, userAgent);
+    await recordWebhookCheck(env, bodyText, sourceIp, userAgent);
     return json({ ok: true, stored: "webhook_check", reason: "missing_message_identity" });
   }
 
   if (env.EXPECTED_APP_ID && normalized.appid !== env.EXPECTED_APP_ID) {
-    await recordWebhookCheck(env, bodyText.slice(0, 5000), sourceIp, userAgent);
+    await recordWebhookCheck(env, bodyText, sourceIp, userAgent);
     return json({ ok: false, reason: "unexpected_appid" }, 403);
   }
 
   const bodySha256 = await sha256Hex(bodyText);
-  const storageBodyText = redactSensitiveBody(bodyText);
   const rawObjectKey = rawEventKey(normalized.schemaVersion, normalized.dedupeKey, receivedAt);
-  ctx.waitUntil(env.RAW_BUCKET.put(rawObjectKey, storageBodyText, {
+  ctx.waitUntil(env.RAW_BUCKET.put(rawObjectKey, bodyText, {
     httpMetadata: { contentType: "application/json; charset=utf-8" },
     customMetadata: compactMetadata({
       appid: normalized.appid,
@@ -81,7 +80,7 @@ async function handleCallback(request, env, ctx) {
     })
   }));
 
-  const rawEvent = await upsertRawEvent(env, normalized, storageBodyText, bodySha256, rawObjectKey, sourceIp, userAgent, receivedAt);
+  const rawEvent = await upsertRawEvent(env, normalized, bodyText, bodySha256, rawObjectKey, sourceIp, userAgent, receivedAt);
   const message = await upsertMessage(env, normalized, rawEvent.id, receivedAt);
   ctx.waitUntil(forwardRawEventToMemory(env, body, receivedAt));
 
@@ -110,7 +109,7 @@ async function forwardRawEventToMemory(env, body, receivedAt) {
       },
       body: JSON.stringify({
         received_at: receivedAt,
-        body: redactSensitiveValue(body)
+        body
       })
     });
     if (!response.ok) {
@@ -128,10 +127,6 @@ async function handleAdmin(request, env, url) {
 
   if (url.pathname === "/admin/requeue-downloads" && request.method === "POST") {
     return json({ ok: true, ...(await requeueDueDownloadJobs(env)) });
-  }
-
-  if (url.pathname === "/admin/redact-raw-events" && request.method === "POST") {
-    return redactStoredRawEvents(env, url);
   }
 
   if (url.pathname === "/admin/backfill-chatroom-events" && request.method === "POST") {
@@ -613,42 +608,6 @@ function assetTypeMessageWhere(assetType) {
   };
   const values = map[assetType] || [];
   return `upper(CAST(COALESCE(m.type_name, m.msg_type, '') AS TEXT)) IN (${values.map((value) => `'${value}'`).join(", ")})`;
-}
-
-async function redactStoredRawEvents(env, url) {
-  const limit = clampInt(url.searchParams.get("limit"), 1, 200, 50);
-  const rows = await env.DB.prepare(`
-    SELECT id, event_json, raw_object_key
-    FROM raw_events
-    WHERE (event_json LIKE '%"token":%' AND event_json NOT LIKE '%"token":"[redacted]"%')
-       OR (event_json LIKE '%"tokenId":%' AND event_json NOT LIKE '%"tokenId":"[redacted]"%')
-       OR (event_json LIKE '%"tokenName":%' AND event_json NOT LIKE '%"tokenName":"[redacted]"%')
-       OR (event_json LIKE '%"userId":%' AND event_json NOT LIKE '%"userId":"[redacted]"%')
-    ORDER BY id
-    LIMIT ?
-  `).bind(limit).all();
-
-  const redactedIds = [];
-  for (const row of rows.results || []) {
-    const redacted = redactSensitiveBody(row.event_json);
-    if (redacted === row.event_json) continue;
-
-    await env.DB.prepare(`
-      UPDATE raw_events
-      SET event_json = ?, body_sha256 = ?
-      WHERE id = ?
-    `).bind(redacted, await sha256Hex(redacted), row.id).run();
-
-    if (row.raw_object_key) {
-      await env.RAW_BUCKET.put(row.raw_object_key, redacted, {
-        httpMetadata: { contentType: "application/json; charset=utf-8" }
-      });
-    }
-
-    redactedIds.push(row.id);
-  }
-
-  return json({ ok: true, scanned_count: rows.results?.length || 0, redacted_count: redactedIds.length, redacted_ids: redactedIds });
 }
 
 async function requireAdmin(request, env) {
@@ -1817,7 +1776,7 @@ async function recordWebhookCheck(env, bodyText, sourceIp, userAgent) {
   await env.DB.prepare(`
     INSERT INTO webhook_checks (body_text, source_ip, user_agent)
     VALUES (?, ?, ?)
-  `).bind(redactSensitiveBody(bodyText), sourceIp, userAgent).run();
+  `).bind(bodyText, sourceIp, userAgent).run();
 }
 
 function attachmentKind(normalized) {
@@ -2019,32 +1978,6 @@ function compactHeaders(headers) {
     if (value !== null && value !== undefined && String(value)) output[key] = String(value);
   }
   return output;
-}
-
-function redactSensitiveBody(text) {
-  if (!text) return text;
-  try {
-    return JSON.stringify(redactSensitiveValue(JSON.parse(text))).slice(0, 5000);
-  } catch (_error) {
-    return String(text)
-      .replace(/(["']?(?:token|tokenId|tokenName|userId|gewe[_-]?token|x-gewe-token|authorization|api[_-]?key|secret|callbackUrl)["']?\\s*[:=]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,}&]+)/gi, '$1"[redacted]"')
-      .slice(0, 5000);
-  }
-}
-
-function redactSensitiveValue(value) {
-  if (Array.isArray(value)) return value.map(redactSensitiveValue);
-  if (!value || typeof value !== "object") return value;
-
-  const output = {};
-  for (const [key, nested] of Object.entries(value)) {
-    output[key] = isSensitiveKey(key) ? "[redacted]" : redactSensitiveValue(nested);
-  }
-  return output;
-}
-
-function isSensitiveKey(key) {
-  return /^(token|tokenId|tokenName|userId|gewe[_-]?token|x-gewe-token|authorization|api[_-]?key|apikey|secret|callbackUrl)$/i.test(key);
 }
 
 function clampInt(value, min, max, fallback) {

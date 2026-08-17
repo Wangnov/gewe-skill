@@ -14,3 +14,7 @@
 - Edge data should be short-lived.
 - Memory data is the durable user-controlled store.
 - Agent access should be read-only unless the user authorizes a specific mutation workflow.
+- Raw callbacks are stored and synchronized verbatim, without field redaction or length
+  truncation, so source evidence remains complete.
+- D1, R2, admin export credentials, and the durable memory service must therefore remain inside
+  the user's trusted security boundary.
