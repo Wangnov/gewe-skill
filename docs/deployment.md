@@ -46,11 +46,12 @@ When the memory service is not publicly reachable, run pull sync on the server i
 
 ```bash
 gewe-skill --json sync edge
-gewe-skill --json sync attachment-repair
+gewe-skill --json sync attachments
+gewe-skill --json sync attachment-backfill
 gewe-skill --json sync chatroom-events
 ```
 
-The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, chatroom snapshots/events, attachment bytes, and recent identity data synchronized into memory. The attachment timer runs bounded `sync attachment-repair`, which backfills missing download jobs, requeues ready jobs, then pulls completed files into memory.
+The systemd timer templates under `crates/gewe-skill-memory/deploy/` keep raw callbacks, chatroom snapshots/events, attachment bytes, and recent identity data synchronized into memory. The five-minute attachment timer runs `sync attachments`, which only pulls completed files by cursor and is cheap on D1. A separate daily timer runs `sync attachment-backfill`, which scans stored messages for media without download jobs; keep it daily because it is a full `messages` scan on D1. Requeueing pending or stale jobs is handled by the edge Worker's own `*/10 * * * *` cron, so timers do not need `attachment-requeue`. Reserve `sync attachment-repair` for on-demand Agent use: it calls `/admin/stats` twice for a before/after report, and each call counts every row in every table.
 
 ## Identity refresh
 

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wangnov.gewe-skill-memory</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PREFIX__/bin/gewe-run</string>
+		<string>--env</string>
+		<string>__PREFIX__/config/gewe-skill-memory.env</string>
+		<string>--timeout</string>
+		<string>0</string>
+		<string>--</string>
+		<string>__PREFIX__/bin/gewe-skill-memory</string>
+	</array>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-skill-memory.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-skill-memory.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

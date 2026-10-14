@@ -1,6 +1,6 @@
 ---
 name: gewe-skill
-description: Use GeWe-backed WeChat memory for read-only Agent analysis, identity resolution, message window queries, summaries, and chatroom event inspection through the gewe-skill CLI/API.
+description: Use GeWe-backed WeChat memory for read-only Agent analysis, identity resolution, message window queries, Moments/SNS analysis, summaries, and chatroom event inspection through the gewe-skill CLI/API.
 ---
 
 # gewe-skill
@@ -94,6 +94,42 @@ gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversati
 ```bash
 gewe-skill --json messages context --message-key '<message_key>' --before 5 --after 5
 ```
+
+## 朋友圈分析
+
+Use this path when the user asks to analyze a friend's 朋友圈/Moments. The user usually provides a fuzzy nickname, WeChat ID, alias, or at most a plain wxid; do not ask them for GeWe `v3` identifiers. Start with `--contact` and let the memory service resolve the contact through GeWe:
+
+```bash
+gewe-skill --json sns fetch --contact '<nickname-or-wechat-id>' --limit 50
+```
+
+This call resolves the contact, pages through `contactsSnsList`, stores every scanned post in `gewe-skill-memory`, and returns the bounded post window. It only captures posts that GeWe exposes in `snsList`: if WeChat shows pinned/profile-only Moments but `contactsSnsList` returns an empty first page, report that source limitation and do not infer that the contact has no Moments. GeWe `snsDetails` requires a known `snsId`, so it cannot recover pinned items that never appear in the list response. If the user gave an exact internal wxid/v3, use the escape hatch:
+
+```bash
+gewe-skill --json sns fetch --target-wxid '<wxid_or_v3>' --limit 50
+```
+
+Use time windows when the user asks for them:
+
+```bash
+gewe-skill --json sns fetch --contact '<nickname-or-wechat-id>' --after '<iso-time>' --before '<iso-time>' --limit 100 --max-pages 100
+```
+
+For analysis, export a local package and hand that file to a subagent or your analysis step:
+
+```bash
+gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
+```
+
+`sns export` refreshes and stores posts by default before writing the local file. Use `--no-refresh --target-wxid '<wxid>'` only when you intentionally want to export already stored posts.
+
+Markdown exports include post ids, timestamps, text, content style, media counts, and safe derived fields, but do not expand media URLs. Use JSONL only when the user explicitly needs raw records:
+
+```bash
+gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.jsonl --format jsonl
+```
+
+When analyzing, distinguish stored facts from inference. Likes and comments are only the visible data for the current account's social graph, so do not treat missing interaction records as proof of low popularity. Prefer content themes, posting cadence, time window, media mix, and recurring topics.
 
 ## Conversation discovery
 

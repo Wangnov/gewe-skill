@@ -216,6 +216,84 @@ pub struct VoiceWarmResponse {
     pub items: Vec<VoiceTranscribeResponse>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnsPostQuery {
+    pub target_wxid: Option<String>,
+    pub q: Option<String>,
+    pub after: Option<Timestamp>,
+    pub before: Option<Timestamp>,
+    pub cursor: Option<Timestamp>,
+    pub limit: Option<i64>,
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnsResolvedContact {
+    pub query: Option<String>,
+    pub target_wxid: String,
+    pub nick_name: Option<String>,
+    pub alias: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnsPostRecord {
+    pub sns_id: String,
+    pub target_wxid: String,
+    pub user_name: Option<String>,
+    pub nick_name: Option<String>,
+    pub create_time: Option<i64>,
+    pub create_time_iso: Option<Timestamp>,
+    pub fetched_at: Timestamp,
+    pub content_text: Option<String>,
+    pub content_style: Option<String>,
+    pub media_count: i64,
+    pub media_types: Vec<String>,
+    pub url_count: i64,
+    pub thumb_count: i64,
+    pub has_location: bool,
+    pub private_flag: Option<String>,
+    pub show_flag: Option<String>,
+    pub sight_folded: Option<String>,
+    pub like_count: i64,
+    pub comment_count: i64,
+    pub with_user_count: i64,
+    pub sns_xml: Option<String>,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SnsFetchRequest {
+    pub contact: Option<String>,
+    pub target_wxid: Option<String>,
+    pub after: Option<Timestamp>,
+    pub before: Option<Timestamp>,
+    pub max_pages: Option<i64>,
+    pub limit: Option<i64>,
+    pub include_outside_first_page: Option<bool>,
+    pub decrypt: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnsFetchResponse {
+    pub ok: bool,
+    pub resolved_contact: Option<SnsResolvedContact>,
+    pub fetched_pages: i64,
+    pub scanned_posts: i64,
+    pub stored_posts: i64,
+    pub inserted_posts: i64,
+    pub updated_posts: i64,
+    pub returned_posts: i64,
+    pub stopped_reason: String,
+    pub first_page_md5: Option<String>,
+    pub next_max_id: Option<String>,
+    pub newest_create_time_iso: Option<Timestamp>,
+    pub oldest_create_time_iso: Option<Timestamp>,
+    pub items: Vec<SnsPostRecord>,
+    pub warnings: Vec<Value>,
+    pub errors: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSummary {
     pub conversation_id: String,

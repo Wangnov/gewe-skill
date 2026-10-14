@@ -15,6 +15,7 @@
 - 由 Rust 长期记忆服务持续拉取原始回调和附件内容。
 - 通过 CLI/API 查询消息、会话、群事件、身份记忆和附件。
 - 通过 GeWe 只读接口补全联系人、群资料、群成员和群名片索引。
+- 通过 GeWe 只读列表接口抓取好友朋友圈，入库后导出本地 AI 分析包；若置顶/个人页内容未出现在 GeWe `snsList` 中，会显式报告数据源限制。
 - 暂不开放微信发消息等写入或变更类 API。
 
 ## 项目组成
@@ -65,6 +66,7 @@ cargo run -p gewe-skill-cli -- --json conversations list --limit 20
 cargo run -p gewe-skill-cli -- --json identity resolve --q '<group-or-member-name>' --limit 10
 cargo run -p gewe-skill-cli -- --json messages list --conversation-id '<conversation_id>' --limit 50
 cargo run -p gewe-skill-cli -- --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
+cargo run -p gewe-skill-cli -- --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
 ```
 
 ## 部署模型
@@ -103,6 +105,8 @@ gewe-skill --json identity refresh --recent-chatrooms 20
 gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
 gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-wxid '<wxid>' --after '<iso-time>' --before '<iso-time>' --limit 50
 gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
+gewe-skill --json sns fetch --contact '<nickname-or-wechat-id>' --limit 50
+gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
 gewe-skill --json chatrooms events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill --json chatrooms system-events --chatroom-id '<chatroom_id>' --limit 100
 gewe-skill --json attachments download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin

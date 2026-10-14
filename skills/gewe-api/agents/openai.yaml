@@ -1,0 +1,4 @@
+interface:
+  display_name: "GeWe API"
+  short_description: "搜索、预览并安全调用任意 GeWe 微信 API 接口操作"
+  default_prompt: "使用 $gewe-api 查找、预览并安全执行我需要的微信 API 操作。"

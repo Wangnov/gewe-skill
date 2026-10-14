@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wangnov.gewe-identity-event-backfill</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PREFIX__/bin/gewe-run</string>
+		<string>--env</string>
+		<string>__PREFIX__/config/gewe-skill-memory.env</string>
+		<string>--timeout</string>
+		<string>1800</string>
+		<string>--</string>
+		<string>__PREFIX__/bin/gewe-skill</string>
+		<string>--json</string>
+		<string>maintenance</string>
+		<string>identity-backfill</string>
+		<string>--event-limit</string>
+		<string>500</string>
+		<string>--max-chatrooms</string>
+		<string>10</string>
+		<string>--max-wxids</string>
+		<string>100</string>
+	</array>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-identity-event-backfill.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-identity-event-backfill.log</string>
+	<key>StartInterval</key>
+	<integer>21600</integer>
+	<key>LowPriorityIO</key>
+	<true/>
+</dict>
+</plist>

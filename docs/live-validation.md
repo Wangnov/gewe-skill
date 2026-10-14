@@ -17,6 +17,7 @@ Environment:
 - Memory service: `gewe-skill-memory.service`
 - Raw callback sync: `gewe-skill-edge-sync.timer`
 - Attachment sync: `gewe-skill-edge-attachment-sync.timer`
+- Attachment job backfill (daily): `gewe-skill-edge-attachment-backfill.timer`
 - Chatroom event sync: `gewe-skill-edge-chatroom-event-sync.timer`
 - Recent event identity backfill: `gewe-skill-identity-event-backfill.timer`
 

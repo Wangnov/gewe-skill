@@ -145,6 +145,8 @@ unit_files=(
   gewe-skill-edge-sync.timer
   gewe-skill-edge-attachment-sync.service
   gewe-skill-edge-attachment-sync.timer
+  gewe-skill-edge-attachment-backfill.service
+  gewe-skill-edge-attachment-backfill.timer
   gewe-skill-edge-chatroom-event-sync.service
   gewe-skill-edge-chatroom-event-sync.timer
   gewe-skill-identity-refresh.service
@@ -165,6 +167,7 @@ systemctl restart gewe-skill-memory.service
 for timer in \
   gewe-skill-edge-sync.timer \
   gewe-skill-edge-attachment-sync.timer \
+  gewe-skill-edge-attachment-backfill.timer \
   gewe-skill-edge-chatroom-event-sync.timer \
   gewe-skill-identity-refresh.timer \
   gewe-skill-identity-event-backfill.timer; do
@@ -183,6 +186,7 @@ curl -fsS http://127.0.0.1:8788/healthz
 systemctl --no-pager --plain list-timers \
   gewe-skill-edge-sync.timer \
   gewe-skill-edge-attachment-sync.timer \
+  gewe-skill-edge-attachment-backfill.timer \
   gewe-skill-edge-chatroom-event-sync.timer \
   gewe-skill-identity-refresh.timer \
   gewe-skill-identity-event-backfill.timer

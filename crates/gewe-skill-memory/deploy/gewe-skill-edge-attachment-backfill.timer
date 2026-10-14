@@ -1,0 +1,12 @@
+[Unit]
+Description=Run gewe-skill edge attachment job backfill once a day
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+AccuracySec=30min
+Unit=gewe-skill-edge-attachment-backfill.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -8,9 +8,10 @@
 POST /write/events
 POST /write/raw-events
 POST /write/attachments
+POST /api/sns/fetch
 ```
 
-These endpoints are for `gewe-skill-edge`, the local sync timer, and trusted repair tools only.
+`/write/*` endpoints are for `gewe-skill-edge`, the local sync timer, and trusted repair tools only. `POST /api/sns/fetch` is also write-token protected because it calls GeWe read APIs and persists fetched Moments/SNS posts into local memory.
 
 ## Read-only Agent API
 
@@ -22,6 +23,7 @@ GET /api/identity/resolve
 POST /api/identity/refresh
 GET /api/attachments/recent
 GET /api/attachments/{sha256}/download
+GET /api/sns/posts
 GET /api/chatrooms/{chatroom_id}/snapshots
 GET /api/chatrooms/{chatroom_id}/events
 GET /api/chatrooms/{chatroom_id}/system-events
@@ -61,6 +63,33 @@ gewe-skill --json identity resolve --q 'DuckCoding技术喝水交流群'
 gewe-skill --json identity resolve --q '视频怪物' --chatroom-id '49407209075@chatroom'
 gewe-skill --json identity refresh --recent-chatrooms 20
 gewe-skill --json identity refresh --chatroom-id '12345@chatroom'
+```
+
+## Moments / SNS memory
+
+`POST /api/sns/fetch` resolves a friend from `contact` or accepts an exact `target_wxid`, pages through GeWe `contactsSnsList`, and upserts each scanned post into `sns_posts`.
+
+Only posts returned by GeWe `contactsSnsList` can be stored. If a WeChat profile shows pinned/profile-only Moments but GeWe returns an empty `snsList`, the response includes a warning and the feature must report the source limitation instead of treating it as proof that the contact has no visible Moments. GeWe `snsDetails` requires a known `snsId`, so it cannot recover a pinned item that never appears in the list response.
+
+Request fields:
+
+| Field | Meaning |
+| --- | --- |
+| `contact` | Fuzzy nickname, WeChat ID, alias, or other user wording. The service resolves it through GeWe `contacts/search`. |
+| `target_wxid` | Exact internal wxid/v3 escape hatch. |
+| `after` / `before` | Optional ISO timestamp window for returned posts. Scanned posts are still persisted. |
+| `limit` | Returned post limit, default 50. |
+| `max_pages` | Maximum GeWe pages to scan. Useful for older time windows. |
+| `decrypt` | Whether to ask GeWe for decrypted SNS content, default true. |
+
+`GET /api/sns/posts` reads stored posts. Supported query fields are `target_wxid`, `q`, `after`, `before`, `cursor`, `limit`, and `order`.
+
+CLI examples:
+
+```bash
+gewe-skill --json sns fetch --contact 'echochen55' --limit 50
+gewe-skill --json sns list --target-wxid '<wxid_or_v3>' --limit 50
+gewe-skill --json sns export --contact 'echochen55' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
 ```
 
 ## Attachment flow

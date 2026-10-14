@@ -21,6 +21,7 @@ Recommended sync and maintenance timers:
 ```text
 crates/gewe-skill-memory/deploy/gewe-skill-edge-sync.timer
 crates/gewe-skill-memory/deploy/gewe-skill-edge-attachment-sync.timer
+crates/gewe-skill-memory/deploy/gewe-skill-edge-attachment-backfill.timer
 crates/gewe-skill-memory/deploy/gewe-skill-edge-chatroom-event-sync.timer
 crates/gewe-skill-memory/deploy/gewe-skill-identity-refresh.timer
 crates/gewe-skill-memory/deploy/gewe-skill-identity-event-backfill.timer

@@ -1,0 +1,191 @@
+#!/bin/bash
+# Rendered by install-macos-memory-release.sh. Never enable shell tracing.
+set +x
+set -euo pipefail
+umask 077
+PYTHON='__PYTHON__'
+DATA_ROOT='__DATA_DIR__'
+VOLUME='__VOLUME__'
+TIMEOUT_BIN='/opt/homebrew/bin/gtimeout'
+
+# Gate before loading credentials. Diagnostics contain fixed labels only.
+if ! "$PYTHON" - "$VOLUME" "$DATA_ROOT" <<'PY'
+import os, pathlib, plistlib, subprocess, sys
+try:
+    volume, root = sys.argv[1:]
+    info = plistlib.loads(subprocess.check_output(
+        ['/usr/sbin/diskutil', 'info', '-plist', volume], stderr=subprocess.DEVNULL))
+    data = pathlib.Path(root) / 'gewe-skill-memory/data'
+    valid = (os.path.ismount(volume) and info.get('MountPoint') == volume
+             and info.get('VolumeUUID') == (pathlib.Path(root) / 'VOLUME_OK').read_text().strip()
+             and os.access(data, os.W_OK)
+             and (data / 'gewe-skill-memory.sqlite').is_file())
+except Exception:
+    valid = False
+if not valid:
+    print('gewe-run: volume_gate_failed', file=sys.stderr)
+    sys.exit(75)
+PY
+then
+  exit 75
+fi
+
+env_files=()
+guards=()
+timeout=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env) [[ $# -ge 2 ]] || exit 64; env_files+=("$2"); shift 2 ;;
+    --timeout) [[ $# -ge 2 ]] || exit 64; timeout="$2"; shift 2 ;;
+    --cursor-guard) [[ $# -ge 2 ]] || exit 64; guards+=("$2"); shift 2 ;;
+    --) shift; break ;;
+    *) echo 'gewe-run: invalid_option' >&2; exit 64 ;;
+  esac
+done
+[[ $# -gt 0 && "$1" == /* && ${#env_files[@]} -gt 0 ]] || exit 64
+for env_file in "${env_files[@]}"; do
+  [[ "$env_file" == /* && -r "$env_file" ]] || exit 66
+  set -a
+  if ! source "$env_file" >/dev/null 2>&1; then
+    echo 'gewe-run: env_load_failed' >&2
+    exit 78
+  fi
+  set +a
+done
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+export NO_PROXY='127.0.0.1,localhost'
+export no_proxy="$NO_PROXY"
+if [[ -z "$timeout" ]]; then
+  case " $* " in
+    *gewe-skill-memory*) timeout=0 ;;
+    *' identity '*|*' maintenance '*) timeout=1800 ;;
+    *' -m radar '*) timeout=1200 ;;
+    *) timeout=600 ;;
+  esac
+fi
+[[ "$timeout" =~ ^[0-9]+$ ]] || exit 64
+guard_list=''
+for guard in "${guards[@]}"; do
+  [[ "$guard" =~ ^[A-Z][A-Z0-9_]*$ ]] || exit 64
+  guard_list+="$guard "
+done
+
+exec "$PYTHON" - "$timeout" "$TIMEOUT_BIN" "$guard_list" "$@" <<'PY'
+import json, os, pathlib, signal, subprocess, sys, tempfile, urllib.request
+seconds, timeout_bin, guard_list = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+command = sys.argv[4:]
+service = pathlib.Path(command[0]).name == 'gewe-skill-memory'
+saved = []
+child = None
+interrupted = False
+
+def restore():
+    for target, snapshot, existed in saved:
+        if existed:
+            os.replace(snapshot, target)
+        else:
+            target.unlink(missing_ok=True)
+            snapshot.unlink(missing_ok=True)
+    if saved:
+        print('gewe-run: cursor_restored', flush=True)
+
+def kill_group(sig):
+    if child is not None:
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+
+def stop(signum, frame):
+    global interrupted
+    interrupted = True
+    kill_group(signal.SIGTERM)
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, stop)
+
+try:
+    if not service:
+        token = os.environ.get('GEWE_SKILL_READ_TOKEN', '')
+        base = os.environ.get('GEWE_SKILL_BASE_URL', '')
+        if not token or not base:
+            raise RuntimeError('missing_read_auth')
+        request = urllib.request.Request(base.rstrip('/') + '/api/conversations?limit=1',
+                                         headers={'Authorization': 'Bearer ' + token})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError('read_probe_failed')
+            json.load(response)
+        print('gewe-run: read_probe_ok', flush=True)
+    for name in guard_list.split():
+        target = pathlib.Path(os.environ.get(name, ''))
+        if not target.is_absolute() or not target.parent.is_dir():
+            raise RuntimeError('invalid_cursor_path')
+        fd, filename = tempfile.mkstemp(prefix='.cursor-before-', dir=target.parent)
+        snapshot = pathlib.Path(filename)
+        existed = target.is_file()
+        with os.fdopen(fd, 'wb') as stream:
+            if existed:
+                stream.write(target.read_bytes())
+        saved.append((target, snapshot, existed))
+    if seconds and not os.access(timeout_bin, os.X_OK):
+        raise RuntimeError('timeout_tool_missing')
+    argv = ([timeout_bin, '--kill-after=30', str(seconds)] if seconds else []) + command
+    # New session isolates the complete task group from launchd and the caller.
+    # Raw stderr is discarded; raw stdout is never printed or written to a log.
+    child = subprocess.Popen(argv, start_new_session=True, stderr=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL if service else subprocess.PIPE)
+    try:
+        output, _ = child.communicate(timeout=seconds + 35 if seconds else None)
+    except subprocess.TimeoutExpired:
+        kill_group(signal.SIGKILL)
+        output, _ = child.communicate()
+        interrupted = True
+    status = child.returncode
+    result = None
+    if not service:
+        try:
+            result = json.loads(output or b'')
+        except (ValueError, TypeError):
+            pass
+    failed = status != 0 or interrupted
+    if saved:
+        failed |= not isinstance(result, dict) or result.get('ok') is not True
+    def has_failure(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ('failed_count', 'failure_count', 'error_count', 'errors_count'):
+                    if isinstance(item, (int, float)) and item > 0:
+                        return True
+                if key in ('failed', 'failures', 'errors') and isinstance(item, list) and item:
+                    return True
+                if has_failure(item):
+                    return True
+        elif isinstance(value, list):
+            return any(has_failure(item) for item in value)
+        return False
+    if isinstance(result, dict):
+        failed |= result.get('ok') is False or has_failure(result)
+        # Only approved numeric/bool counters can reach logs; no payloads/errors/secrets.
+        safe = {k: v for k, v in result.items()
+                if (k in ('ok', 'scanned', 'written', 'failed_count', 'cursor_written')
+                    or k.startswith(('after_', 'next_after_'))
+                    or k.endswith(('_scanned', '_written')))
+                and isinstance(v, (int, float, bool))}
+        print(json.dumps(safe, sort_keys=True), flush=True)
+    if failed:
+        restore()
+        print('gewe-run: task_failed', flush=True)
+        sys.exit(status if 0 < status < 256 else 1)
+    print('gewe-run: task_completed', flush=True)
+except Exception:
+    kill_group(signal.SIGKILL)
+    restore()
+    print('gewe-run: task_setup_or_execution_failed', file=sys.stderr, flush=True)
+    sys.exit(1)
+finally:
+    # Also terminate orphan descendants after a parent exits or is timed out.
+    kill_group(signal.SIGKILL)
+    for _, snapshot, _ in saved:
+        snapshot.unlink(missing_ok=True)
+PY

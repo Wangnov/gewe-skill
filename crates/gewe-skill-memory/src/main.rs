@@ -16,14 +16,15 @@ use gewe_skill_types::{
     IdentityEventBackfillRequest, IdentityEventBackfillResponse, IdentityMatch,
     IdentityMemoryRecordStatus, IdentityMemoryStatus, IdentityProfileResponse,
     IdentityRefreshRequest, IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest,
-    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem,
-    VoiceQuery, VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord,
-    VoiceWarmRequest, VoiceWarmResponse,
+    MessageContextResponse, MessageQuery, NormalizedMessage, RawCallbackRequest, SnsFetchRequest,
+    SnsFetchResponse, SnsPostQuery, SnsPostRecord, SnsResolvedContact, VoiceItem, VoiceQuery,
+    VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceTranscriptRecord, VoiceWarmRequest,
+    VoiceWarmResponse,
 };
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::{
     collections::{BTreeSet, HashSet},
     env,
@@ -268,6 +269,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/sns/fetch",
+            post(fetch_sns_posts).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
+            "/api/sns/posts",
+            get(list_sns_posts).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
             "/api/maintenance/status",
             get(maintenance_status).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -497,6 +512,13 @@ async fn maintenance_status(State(state): State<SharedState>) -> Result<Json<Val
             "system_events": scalar_i64(db, "SELECT COUNT(*) AS value FROM chatroom_system_events").await?,
             "member_events_by_type": count_map(db, "SELECT lower(event_type) AS key, COUNT(*) AS count FROM chatroom_member_events GROUP BY lower(event_type) ORDER BY count DESC").await?,
             "system_events_by_type": count_map(db, "SELECT lower(event_type) AS key, COUNT(*) AS count FROM chatroom_system_events GROUP BY lower(event_type) ORDER BY count DESC").await?,
+        },
+        "sns": {
+            "posts": scalar_i64(db, "SELECT COUNT(*) AS value FROM sns_posts").await?,
+            "contacts": scalar_i64(db, "SELECT COUNT(DISTINCT target_wxid) AS value FROM sns_posts").await?,
+            "fetch_runs": scalar_i64(db, "SELECT COUNT(*) AS value FROM sns_fetch_runs").await?,
+            "oldest_create_time": scalar_text(db, "SELECT MIN(create_time_iso) AS value FROM sns_posts").await?,
+            "newest_create_time": scalar_text(db, "SELECT MAX(create_time_iso) AS value FROM sns_posts").await?,
         }
     })))
 }
@@ -2556,6 +2578,852 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     (!value.is_empty()).then_some(value.to_string())
 }
 
+async fn fetch_sns_posts(
+    State(state): State<SharedState>,
+    Json(request): Json<SnsFetchRequest>,
+) -> Result<Json<SnsFetchResponse>, ApiError> {
+    fetch_sns_posts_impl(&state, request).await.map(Json)
+}
+
+async fn list_sns_posts(
+    State(state): State<SharedState>,
+    Query(query): Query<SnsPostQuery>,
+) -> Result<Json<ApiPage<SnsPostRecord>>, ApiError> {
+    list_sns_posts_impl(&state.db, &query).await.map(Json)
+}
+
+async fn fetch_sns_posts_impl(
+    state: &SharedState,
+    request: SnsFetchRequest,
+) -> Result<SnsFetchResponse, ApiError> {
+    let started_at = now_iso();
+    let resolved = resolve_sns_contact(state, &request).await?;
+    let limit = clamp_sns_fetch_limit(request.limit);
+    let max_pages = clamp_sns_max_pages(request.max_pages, &request);
+    let after_seconds = parse_timestamp_seconds(request.after.as_deref());
+    let before_seconds = parse_timestamp_seconds(request.before.as_deref());
+    let decrypt = request.decrypt.unwrap_or(true);
+    let mut fetched_pages = 0i64;
+    let mut scanned_posts = 0i64;
+    let mut stored_posts = 0i64;
+    let mut inserted_posts = 0i64;
+    let mut updated_posts = 0i64;
+    let mut items = Vec::<SnsPostRecord>::new();
+    let mut warnings = Vec::<Value>::new();
+    let mut errors = Vec::<Value>::new();
+    let mut first_page_md5 = None;
+    let mut next_max_id: Option<String> = None;
+    let mut stopped_reason = "max_pages_reached".to_string();
+    let mut newest_create_time: Option<i64> = None;
+    let mut oldest_create_time: Option<i64> = None;
+    let mut current_max_id = "0".to_string();
+
+    for page_index in 0..max_pages {
+        let mut payload = json!({
+            "wxid": resolved.target_wxid,
+            "maxId": current_max_id,
+            "decrypt": decrypt,
+        });
+        if page_index > 0 {
+            if let Some(value) = first_page_md5.as_deref() {
+                payload["firstPageMd5"] = json!(value);
+            }
+        }
+
+        let page = match gewe_post(state, "/gewe/v2/api/sns/contactsSnsList", payload).await {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(json!({
+                    "scope": "contactsSnsList",
+                    "page": page_index + 1,
+                    "max_id": current_max_id,
+                    "error": error.to_string(),
+                }));
+                stopped_reason = "gewe_error".to_string();
+                break;
+            }
+        };
+        fetched_pages += 1;
+
+        if page_index == 0 {
+            first_page_md5 = json_text(&page, "firstPageMd5");
+        }
+        let page_next_max_id = json_text(&page, "maxId");
+        let sns_list = page
+            .get("snsList")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if sns_list.is_empty() {
+            stopped_reason = "empty_page".to_string();
+            next_max_id = page_next_max_id;
+            if page_index == 0 {
+                warnings.push(json!({
+                    "code": "gewe_contacts_sns_list_empty",
+                    "scope": "contactsSnsList",
+                    "message": "GeWe contactsSnsList returned no first-page snsList items. Pinned/profile-only Moments are not currently exposed unless GeWe includes them in snsList; snsDetails also requires a known snsId.",
+                }));
+            }
+            break;
+        }
+
+        let fetched_at = now_iso();
+        let mut page_oldest: Option<i64> = None;
+        for raw_post in sns_list {
+            scanned_posts += 1;
+            let record = sns_post_from_value(&resolved.target_wxid, &raw_post, &fetched_at)?;
+            if let Some(timestamp) = record.create_time {
+                newest_create_time =
+                    Some(newest_create_time.map_or(timestamp, |value| value.max(timestamp)));
+                oldest_create_time =
+                    Some(oldest_create_time.map_or(timestamp, |value| value.min(timestamp)));
+                page_oldest = Some(page_oldest.map_or(timestamp, |value| value.min(timestamp)));
+            }
+            let inserted = upsert_sns_post(&state.db, &record).await?;
+            stored_posts += 1;
+            if inserted {
+                inserted_posts += 1;
+            } else {
+                updated_posts += 1;
+            }
+            if sns_post_in_window(&record, after_seconds, before_seconds)
+                && (items.len() as i64) < limit
+            {
+                items.push(record);
+            }
+        }
+
+        next_max_id = page_next_max_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && *value != "0")
+            .map(ToOwned::to_owned);
+        if (items.len() as i64) >= limit {
+            stopped_reason = "limit_reached".to_string();
+            break;
+        }
+        if after_seconds
+            .zip(page_oldest)
+            .is_some_and(|(after, oldest)| oldest < after)
+        {
+            stopped_reason = "after_bound_reached".to_string();
+            break;
+        }
+        let Some(value) = next_max_id.clone() else {
+            stopped_reason = "no_next_max_id".to_string();
+            break;
+        };
+        if value == current_max_id {
+            stopped_reason = "same_next_max_id".to_string();
+            break;
+        }
+        current_max_id = value;
+    }
+
+    let response = SnsFetchResponse {
+        ok: errors.is_empty(),
+        resolved_contact: Some(resolved),
+        fetched_pages,
+        scanned_posts,
+        stored_posts,
+        inserted_posts,
+        updated_posts,
+        returned_posts: items.len() as i64,
+        stopped_reason,
+        first_page_md5,
+        next_max_id,
+        newest_create_time_iso: newest_create_time.and_then(unix_ts_to_iso),
+        oldest_create_time_iso: oldest_create_time.and_then(unix_ts_to_iso),
+        items,
+        warnings,
+        errors,
+    };
+    insert_sns_fetch_run(&state.db, &started_at, &request, &response).await?;
+    Ok(response)
+}
+
+async fn resolve_sns_contact(
+    state: &SharedState,
+    request: &SnsFetchRequest,
+) -> Result<SnsResolvedContact, ApiError> {
+    if let Some(target_wxid) = request
+        .target_wxid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(SnsResolvedContact {
+            query: request.contact.clone(),
+            target_wxid: target_wxid.to_string(),
+            nick_name: None,
+            alias: None,
+            source: "target_wxid".to_string(),
+        });
+    }
+
+    let Some(contact) = request
+        .contact
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(ApiError::BadRequest(
+            "sns fetch requires --contact or --target-wxid".to_string(),
+        ));
+    };
+
+    if looks_like_direct_contact_wxid(contact) {
+        return Ok(SnsResolvedContact {
+            query: Some(contact.to_string()),
+            target_wxid: contact.to_string(),
+            nick_name: None,
+            alias: None,
+            source: "contact_direct_wxid".to_string(),
+        });
+    }
+
+    match gewe_post(
+        state,
+        "/gewe/v2/api/contacts/search",
+        json!({ "contactsInfo": contact }),
+    )
+    .await
+    {
+        Ok(data) => {
+            if let Some(resolved) = sns_resolved_contact_from_gewe_search(contact, &data) {
+                if looks_like_sns_fetch_id(&resolved.target_wxid) {
+                    persist_sns_resolved_contact(state, &resolved, Some(&data)).await?;
+                    return Ok(resolved);
+                }
+                if let Some(detail_resolved) = resolve_sns_contact_from_gewe_detail(state, contact)
+                    .await?
+                    .filter(|item| looks_like_sns_fetch_id(&item.target_wxid))
+                {
+                    return Ok(detail_resolved);
+                }
+                persist_sns_resolved_contact(state, &resolved, Some(&data)).await?;
+                return Ok(resolved);
+            }
+        }
+        Err(error) => {
+            warn!(query = contact, error = %error, "gewe contacts/search failed while resolving sns contact");
+        }
+    }
+
+    if let Some(resolved) = resolve_sns_contact_from_local(&state.db, contact).await? {
+        return Ok(resolved);
+    }
+
+    if let Some(resolved) = resolve_sns_contact_from_gewe_detail(state, contact).await? {
+        return Ok(resolved);
+    }
+
+    Err(ApiError::BadRequest(format!(
+        "could not resolve sns contact from query: {contact}"
+    )))
+}
+
+async fn resolve_sns_contact_from_gewe_detail(
+    state: &SharedState,
+    contact: &str,
+) -> Result<Option<SnsResolvedContact>, ApiError> {
+    let data = gewe_post(
+        state,
+        "/gewe/v2/api/contacts/getDetailInfo",
+        json!({ "wxids": [contact] }),
+    )
+    .await?;
+    let details = data.as_array().cloned().unwrap_or_default();
+    for item in details {
+        if let Some(resolved) = sns_resolved_contact_from_detail(contact, &item) {
+            persist_sns_resolved_contact(state, &resolved, Some(&item)).await?;
+            return Ok(Some(resolved));
+        }
+    }
+    Ok(None)
+}
+
+fn sns_resolved_contact_from_gewe_search(query: &str, data: &Value) -> Option<SnsResolvedContact> {
+    let target_wxid = json_text(data, "v3")
+        .or_else(|| json_text(data, "userName"))
+        .or_else(|| json_text(data, "wxid"))?;
+    Some(SnsResolvedContact {
+        query: Some(query.to_string()),
+        target_wxid,
+        nick_name: json_text(data, "nickName"),
+        alias: json_text(data, "alias").or_else(|| {
+            (query
+                != data
+                    .get("nickName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default())
+            .then(|| query.to_string())
+        }),
+        source: "gewe_contacts_search".to_string(),
+    })
+}
+
+fn sns_resolved_contact_from_detail(query: &str, data: &Value) -> Option<SnsResolvedContact> {
+    let target_wxid = json_text(data, "v3")
+        .or_else(|| json_text(data, "userName"))
+        .or_else(|| json_text(data, "wxid"))?;
+    Some(SnsResolvedContact {
+        query: Some(query.to_string()),
+        target_wxid,
+        nick_name: json_text(data, "nickName"),
+        alias: json_text(data, "alias"),
+        source: "gewe_contacts_detail".to_string(),
+    })
+}
+
+async fn persist_sns_resolved_contact(
+    state: &SharedState,
+    resolved: &SnsResolvedContact,
+    raw: Option<&Value>,
+) -> Result<(), ApiError> {
+    let seen_at = now_iso();
+    let mut tx = state.db.begin().await?;
+    upsert_contact(
+        &mut tx,
+        &resolved.target_wxid,
+        resolved.nick_name.as_deref(),
+        None,
+        resolved.alias.as_deref(),
+        raw,
+        &seen_at,
+        &resolved.source,
+    )
+    .await?;
+    if let Some(query) = resolved
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != resolved.target_wxid)
+    {
+        upsert_alias(
+            &mut tx,
+            query,
+            "contact",
+            &resolved.target_wxid,
+            None,
+            "sns_contact_query",
+            true,
+            0.7,
+            &seen_at,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn resolve_sns_contact_from_local(
+    db: &SqlitePool,
+    query: &str,
+) -> Result<Option<SnsResolvedContact>, ApiError> {
+    let alias_key = normalize_alias(query);
+    let like = format!("%{}%", query.trim());
+    let row = sqlx::query(
+        r#"
+        SELECT wxid, nickname, alias
+        FROM identity_contacts
+        WHERE wxid = ?
+           OR lower(COALESCE(nickname, '')) LIKE lower(?)
+           OR lower(COALESCE(remark, '')) LIKE lower(?)
+           OR lower(COALESCE(alias, '')) LIKE lower(?)
+           OR wxid IN (
+             SELECT entity_id
+             FROM identity_aliases
+             WHERE entity_type = 'contact'
+               AND alias_key = ?
+           )
+        ORDER BY
+          CASE WHEN wxid = ? THEN 0 ELSE 1 END,
+          updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(query)
+    .bind(&like)
+    .bind(&like)
+    .bind(&like)
+    .bind(alias_key)
+    .bind(query)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|row| SnsResolvedContact {
+        query: Some(query.to_string()),
+        target_wxid: row.get("wxid"),
+        nick_name: row.get("nickname"),
+        alias: row.get("alias"),
+        source: "local_identity".to_string(),
+    }))
+}
+
+fn looks_like_direct_contact_wxid(value: &str) -> bool {
+    looks_like_sns_fetch_id(value)
+}
+
+fn looks_like_sns_fetch_id(value: &str) -> bool {
+    value.starts_with("wxid_") || value.starts_with("v3_") || value.ends_with("@stranger")
+}
+
+fn sns_post_from_value(
+    target_wxid: &str,
+    raw: &Value,
+    fetched_at: &str,
+) -> Result<SnsPostRecord, ApiError> {
+    let sns_id = json_text(raw, "id").ok_or_else(|| {
+        ApiError::BadRequest(
+            "sns post missing id; cannot persist without stable sns_id".to_string(),
+        )
+    })?;
+    let sns_xml = json_text(raw, "snsXml");
+    let content_text = sns_xml
+        .as_deref()
+        .and_then(|xml| extract_xml_tag_clean(xml, "contentDesc"))
+        .or_else(|| json_text(raw, "contentDesc"));
+    let content_style = sns_xml
+        .as_deref()
+        .and_then(|xml| extract_xml_tag_clean(xml, "contentStyle"))
+        .or_else(|| json_text(raw, "contentStyle"));
+    let media_types = sns_xml
+        .as_deref()
+        .map(extract_sns_media_types)
+        .unwrap_or_default();
+    let media_count = sns_xml
+        .as_deref()
+        .map(|xml| count_xml_element_starts(xml, "media") as i64)
+        .unwrap_or(0);
+    let url_count = sns_xml
+        .as_deref()
+        .map(|xml| count_xml_element_starts(xml, "url") as i64)
+        .unwrap_or(0);
+    let thumb_count = sns_xml
+        .as_deref()
+        .map(|xml| count_xml_element_starts(xml, "thumb") as i64)
+        .unwrap_or(0);
+    let has_location = sns_xml
+        .as_deref()
+        .and_then(|xml| extract_xml_tag_clean(xml, "location"))
+        .is_some();
+    let create_time = json_i64(raw, "createTime");
+    Ok(SnsPostRecord {
+        sns_id,
+        target_wxid: target_wxid.to_string(),
+        user_name: json_text(raw, "userName"),
+        nick_name: json_text(raw, "nickName"),
+        create_time,
+        create_time_iso: create_time.and_then(unix_ts_to_iso),
+        fetched_at: fetched_at.to_string(),
+        content_text,
+        content_style,
+        media_count,
+        media_types,
+        url_count,
+        thumb_count,
+        has_location,
+        private_flag: sns_xml
+            .as_deref()
+            .and_then(|xml| extract_xml_tag_clean(xml, "private")),
+        show_flag: sns_xml
+            .as_deref()
+            .and_then(|xml| extract_xml_tag_clean(xml, "showFlag")),
+        sight_folded: sns_xml
+            .as_deref()
+            .and_then(|xml| extract_xml_tag_clean(xml, "sightFolded")),
+        like_count: json_i64(raw, "likeCount").unwrap_or(0),
+        comment_count: json_i64(raw, "commentCount").unwrap_or(0),
+        with_user_count: json_i64(raw, "withUserCount").unwrap_or(0),
+        sns_xml,
+        raw: raw.clone(),
+    })
+}
+
+async fn upsert_sns_post(db: &SqlitePool, record: &SnsPostRecord) -> Result<bool, ApiError> {
+    let existed = sqlx::query(
+        "SELECT 1 AS value FROM sns_posts WHERE target_wxid = ? AND sns_id = ? LIMIT 1",
+    )
+    .bind(&record.target_wxid)
+    .bind(&record.sns_id)
+    .fetch_optional(db)
+    .await?
+    .is_some();
+    sqlx::query(
+        r#"
+        INSERT INTO sns_posts (
+          target_wxid, sns_id, user_name, nick_name, create_time, create_time_iso,
+          fetched_at, content_text, content_style, media_count, media_types_json,
+          url_count, thumb_count, has_location, private_flag, show_flag, sight_folded,
+          like_count, comment_count, with_user_count, sns_xml, post_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(target_wxid, sns_id) DO UPDATE SET
+          user_name = excluded.user_name,
+          nick_name = excluded.nick_name,
+          create_time = excluded.create_time,
+          create_time_iso = excluded.create_time_iso,
+          fetched_at = excluded.fetched_at,
+          content_text = excluded.content_text,
+          content_style = excluded.content_style,
+          media_count = excluded.media_count,
+          media_types_json = excluded.media_types_json,
+          url_count = excluded.url_count,
+          thumb_count = excluded.thumb_count,
+          has_location = excluded.has_location,
+          private_flag = excluded.private_flag,
+          show_flag = excluded.show_flag,
+          sight_folded = excluded.sight_folded,
+          like_count = excluded.like_count,
+          comment_count = excluded.comment_count,
+          with_user_count = excluded.with_user_count,
+          sns_xml = excluded.sns_xml,
+          post_json = excluded.post_json,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&record.target_wxid)
+    .bind(&record.sns_id)
+    .bind(&record.user_name)
+    .bind(&record.nick_name)
+    .bind(record.create_time)
+    .bind(&record.create_time_iso)
+    .bind(&record.fetched_at)
+    .bind(&record.content_text)
+    .bind(&record.content_style)
+    .bind(record.media_count)
+    .bind(serde_json::to_string(&record.media_types)?)
+    .bind(record.url_count)
+    .bind(record.thumb_count)
+    .bind(i64::from(record.has_location))
+    .bind(&record.private_flag)
+    .bind(&record.show_flag)
+    .bind(&record.sight_folded)
+    .bind(record.like_count)
+    .bind(record.comment_count)
+    .bind(record.with_user_count)
+    .bind(&record.sns_xml)
+    .bind(serde_json::to_string(&record.raw)?)
+    .bind(now_iso())
+    .execute(db)
+    .await?;
+    Ok(!existed)
+}
+
+async fn list_sns_posts_impl(
+    db: &SqlitePool,
+    query: &SnsPostQuery,
+) -> Result<ApiPage<SnsPostRecord>, ApiError> {
+    let limit = clamp_sns_list_limit(query.limit);
+    let order = query
+        .order
+        .as_deref()
+        .unwrap_or("desc")
+        .to_ascii_lowercase();
+    let ascending = order == "asc";
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT target_wxid, sns_id, user_name, nick_name, create_time, create_time_iso, \
+         fetched_at, content_text, content_style, media_count, media_types_json, url_count, \
+         thumb_count, has_location, private_flag, show_flag, sight_folded, like_count, \
+         comment_count, with_user_count, sns_xml, post_json FROM sns_posts WHERE 1 = 1",
+    );
+    if let Some(value) = query
+        .target_wxid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        builder.push(" AND target_wxid = ");
+        builder.push_bind(value);
+    }
+    if let Some(value) = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let like = format!("%{value}%");
+        builder.push(" AND (content_text LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR nick_name LIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR sns_id = ");
+        builder.push_bind(value.to_string());
+        builder.push(" OR target_wxid = ");
+        builder.push_bind(value.to_string());
+        builder.push(")");
+    }
+    if let Some(after) = parse_timestamp_seconds(query.after.as_deref()) {
+        builder.push(" AND create_time >= ");
+        builder.push_bind(after);
+    }
+    if let Some(before) = parse_timestamp_seconds(query.before.as_deref()) {
+        builder.push(" AND create_time < ");
+        builder.push_bind(before);
+    }
+    if let Some(cursor) = parse_timestamp_seconds(query.cursor.as_deref()) {
+        if ascending {
+            builder.push(" AND create_time > ");
+        } else {
+            builder.push(" AND create_time < ");
+        }
+        builder.push_bind(cursor);
+    }
+    if ascending {
+        builder.push(" ORDER BY create_time ASC, sns_id ASC LIMIT ");
+    } else {
+        builder.push(" ORDER BY create_time DESC, sns_id DESC LIMIT ");
+    }
+    builder.push_bind(limit + 1);
+
+    let rows = builder.build().fetch_all(db).await?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(sns_post_record_from_row(&row)?);
+    }
+    let next_cursor = if items.len() > limit as usize {
+        items.pop().and_then(|item| item.create_time_iso)
+    } else {
+        None
+    };
+    Ok(ApiPage { items, next_cursor })
+}
+
+fn sns_post_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SnsPostRecord, ApiError> {
+    let media_types_json: String = row.get("media_types_json");
+    let post_json: String = row.get("post_json");
+    Ok(SnsPostRecord {
+        sns_id: row.get("sns_id"),
+        target_wxid: row.get("target_wxid"),
+        user_name: row.get("user_name"),
+        nick_name: row.get("nick_name"),
+        create_time: row.get("create_time"),
+        create_time_iso: row.get("create_time_iso"),
+        fetched_at: row.get("fetched_at"),
+        content_text: row.get("content_text"),
+        content_style: row.get("content_style"),
+        media_count: row.get("media_count"),
+        media_types: serde_json::from_str(&media_types_json).unwrap_or_default(),
+        url_count: row.get("url_count"),
+        thumb_count: row.get("thumb_count"),
+        has_location: row.get::<i64, _>("has_location") != 0,
+        private_flag: row.get("private_flag"),
+        show_flag: row.get("show_flag"),
+        sight_folded: row.get("sight_folded"),
+        like_count: row.get("like_count"),
+        comment_count: row.get("comment_count"),
+        with_user_count: row.get("with_user_count"),
+        sns_xml: row.get("sns_xml"),
+        raw: serde_json::from_str(&post_json).unwrap_or(Value::Null),
+    })
+}
+
+async fn insert_sns_fetch_run(
+    db: &SqlitePool,
+    started_at: &str,
+    request: &SnsFetchRequest,
+    response: &SnsFetchResponse,
+) -> Result<(), ApiError> {
+    let finished_at = now_iso();
+    let response_summary = json!({
+        "ok": response.ok,
+        "resolved_contact": response.resolved_contact,
+        "fetched_pages": response.fetched_pages,
+        "scanned_posts": response.scanned_posts,
+        "stored_posts": response.stored_posts,
+        "inserted_posts": response.inserted_posts,
+        "updated_posts": response.updated_posts,
+        "returned_posts": response.returned_posts,
+        "stopped_reason": response.stopped_reason,
+        "first_page_md5": response.first_page_md5,
+        "next_max_id": response.next_max_id,
+        "newest_create_time_iso": response.newest_create_time_iso,
+        "oldest_create_time_iso": response.oldest_create_time_iso,
+        "errors": response.errors,
+    });
+    sqlx::query(
+        r#"
+        INSERT INTO sns_fetch_runs (
+          requested_contact, target_wxid, resolved_nick_name, started_at, finished_at,
+          request_json, response_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(
+        request
+            .contact
+            .as_deref()
+            .or(request.target_wxid.as_deref()),
+    )
+    .bind(
+        response
+            .resolved_contact
+            .as_ref()
+            .map(|contact| contact.target_wxid.as_str()),
+    )
+    .bind(
+        response
+            .resolved_contact
+            .as_ref()
+            .and_then(|contact| contact.nick_name.as_deref()),
+    )
+    .bind(started_at)
+    .bind(finished_at)
+    .bind(serde_json::to_string(request)?)
+    .bind(response_summary.to_string())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+fn clamp_sns_fetch_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 2000)
+}
+
+fn clamp_sns_list_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 500)
+}
+
+fn clamp_sns_max_pages(max_pages: Option<i64>, request: &SnsFetchRequest) -> i64 {
+    if let Some(max_pages) = max_pages {
+        return max_pages.clamp(1, 200);
+    }
+    if request.after.is_some() || request.before.is_some() {
+        100
+    } else {
+        ((clamp_sns_fetch_limit(request.limit) + 9) / 10 + 2).clamp(1, 50)
+    }
+}
+
+fn parse_timestamp_seconds(value: Option<&str>) -> Option<i64> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<i64>().ok().or_else(|| {
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|timestamp| timestamp.timestamp())
+    })
+}
+
+fn unix_ts_to_iso(timestamp: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0).map(|value| value.to_rfc3339())
+}
+
+fn sns_post_in_window(
+    record: &SnsPostRecord,
+    after_seconds: Option<i64>,
+    before_seconds: Option<i64>,
+) -> bool {
+    let Some(create_time) = record.create_time else {
+        return after_seconds.is_none() && before_seconds.is_none();
+    };
+    if after_seconds.is_some_and(|after| create_time < after) {
+        return false;
+    }
+    if before_seconds.is_some_and(|before| create_time >= before) {
+        return false;
+    }
+    true
+}
+
+fn extract_xml_tag_clean(xml: &str, tag: &str) -> Option<String> {
+    extract_xml_tag(xml, tag)
+        .map(|value| clean_xml_text(&value))
+        .filter(|value| !value.is_empty())
+}
+
+fn clean_xml_text(value: &str) -> String {
+    let mut text = value.trim();
+    if let Some(inner) = text
+        .strip_prefix("<![CDATA[")
+        .and_then(|value| value.strip_suffix("]]>"))
+    {
+        text = inner.trim();
+    }
+    decode_xml_entities(text).trim().to_string()
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('&') {
+        output.push_str(&rest[..start]);
+        let after_amp = &rest[start + 1..];
+        let Some(end) = after_amp.find(';') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let entity = &after_amp[..end];
+        if let Some(decoded) = decode_xml_entity(entity) {
+            output.push(decoded);
+        } else {
+            output.push('&');
+            output.push_str(entity);
+            output.push(';');
+        }
+        rest = &after_amp[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn decode_xml_entity(entity: &str) -> Option<char> {
+    match entity {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let value = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+                .and_then(|value| u32::from_str_radix(value, 16).ok())
+                .or_else(|| {
+                    entity
+                        .strip_prefix('#')
+                        .and_then(|value| value.parse::<u32>().ok())
+                })?;
+            char::from_u32(value)
+        }
+    }
+}
+
+fn count_xml_element_starts(xml: &str, tag: &str) -> usize {
+    let needle = format!("<{tag}");
+    xml.match_indices(&needle)
+        .filter(|(idx, _)| {
+            let after = idx + needle.len();
+            let next = xml[after..].chars().next();
+            matches!(
+                next,
+                Some('>') | Some('/') | Some(' ') | Some('\n') | Some('\t')
+            )
+        })
+        .count()
+}
+
+fn extract_sns_media_types(xml: &str) -> Vec<String> {
+    let mut media_types = Vec::<String>::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<type") {
+        let after_start = &rest[start..];
+        let Some(close_bracket) = after_start.find('>') else {
+            break;
+        };
+        let content_start = start + close_bracket + 1;
+        let Some(content_end) = rest[content_start..].find("</type>") else {
+            break;
+        };
+        let value = clean_xml_text(&rest[content_start..content_start + content_end]);
+        if !value.is_empty() && !media_types.iter().any(|item| item == &value) {
+            media_types.push(value);
+        }
+        rest = &rest[content_start + content_end + "</type>".len()..];
+    }
+    media_types
+}
+
 async fn chatroom_snapshots(
     State(state): State<SharedState>,
     Path(chatroom_id): Path<String>,
@@ -3898,6 +4766,68 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(db)
     .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sns_posts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          target_wxid TEXT NOT NULL,
+          sns_id TEXT NOT NULL,
+          user_name TEXT,
+          nick_name TEXT,
+          create_time INTEGER,
+          create_time_iso TEXT,
+          fetched_at TEXT NOT NULL,
+          content_text TEXT,
+          content_style TEXT,
+          media_count INTEGER NOT NULL DEFAULT 0,
+          media_types_json TEXT NOT NULL DEFAULT '[]',
+          url_count INTEGER NOT NULL DEFAULT 0,
+          thumb_count INTEGER NOT NULL DEFAULT 0,
+          has_location INTEGER NOT NULL DEFAULT 0,
+          private_flag TEXT,
+          show_flag TEXT,
+          sight_folded TEXT,
+          like_count INTEGER NOT NULL DEFAULT 0,
+          comment_count INTEGER NOT NULL DEFAULT 0,
+          with_user_count INTEGER NOT NULL DEFAULT 0,
+          sns_xml TEXT,
+          post_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(target_wxid, sns_id)
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sns_posts_target_create ON sns_posts(target_wxid, create_time DESC, sns_id DESC)",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sns_posts_create ON sns_posts(create_time DESC)")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS sns_fetch_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          requested_contact TEXT,
+          target_wxid TEXT,
+          resolved_nick_name TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT NOT NULL,
+          request_json TEXT NOT NULL,
+          response_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_sns_fetch_runs_target_finished ON sns_fetch_runs(target_wxid, finished_at DESC)",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -4040,6 +4970,7 @@ enum ApiError {
     AsrConfig(&'static str),
     Asr(String),
     Io(std::io::Error),
+    BadRequest(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -4054,6 +4985,7 @@ impl std::fmt::Display for ApiError {
             Self::AsrConfig(error) => error.to_string(),
             Self::Asr(error) => error.clone(),
             Self::Io(error) => error.to_string(),
+            Self::BadRequest(error) => error.clone(),
         };
         formatter.write_str(&message)
     }
@@ -4103,6 +5035,13 @@ impl IntoResponse for ApiError {
             Self::AsrConfig(error) => error.to_string(),
             Self::Asr(error) => error,
             Self::Io(error) => error.to_string(),
+            Self::BadRequest(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "ok": false, "error": error })),
+                )
+                    .into_response();
+            }
         };
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4136,5 +5075,86 @@ mod tests {
         let candidate = candidates.iter().next().expect("candidate exists");
         assert_eq!(candidate.chatroom_id, "123@chatroom");
         assert_eq!(candidate.wxid, "wxid_member");
+    }
+
+    #[test]
+    fn sns_post_from_value_preserves_large_id_and_derives_xml_fields() {
+        let raw = json!({
+            "id": "14953681338304827928",
+            "userName": "wxid_target",
+            "nickName": "测试好友",
+            "createTime": 1783000000,
+            "likeCount": 2,
+            "commentCount": 1,
+            "withUserCount": 0,
+            "snsXml": r#"
+                <TimelineObject>
+                  <contentDesc><![CDATA[hello &amp; world]]></contentDesc>
+                  <contentStyle>3</contentStyle>
+                  <mediaList>
+                    <media><type>2</type><url>https://example.com/a</url><thumb>https://example.com/t</thumb></media>
+                    <media><type>4</type><url>https://example.com/b</url></media>
+                  </mediaList>
+                  <location>Shenzhen</location>
+                  <private>0</private>
+                  <showFlag>0</showFlag>
+                  <sightFolded>1</sightFolded>
+                </TimelineObject>
+            "#
+        });
+        let record = sns_post_from_value("wxid_target", &raw, "2026-07-04T00:00:00.000Z")
+            .expect("sns post parses");
+
+        assert_eq!(record.sns_id, "14953681338304827928");
+        assert_eq!(record.content_text.as_deref(), Some("hello & world"));
+        assert_eq!(record.content_style.as_deref(), Some("3"));
+        assert_eq!(record.media_count, 2);
+        assert_eq!(record.media_types, vec!["2".to_string(), "4".to_string()]);
+        assert_eq!(record.url_count, 2);
+        assert_eq!(record.thumb_count, 1);
+        assert!(record.has_location);
+        assert_eq!(record.private_flag.as_deref(), Some("0"));
+        assert_eq!(record.show_flag.as_deref(), Some("0"));
+        assert_eq!(record.sight_folded.as_deref(), Some("1"));
+        assert_eq!(record.like_count, 2);
+        assert_eq!(record.comment_count, 1);
+    }
+
+    #[test]
+    fn count_xml_element_starts_does_not_count_container_prefixes() {
+        let xml = "<mediaList><media><type>2</type></media><media attr=\"x\" /></mediaList>";
+        assert_eq!(count_xml_element_starts(xml, "media"), 2);
+        assert_eq!(extract_sns_media_types(xml), vec!["2".to_string()]);
+    }
+
+    #[test]
+    fn decode_xml_entities_handles_named_and_numeric_entities() {
+        assert_eq!(
+            decode_xml_entities("a&amp;b&#x0A;c&#10;d&apos;e&quot;"),
+            "a&b\nc\nd'e\""
+        );
+    }
+
+    #[test]
+    fn sns_contact_resolution_distinguishes_plain_alias_from_internal_v3() {
+        let search = json!({
+            "v3": "jyc20011206",
+            "nickName": "Hii:Dlen",
+            "alias": "jyc20011206"
+        });
+        let search_resolved =
+            sns_resolved_contact_from_gewe_search("jyc20011206", &search).expect("search resolves");
+        assert_eq!(search_resolved.target_wxid, "jyc20011206");
+        assert!(!looks_like_sns_fetch_id(&search_resolved.target_wxid));
+
+        let detail = json!({
+            "userName": "jyc20011206",
+            "v3": "v3_abc@stranger",
+            "nickName": "Hii:Dlen"
+        });
+        let detail_resolved =
+            sns_resolved_contact_from_detail("jyc20011206", &detail).expect("detail resolves");
+        assert_eq!(detail_resolved.target_wxid, "v3_abc@stranger");
+        assert!(looks_like_sns_fetch_id(&detail_resolved.target_wxid));
     }
 }

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wangnov.gewe-sync-chatroom-events</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PREFIX__/bin/gewe-run</string>
+		<string>--env</string>
+		<string>__PREFIX__/config/gewe-skill-memory.env</string>
+		<string>--timeout</string>
+		<string>600</string>
+		<string>--cursor-guard</string>
+		<string>GEWE_SKILL_CHATROOM_SNAPSHOT_CURSOR_FILE</string>
+		<string>--cursor-guard</string>
+		<string>GEWE_SKILL_CHATROOM_MEMBER_EVENT_CURSOR_FILE</string>
+		<string>--cursor-guard</string>
+		<string>GEWE_SKILL_CHATROOM_SYSTEM_EVENT_CURSOR_FILE</string>
+		<string>--</string>
+		<string>__PREFIX__/bin/gewe-skill</string>
+		<string>--json</string>
+		<string>sync</string>
+		<string>chatroom-events</string>
+		<string>--limit</string>
+		<string>500</string>
+	</array>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-sync-chatroom-events.log</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_DIR__/com.wangnov.gewe-sync-chatroom-events.log</string>
+	<key>StartInterval</key>
+	<integer>120</integer>
+</dict>
+</plist>

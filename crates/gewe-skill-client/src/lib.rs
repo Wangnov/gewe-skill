@@ -5,8 +5,9 @@ use gewe_skill_types::{
     ChatroomSystemEvent, ConversationSummary, IdentityEventBackfillRequest,
     IdentityEventBackfillResponse, IdentityProfileResponse, IdentityRefreshRequest,
     IdentityRefreshResponse, IdentityResolveResponse, IngestEventRequest, MessageContextResponse,
-    MessageQuery, NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery,
-    VoiceTranscribeRequest, VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
+    MessageQuery, NormalizedMessage, RawCallbackRequest, SnsFetchRequest, SnsFetchResponse,
+    SnsPostQuery, SnsPostRecord, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
+    VoiceTranscribeResponse, VoiceWarmRequest, VoiceWarmResponse,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -318,6 +319,26 @@ impl GeweSkillClient {
         self.post_write_json_as("api/voice/warm", request).await
     }
 
+    pub async fn fetch_sns(
+        &self,
+        request: &SnsFetchRequest,
+    ) -> Result<SnsFetchResponse, ClientError> {
+        self.post_write_json_as("api/sns/fetch", request).await
+    }
+
+    pub async fn sns_posts(
+        &self,
+        query: &SnsPostQuery,
+    ) -> Result<ApiPage<SnsPostRecord>, ClientError> {
+        let mut url = self.url("api/sns/posts")?;
+        append_sns_query(&mut url, query);
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.read_token {
+            request = request.bearer_auth(token);
+        }
+        Self::decode_response(request.send().await?).await
+    }
+
     pub async fn chatroom_snapshots(
         &self,
         chatroom_id: &str,
@@ -437,5 +458,30 @@ fn append_voice_query(url: &mut Url, query: &VoiceQuery) {
     }
     if let Some(value) = query.missing_only {
         pairs.append_pair("missing_only", if value { "true" } else { "false" });
+    }
+}
+
+fn append_sns_query(url: &mut Url, query: &SnsPostQuery) {
+    let mut pairs = url.query_pairs_mut();
+    if let Some(value) = &query.target_wxid {
+        pairs.append_pair("target_wxid", value);
+    }
+    if let Some(value) = &query.q {
+        pairs.append_pair("q", value);
+    }
+    if let Some(value) = &query.after {
+        pairs.append_pair("after", value);
+    }
+    if let Some(value) = &query.before {
+        pairs.append_pair("before", value);
+    }
+    if let Some(value) = &query.cursor {
+        pairs.append_pair("cursor", value);
+    }
+    if let Some(value) = query.limit {
+        pairs.append_pair("limit", &value.to_string());
+    }
+    if let Some(value) = &query.order {
+        pairs.append_pair("order", value);
     }
 }

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/gewe-api-cli",
   "crates/gewe-skill-types",
   "crates/gewe-skill-core",
   "crates/gewe-skill-memory",

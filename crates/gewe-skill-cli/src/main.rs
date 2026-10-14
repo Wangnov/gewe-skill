@@ -10,8 +10,8 @@ use gewe_skill_core::normalize_callback;
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, IdentityEventBackfillRequest, IdentityMatch,
     IdentityProfileResponse, IdentityRefreshRequest, MessageQuery, NormalizedKind,
-    NormalizedMessage, RawCallbackRequest, VoiceItem, VoiceQuery, VoiceTranscribeRequest,
-    VoiceWarmRequest,
+    NormalizedMessage, RawCallbackRequest, SnsFetchRequest, SnsPostQuery, SnsPostRecord,
+    SnsResolvedContact, VoiceItem, VoiceQuery, VoiceTranscribeRequest, VoiceWarmRequest,
 };
 use reqwest::Url;
 use serde::Deserialize;
@@ -95,6 +95,11 @@ enum Command {
     Voice {
         #[command(subcommand)]
         command: VoiceCommand,
+    },
+    /// Fetch, store, query, and export WeChat friend Moments/SNS posts.
+    Sns {
+        #[command(subcommand)]
+        command: SnsCommand,
     },
     /// Inspect chatroom snapshots and member/system events.
     Chatrooms {
@@ -413,6 +418,97 @@ struct VoiceFilterArgs {
     limit: i64,
     #[arg(long, value_enum, default_value = "desc")]
     order: Order,
+}
+
+#[derive(Debug, Subcommand)]
+enum SnsCommand {
+    /// Resolve a contact, page through their Moments, and persist the returned posts.
+    Fetch {
+        #[command(flatten)]
+        args: SnsFetchArgs,
+    },
+    /// List stored Moments posts from local memory.
+    List {
+        #[command(flatten)]
+        filters: SnsFilterArgs,
+    },
+    /// Export a local AI analysis package, refreshing from GeWe by default.
+    Export {
+        #[command(flatten)]
+        args: SnsExportArgs,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+struct SnsFetchArgs {
+    /// Human nickname, WeChat ID, alias, or other search wording. The CLI resolves it through GeWe.
+    #[arg(long)]
+    contact: Option<String>,
+    /// Exact internal wxid/v3 escape hatch.
+    #[arg(long)]
+    target_wxid: Option<String>,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    max_pages: Option<i64>,
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long, default_value_t = false)]
+    include_outside_first_page: bool,
+    #[arg(long = "no-decrypt", action = ArgAction::SetFalse, default_value_t = true)]
+    decrypt: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SnsFilterArgs {
+    #[arg(long)]
+    target_wxid: Option<String>,
+    #[arg(long)]
+    q: Option<String>,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long, value_enum, default_value = "desc")]
+    order: Order,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SnsExportArgs {
+    /// Human nickname, WeChat ID, alias, or other search wording. When refresh is enabled, this is resolved through GeWe.
+    #[arg(long)]
+    contact: Option<String>,
+    /// Exact internal wxid/v3 escape hatch.
+    #[arg(long)]
+    target_wxid: Option<String>,
+    #[arg(long)]
+    after: Option<String>,
+    #[arg(long)]
+    before: Option<String>,
+    #[arg(long)]
+    max_pages: Option<i64>,
+    #[arg(long, default_value_t = 50)]
+    limit: i64,
+    #[arg(long, value_enum, default_value = "markdown")]
+    format: SnsExportFormat,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long = "no-refresh", action = ArgAction::SetFalse, default_value_t = true)]
+    refresh: bool,
+    #[arg(long = "no-decrypt", action = ArgAction::SetFalse, default_value_t = true)]
+    decrypt: bool,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum SnsExportFormat {
+    Markdown,
+    Jsonl,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1144,6 +1240,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
         },
+        Command::Sns { command } => match command {
+            SnsCommand::Fetch { args } => {
+                print_json(client.fetch_sns(&sns_fetch_request(args)).await?)?;
+            }
+            SnsCommand::List { filters } => {
+                print_json(client.sns_posts(&sns_query(filters)).await?)?;
+            }
+            SnsCommand::Export { args } => {
+                print_json(export_sns_analysis_package(&client, args).await?)?;
+            }
+        },
         Command::Chatrooms { command } => match command {
             ChatroomsCommand::Snapshots { chatroom_id, limit } => {
                 print_json(client.chatroom_snapshots(&chatroom_id, Some(limit)).await?)?
@@ -1557,6 +1664,268 @@ fn message_query(q: Option<String>, filters: MessageFilterArgs) -> MessageQuery 
         limit: Some(filters.limit),
         order: Some(filters.order.query_value()),
     }
+}
+
+fn sns_fetch_request(args: SnsFetchArgs) -> SnsFetchRequest {
+    SnsFetchRequest {
+        contact: args.contact,
+        target_wxid: args.target_wxid,
+        after: args.after,
+        before: args.before,
+        max_pages: args.max_pages,
+        limit: Some(args.limit),
+        include_outside_first_page: Some(args.include_outside_first_page),
+        decrypt: Some(args.decrypt),
+    }
+}
+
+fn sns_query(filters: SnsFilterArgs) -> SnsPostQuery {
+    SnsPostQuery {
+        target_wxid: filters.target_wxid,
+        q: filters.q,
+        after: filters.after,
+        before: filters.before,
+        cursor: filters.cursor,
+        limit: Some(filters.limit),
+        order: Some(filters.order.query_value()),
+    }
+}
+
+async fn export_sns_analysis_package(
+    client: &GeweSkillClient,
+    args: SnsExportArgs,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (items, resolved_contact, source, warnings) = if args.refresh {
+        let response = client
+            .fetch_sns(&SnsFetchRequest {
+                contact: args.contact.clone(),
+                target_wxid: args.target_wxid.clone(),
+                after: args.after.clone(),
+                before: args.before.clone(),
+                max_pages: args.max_pages,
+                limit: Some(args.limit),
+                include_outside_first_page: Some(false),
+                decrypt: Some(args.decrypt),
+            })
+            .await?;
+        (
+            response.items,
+            response.resolved_contact,
+            "gewe_fetch_then_export",
+            response.warnings,
+        )
+    } else {
+        let page = client
+            .sns_posts(&SnsPostQuery {
+                target_wxid: args.target_wxid.clone(),
+                q: args.contact.clone(),
+                after: args.after.clone(),
+                before: args.before.clone(),
+                cursor: None,
+                limit: Some(args.limit),
+                order: Some("desc".to_string()),
+            })
+            .await?;
+        (page.items, None, "stored_posts_export", Vec::new())
+    };
+
+    let rendered = match args.format {
+        SnsExportFormat::Markdown => render_sns_markdown(
+            args.contact.as_deref(),
+            args.target_wxid.as_deref(),
+            resolved_contact.as_ref(),
+            &items,
+            &warnings,
+        )?,
+        SnsExportFormat::Jsonl => render_sns_jsonl(&items)?,
+    };
+    if let Some(parent) = args.output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&args.output, rendered.as_bytes())?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "source": source,
+        "output": args.output,
+        "format": format!("{:?}", args.format).to_ascii_lowercase(),
+        "post_count": items.len(),
+        "resolved_contact": resolved_contact,
+        "warnings": warnings,
+        "oldest_create_time_iso": items.iter().filter_map(|item| item.create_time_iso.as_deref()).min(),
+        "newest_create_time_iso": items.iter().filter_map(|item| item.create_time_iso.as_deref()).max(),
+    }))
+}
+
+fn render_sns_jsonl(items: &[SnsPostRecord]) -> Result<String, serde_json::Error> {
+    let mut output = String::new();
+    for item in items {
+        output.push_str(&serde_json::to_string(item)?);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn render_sns_markdown(
+    contact: Option<&str>,
+    target_wxid: Option<&str>,
+    resolved: Option<&SnsResolvedContact>,
+    items: &[SnsPostRecord],
+    warnings: &[serde_json::Value],
+) -> Result<String, serde_json::Error> {
+    let mut output = String::new();
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let resolved_target = resolved
+        .map(|item| item.target_wxid.as_str())
+        .or(target_wxid)
+        .unwrap_or("");
+    let display_name = resolved
+        .and_then(|item| item.nick_name.as_deref())
+        .or_else(|| items.iter().find_map(|item| item.nick_name.as_deref()));
+    let oldest = items
+        .iter()
+        .filter_map(|item| item.create_time_iso.as_deref())
+        .min()
+        .unwrap_or("");
+    let newest = items
+        .iter()
+        .filter_map(|item| item.create_time_iso.as_deref())
+        .max()
+        .unwrap_or("");
+    let content_style_counts = count_sns_field(items, |item| item.content_style.as_deref());
+    let media_type_counts = count_sns_media_types(items);
+    output.push_str("# 朋友圈分析包\n\n");
+    output.push_str(&format!("- generated_at: {generated_at}\n"));
+    if let Some(contact) = contact.filter(|value| !value.trim().is_empty()) {
+        output.push_str(&format!("- contact_query: {}\n", markdown_inline(contact)));
+    }
+    if !resolved_target.is_empty() {
+        output.push_str(&format!(
+            "- target_wxid: {}\n",
+            markdown_inline(resolved_target)
+        ));
+    }
+    if let Some(display_name) = display_name {
+        output.push_str(&format!(
+            "- display_name: {}\n",
+            markdown_inline(display_name)
+        ));
+    }
+    output.push_str(&format!("- post_count: {}\n", items.len()));
+    if !oldest.is_empty() || !newest.is_empty() {
+        output.push_str(&format!("- time_window: {oldest} .. {newest}\n"));
+    }
+    output.push_str(&format!(
+        "- content_style_counts: {}\n",
+        serde_json::to_string(&content_style_counts)?
+    ));
+    output.push_str(&format!(
+        "- media_type_counts: {}\n\n",
+        serde_json::to_string(&media_type_counts)?
+    ));
+    output.push_str("## 分析说明\n\n");
+    output.push_str("- 每条记录保留稳定 sns_id、发布时间、正文、内容样式、媒体数量、位置标记和基础互动计数字段。\n");
+    output.push_str(
+        "- Markdown 导出不会展开媒体 URL；需要完整 raw JSON 时请使用 `--format jsonl`。\n",
+    );
+    output.push_str(
+        "- 互动字段只代表当前账号可见范围内的数据，分析时应优先依据内容、时间和主题模式。\n\n",
+    );
+    if !warnings.is_empty() {
+        output.push_str("## 数据限制\n\n");
+        for warning in warnings {
+            let code = warning
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("warning");
+            let message = warning
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            output.push_str(&format!(
+                "- {}: {}\n",
+                markdown_inline(code),
+                markdown_inline(message)
+            ));
+        }
+        output.push('\n');
+    }
+    output.push_str("## 朋友圈记录\n\n");
+    for (index, item) in items.iter().enumerate() {
+        let title_time = item.create_time_iso.as_deref().unwrap_or(&item.fetched_at);
+        output.push_str(&format!(
+            "### {}. {}\n\n",
+            index + 1,
+            markdown_inline(title_time)
+        ));
+        output.push_str(&format!("- sns_id: {}\n", markdown_inline(&item.sns_id)));
+        if let Some(style) = item.content_style.as_deref() {
+            output.push_str(&format!("- content_style: {}\n", markdown_inline(style)));
+        }
+        output.push_str(&format!(
+            "- media: count={}, types={}\n",
+            item.media_count,
+            serde_json::to_string(&item.media_types)?
+        ));
+        output.push_str(&format!(
+            "- url_count: {}, thumb_count: {}, has_location: {}\n",
+            item.url_count, item.thumb_count, item.has_location
+        ));
+        output.push_str(&format!(
+            "- visible_like_count: {}, visible_comment_count: {}, with_user_count: {}\n\n",
+            item.like_count, item.comment_count, item.with_user_count
+        ));
+        output.push_str("正文：\n\n");
+        let text = item
+            .content_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(无文字正文)");
+        output.push_str(&markdown_blockquote(text));
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn count_sns_field<'a>(
+    items: &'a [SnsPostRecord],
+    mut field: impl FnMut(&'a SnsPostRecord) -> Option<&'a str>,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for item in items {
+        let key = field(item)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+}
+
+fn count_sns_media_types(items: &[SnsPostRecord]) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for item in items {
+        if item.media_types.is_empty() {
+            *counts.entry("none".to_string()).or_default() += 1;
+            continue;
+        }
+        for media_type in &item.media_types {
+            *counts.entry(media_type.clone()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn markdown_inline(value: &str) -> String {
+    value.replace('\n', " ").replace('|', "\\|")
+}
+
+fn markdown_blockquote(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("> {line}\n"))
+        .collect::<String>()
 }
 
 async fn agent_query_messages(
