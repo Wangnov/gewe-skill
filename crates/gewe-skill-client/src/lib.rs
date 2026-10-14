@@ -64,6 +64,21 @@ impl GeweSkillClient {
         self.get_json("api/maintenance/status", None).await
     }
 
+    pub async fn attachment_mime_backfill(
+        &self,
+        dry_run: bool,
+        after_id: i64,
+        limit: u32,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.post_write_json(
+            "write/maintenance/attachment-mime",
+            &serde_json::json!({
+                "dry_run": dry_run, "after_id": after_id, "limit": limit
+            }),
+        )
+        .await
+    }
+
     pub async fn maintenance_identity_event_backfill(
         &self,
         request: &IdentityEventBackfillRequest,
@@ -304,6 +319,17 @@ impl GeweSkillClient {
         Self::decode_response(request.send().await?).await
     }
 
+    pub async fn voices_by_message_keys(
+        &self,
+        message_keys: &[String],
+    ) -> Result<ApiPage<VoiceItem>, ClientError> {
+        self.post_read_json_as(
+            "api/voice/by-message-keys",
+            &serde_json::json!({ "message_keys": message_keys }),
+        )
+        .await
+    }
+
     pub async fn transcribe_voice(
         &self,
         request: &VoiceTranscribeRequest,
@@ -401,6 +427,9 @@ impl GeweSkillClient {
 
 fn append_message_query(url: &mut Url, query: &MessageQuery) {
     let mut pairs = url.query_pairs_mut();
+    if query.dm == Some(true) {
+        pairs.append_pair("dm", "true");
+    }
     if let Some(value) = &query.q {
         pairs.append_pair("q", value);
     }

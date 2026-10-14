@@ -28,6 +28,11 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-targets
 
+      - name: Test local usability through CLI and temporary memory
+        run: |
+          cargo build --locked -p gewe-skill-cli -p gewe-skill-memory --bins
+          python3 scripts/test-usability-2026-10-15.py
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-latest
@@ -60,3 +65,6 @@ jobs:
 
       - name: Check TypeScript
         run: npm run check
+
+      - name: Test edge
+        run: npm test

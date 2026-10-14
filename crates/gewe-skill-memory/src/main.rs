@@ -1,3 +1,7 @@
+mod attachment_mime;
+mod message_reads;
+use message_reads::list_messages_impl;
+
 use axum::{
     extract::{Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -136,6 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route(
+            "/write/maintenance/attachment-mime",
+            post(attachment_mime::backfill).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_write_token,
+            )),
+        )
+        .route(
             "/write/events",
             post(write_event).route_layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -250,6 +261,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/voice",
             get(list_voice).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_read_token,
+            )),
+        )
+        .route(
+            "/api/voice/by-message-keys",
+            post(voices_by_message_keys).route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_read_token,
             )),
@@ -616,8 +634,9 @@ async fn write_raw_event(
 
 async fn write_attachment(
     State(state): State<SharedState>,
-    Json(record): Json<AttachmentRecord>,
+    Json(mut record): Json<AttachmentRecord>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    attachment_mime::correct_record(&state.attachment_dir, &mut record).map_err(ApiError::Io)?;
     let should_auto_transcribe =
         matches!(&record.kind, AttachmentKind::Voice) && auto_voice_transcribe_enabled();
     let message_key = record.message_key.clone();
@@ -764,93 +783,6 @@ async fn list_messages(
     list_messages_impl(&state.db, &query).await.map(Json)
 }
 
-async fn list_messages_impl(
-    db: &SqlitePool,
-    query: &MessageQuery,
-) -> Result<ApiPage<NormalizedMessage>, ApiError> {
-    let limit = clamp_limit(query.limit);
-    let order = query
-        .order
-        .as_deref()
-        .unwrap_or("desc")
-        .to_ascii_lowercase();
-    let ascending = order == "asc";
-    let mut sql = String::from("SELECT message_json FROM messages WHERE 1 = 1");
-    let mut args = Vec::<String>::new();
-
-    if let Some(value) = query
-        .conversation_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        sql.push_str(" AND conversation_id = ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query
-        .sender_wxid
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        sql.push_str(" AND sender_wxid = ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.kind.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND lower(kind) = lower(?)");
-        args.push(value.to_string());
-    }
-    match query
-        .direction
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("incoming") => sql.push_str(" AND is_outgoing = 0"),
-        Some("outgoing") => sql.push_str(" AND is_outgoing != 0"),
-        _ => {}
-    }
-    if let Some(value) = query.after.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND received_at >= ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.before.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND received_at < ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.cursor.as_deref().filter(|value| !value.is_empty()) {
-        if ascending {
-            sql.push_str(" AND received_at > ?");
-        } else {
-            sql.push_str(" AND received_at < ?");
-        }
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.q.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND (content_text LIKE ? OR message_json LIKE ?)");
-        let pattern = format!("%{value}%");
-        args.push(pattern.clone());
-        args.push(pattern);
-    }
-    if ascending {
-        sql.push_str(" ORDER BY received_at ASC, id ASC LIMIT ?");
-    } else {
-        sql.push_str(" ORDER BY received_at DESC, id DESC LIMIT ?");
-    }
-
-    let mut statement = sqlx::query(&sql);
-    for arg in args {
-        statement = statement.bind(arg);
-    }
-    let rows = statement.bind(limit).fetch_all(db).await?;
-    let items = rows
-        .iter()
-        .filter_map(|row| {
-            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json")).ok()
-        })
-        .collect::<Vec<_>>();
-    let next_cursor = items.last().map(|message| message.received_at.clone());
-    Ok(ApiPage { items, next_cursor })
-}
-
 async fn message_context(
     State(state): State<SharedState>,
     Path(message_key): Path<String>,
@@ -874,6 +806,7 @@ async fn message_context(
             before: Vec::new(),
             anchor: None,
             after: Vec::new(),
+            pagination: None,
         }));
     };
     let anchor_id: i64 = anchor_row.get("id");
@@ -898,7 +831,15 @@ async fn message_context(
         clamp_limit(query.after),
     )
     .await?;
+    let messages = before
+        .iter()
+        .chain(anchor.iter())
+        .chain(after.iter())
+        .collect::<Vec<_>>();
+    let pagination =
+        message_reads::context_pagination(&state.db, conversation_id.clone(), &messages).await?;
     Ok(Json(MessageContextResponse {
+        pagination,
         conversation_id,
         message_key,
         before,
@@ -928,8 +869,8 @@ async fn context_rows(
         SELECT message_json
         FROM messages
         WHERE conversation_id = ?
-          AND (received_at {operator} ? OR (received_at = ? AND id {operator} ?))
-        ORDER BY received_at {order}, id {order}
+          AND (julianday(received_at) {operator} julianday(?) OR (julianday(received_at) = julianday(?) AND id {operator} ?))
+        ORDER BY julianday(received_at) {order}, id {order}
         LIMIT ?
         "#
     );
@@ -991,6 +932,7 @@ async fn conversations(
     Ok(Json(ApiPage {
         items,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -999,29 +941,12 @@ async fn resolve_identity(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<IdentityResolveResponse>, ApiError> {
     let limit = clamp_limit(query.limit);
-    let mut items = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
     for term in identity_query_terms(&query.q) {
-        let matches = query_identity_matches(&state.db, &term, query.q.trim(), limit).await?;
-        for item in matches {
-            let key = format!(
-                "{}:{}:{}:{}",
-                item.entity_type,
-                item.entity_id,
-                item.chatroom_id.as_deref().unwrap_or_default(),
-                item.source.as_deref().unwrap_or_default()
-            );
-            if seen.insert(key) {
-                items.push(item);
-            }
-            if items.len() >= limit as usize {
-                break;
-            }
-        }
-        if items.len() >= limit as usize {
-            break;
-        }
+        matches.extend(query_identity_matches(&state.db, &term, query.q.trim(), limit).await?);
     }
+    let mut items = gewe_skill_core::identity::merge_identity_matches(matches);
+    items.truncate(usize::try_from(limit).unwrap_or(200));
     Ok(Json(IdentityResolveResponse {
         query: query.q,
         items,
@@ -1032,7 +957,7 @@ async fn query_identity_matches(
     db: &SqlitePool,
     term: &str,
     raw_query: &str,
-    limit: i64,
+    _limit: i64,
 ) -> Result<Vec<IdentityMatch>, ApiError> {
     let alias_key = normalize_alias(term);
     let like = format!("%{}%", term.trim());
@@ -1072,14 +997,12 @@ async fn query_identity_matches(
         FROM identity_aliases
         WHERE alias_key = ? OR alias LIKE ? OR entity_id = ?
         ORDER BY score DESC, last_seen_at DESC
-        LIMIT ?
         "#,
     )
     .bind(&alias_key)
     .bind(&alias_key)
     .bind(&like)
     .bind(raw_query)
-    .bind(limit)
     .fetch_all(db)
     .await?;
     Ok(rows
@@ -1094,6 +1017,9 @@ async fn query_identity_matches(
             is_current: row.get::<i64, _>("is_current") != 0,
             score: row.get("score"),
             last_seen_at: row.get("last_seen_at"),
+            sources: Vec::new(),
+            chatroom_ids: Vec::new(),
+            matched_aliases: Vec::new(),
         })
         .collect())
 }
@@ -1249,6 +1175,9 @@ async fn identity_alias_profiles(
             is_current: row.get::<i64, _>("is_current") != 0,
             score: row.get("score"),
             last_seen_at: row.get("last_seen_at"),
+            sources: Vec::new(),
+            chatroom_ids: Vec::new(),
+            matched_aliases: Vec::new(),
         })
         .collect())
 }
@@ -1766,19 +1695,18 @@ async fn recent_attachments(
     .bind(limit)
     .fetch_all(&state.db)
     .await?;
-    let items = rows
-        .iter()
-        .filter_map(|row| {
-            let mut record =
-                serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))
-                    .ok()?;
-            record.id = Some(row.get("id"));
-            Some(record)
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::new();
+    for row in &rows {
+        let mut record: AttachmentRecord = serde_json::from_str(row.get("attachment_json"))?;
+        record.id = Some(row.get("id"));
+        attachment_mime::correct_record(&state.attachment_dir, &mut record)
+            .map_err(ApiError::Io)?;
+        items.push(record);
+    }
     Ok(Json(ApiPage {
         items,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -1816,11 +1744,14 @@ async fn attachments_by_job_keys(
         let mut record =
             serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
         record.id = Some(row.get("id"));
+        attachment_mime::correct_record(&state.attachment_dir, &mut record)
+            .map_err(ApiError::Io)?;
         items.push(record);
     }
     Ok(Json(ApiPage {
         items,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -1855,12 +1786,15 @@ async fn attachments_by_message_keys(
             let mut record =
                 serde_json::from_str::<AttachmentRecord>(row.get::<&str, _>("attachment_json"))?;
             record.id = Some(row.get("id"));
+            attachment_mime::correct_record(&state.attachment_dir, &mut record)
+                .map_err(ApiError::Io)?;
             items.push(record);
         }
     }
     Ok(Json(ApiPage {
         items,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -1908,7 +1842,7 @@ async fn download_attachment(
     Ok((
         [(
             "content-type",
-            mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            gewe_skill_core::mime::corrected_mime(&bytes, mime_type.as_deref()),
         )],
         bytes,
     )
@@ -2022,75 +1956,59 @@ async fn list_voice_impl(
     db: &SqlitePool,
     query: &VoiceQuery,
 ) -> Result<ApiPage<VoiceItem>, ApiError> {
-    let limit = clamp_limit(query.limit);
-    let order = query
-        .order
-        .as_deref()
-        .unwrap_or("desc")
-        .to_ascii_lowercase();
-    let ascending = order == "asc";
-    let mut sql =
-        String::from("SELECT message_json FROM messages WHERE lower(kind) = lower('Voice')");
-    let mut args = Vec::<String>::new();
-
-    if let Some(value) = query
-        .conversation_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        sql.push_str(" AND conversation_id = ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query
-        .sender_wxid
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        sql.push_str(" AND sender_wxid = ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.after.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND received_at >= ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.before.as_deref().filter(|value| !value.is_empty()) {
-        sql.push_str(" AND received_at < ?");
-        args.push(value.to_string());
-    }
-    if let Some(value) = query.cursor.as_deref().filter(|value| !value.is_empty()) {
-        if ascending {
-            sql.push_str(" AND received_at > ?");
-        } else {
-            sql.push_str(" AND received_at < ?");
-        }
-        args.push(value.to_string());
-    }
-    if ascending {
-        sql.push_str(" ORDER BY received_at ASC, id ASC LIMIT ?");
-    } else {
-        sql.push_str(" ORDER BY received_at DESC, id DESC LIMIT ?");
-    }
-
-    let mut statement = sqlx::query(&sql);
-    for arg in args {
-        statement = statement.bind(arg);
-    }
-    let rows = statement.bind(limit).fetch_all(db).await?;
+    let messages = list_messages_impl(
+        db,
+        &MessageQuery {
+            conversation_id: query.conversation_id.clone(),
+            sender_wxid: query.sender_wxid.clone(),
+            kind: Some("voice".to_string()),
+            after: query.after.clone(),
+            before: query.before.clone(),
+            cursor: query.cursor.clone(),
+            limit: query.limit,
+            order: query.order.clone(),
+            ..MessageQuery::default()
+        },
+    )
+    .await?;
     let mut items = Vec::new();
-    for row in rows {
-        let Ok(message) =
-            serde_json::from_str::<NormalizedMessage>(row.get::<&str, _>("message_json"))
-        else {
-            continue;
-        };
+    for message in messages.items {
         let item = voice_item_from_message(db, message).await?;
         if query.missing_only.unwrap_or(false) && item.availability != "missing_attachment" {
             continue;
         }
         items.push(item);
     }
-    let next_cursor = items.last().map(|item| item.message.received_at.clone());
-    Ok(ApiPage { items, next_cursor })
+    Ok(ApiPage {
+        items,
+        next_cursor: messages.next_cursor,
+        pagination: None,
+    })
+}
+
+async fn voices_by_message_keys(
+    State(state): State<SharedState>,
+    Json(request): Json<AttachmentMessageKeyLookupRequest>,
+) -> Result<Json<ApiPage<VoiceItem>>, ApiError> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for key in request.message_keys.into_iter().take(1000) {
+        if seen.insert(key.clone()) {
+            if let Some(message) = voice_message_by_key(&state.db, &key).await? {
+                let mut item = voice_item_from_message(&state.db, message).await?;
+                if let Some(record) = &mut item.attachment {
+                    attachment_mime::correct_record(&state.attachment_dir, record)
+                        .map_err(ApiError::Io)?;
+                }
+                items.push(item);
+            }
+        }
+    }
+    Ok(Json(ApiPage {
+        items,
+        next_cursor: None,
+        pagination: None,
+    }))
 }
 
 async fn voice_item_from_message(
@@ -3184,7 +3102,11 @@ async fn list_sns_posts_impl(
     } else {
         None
     };
-    Ok(ApiPage { items, next_cursor })
+    Ok(ApiPage {
+        items,
+        next_cursor,
+        pagination: None,
+    })
 }
 
 fn sns_post_record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SnsPostRecord, ApiError> {
@@ -3440,6 +3362,7 @@ async fn chatroom_snapshots(
     Ok(Json(ApiPage {
         items: rows,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -3459,6 +3382,7 @@ async fn chatroom_events(
     Ok(Json(ApiPage {
         items: rows,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -3478,6 +3402,7 @@ async fn chatroom_system_events(
     Ok(Json(ApiPage {
         items: rows,
         next_cursor: None,
+        pagination: None,
     }))
 }
 
@@ -4573,6 +4498,12 @@ async fn init_db(db: &SqlitePool) -> Result<(), sqlx::Error> {
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         );
         "#,
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_conversation_instant ON messages(conversation_id, julianday(received_at), id)").execute(db).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_messages_instant ON messages(julianday(received_at), id)",
     )
     .execute(db)
     .await?;

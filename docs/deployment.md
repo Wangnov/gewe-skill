@@ -1,5 +1,11 @@
 # Deployment
 
+## 2026-10-15 待审上线
+
+`scripts/deploy-oci-2026-10-15.sh` 从本机工作区使用 cargo-zigbuild + Zig 构建 aarch64-unknown-linux-gnu（默认 glibc 下限 2.28），支持 --build-only 与显式 --deploy。上线时校验 SHA-256，保存带时间戳的二进制备份，原子替换两份程序，仅重启 gewe-skill-memory.service；健康接口和认证只读查询失败时恢复备份再验收。不会修改 systemd/定时器、发布版本或部署 edge。
+
+MIME 回填单独使用 --mime-dry-run / --mime-apply；apply 前先 dry-run，普通上线不执行。定向附件 repair 需要新版 Worker，OCI 脚本不能替代 edge 上线。脚本必须经负责人放行再执行，本次仅本机编译与语法检查；完整交付说明见根目录 DELIVERY-2026-10-15.md。
+
 ## Edge
 
 `apps/gewe-skill-edge` runs on Cloudflare Workers.

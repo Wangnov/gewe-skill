@@ -111,6 +111,9 @@ pub struct MessageQuery {
     pub cursor: Option<Timestamp>,
     pub limit: Option<i64>,
     pub order: Option<String>,
+    /// Restrict the window to private conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dm: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +123,8 @@ pub struct MessageContextResponse {
     pub before: Vec<NormalizedMessage>,
     pub anchor: Option<NormalizedMessage>,
     pub after: Vec<NormalizedMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<MessagePagination>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +320,12 @@ pub struct IdentityMatch {
     pub is_current: bool,
     pub score: f64,
     pub last_seen_at: Option<Timestamp>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub chatroom_ids: Vec<String>,
+    #[serde(default)]
+    pub matched_aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,4 +531,21 @@ pub struct RawCallbackRequest {
 pub struct ApiPage<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pagination: Option<MessagePagination>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePagination {
+    pub order: String,
+    pub selection: String,
+    pub time_basis: String,
+    pub returned: usize,
+    pub start_at: Option<Timestamp>,
+    pub end_at: Option<Timestamp>,
+    pub has_more: bool,
+    pub has_earlier: bool,
+    pub has_later: bool,
+    pub earlier_cursor: Option<String>,
+    pub later_cursor: Option<String>,
 }

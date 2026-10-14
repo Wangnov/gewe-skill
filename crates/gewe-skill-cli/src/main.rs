@@ -1,12 +1,17 @@
+mod attachment_io;
+use attachment_io::{
+    download_selected_attachment, repair_one_message_attachment, write_file_or_stdout,
+};
 mod attachment_maintenance;
 mod chatroom_events;
 mod data_health;
+mod message_output;
 use crate::data_health::maintenance_data_health_report;
 mod voice_maintenance;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use gewe_skill_client::GeweSkillClient;
-use gewe_skill_core::normalize_callback;
+use gewe_skill_core::{message_sender_id, normalize_callback};
 use gewe_skill_types::{
     ApiPage, AttachmentKind, AttachmentRecord, IdentityEventBackfillRequest, IdentityMatch,
     IdentityProfileResponse, IdentityRefreshRequest, MessageQuery, NormalizedKind,
@@ -197,6 +202,8 @@ enum MessagesCommand {
     List {
         #[command(flatten)]
         filters: MessageFilterArgs,
+        #[command(flatten)]
+        output: message_output::MessageOutputArgs,
     },
     /// Search message text/XML within an optional scoped window.
     Search {
@@ -204,6 +211,8 @@ enum MessagesCommand {
         q: String,
         #[command(flatten)]
         filters: MessageFilterArgs,
+        #[command(flatten)]
+        output: message_output::MessageOutputArgs,
     },
     /// Read messages around a known message key.
     Context {
@@ -213,6 +222,8 @@ enum MessagesCommand {
         before: u32,
         #[arg(long, default_value_t = 5)]
         after: u32,
+        #[command(flatten)]
+        output: message_output::MessageOutputArgs,
     },
 }
 
@@ -240,6 +251,11 @@ struct MessageFilterArgs {
 
 #[derive(Debug, Clone, Args)]
 struct AgentMessageQueryArgs {
+    #[command(flatten)]
+    output: message_output::MessageOutputArgs,
+    /// Resolve and read private conversations only.
+    #[arg(long)]
+    dm: bool,
     /// Human chatroom/contact wording. The CLI resolves it to conversation_id before reading.
     #[arg(long)]
     conversation: Option<String>,
@@ -360,11 +376,21 @@ enum AttachmentsCommand {
         #[arg(long)]
         kind: Option<String>,
     },
-    /// Download one synced attachment by sha256.
+    /// Download by message key or sha256. Use --index when a message has multiple attachments.
     Download {
-        #[arg(long)]
-        sha256: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            required_unless_present = "message_key",
+            conflicts_with = "message_key"
+        )]
+        sha256: Option<String>,
+        #[arg(long, required_unless_present = "sha256")]
+        message_key: Option<String>,
+        /// One-based attachment index from the selection error or attachments list.
+        #[arg(long, requires = "message_key", value_parser = clap::value_parser!(u32).range(1..))]
+        index: Option<u32>,
+        /// Local output file, or - for unadorned binary stdout.
+        #[arg(short = 'o', long, default_value = "-")]
         output: PathBuf,
     },
 }
@@ -497,7 +523,7 @@ struct SnsExportArgs {
     limit: i64,
     #[arg(long, value_enum, default_value = "markdown")]
     format: SnsExportFormat,
-    #[arg(long)]
+    #[arg(short = 'o', long)]
     output: PathBuf,
     #[arg(long = "no-refresh", action = ArgAction::SetFalse, default_value_t = true)]
     refresh: bool,
@@ -672,6 +698,12 @@ enum SyncCommand {
     },
     /// Run one bounded attachment queue repair sweep: backfill, requeue, then sync completed files.
     AttachmentRepair {
+        /// Repair only this message, without touching global queues or sync cursors.
+        #[arg(long)]
+        message_key: Option<String>,
+        /// Maximum seconds to wait for the targeted download and memory sync.
+        #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u64).range(1..=600))]
+        wait_seconds: u64,
         #[arg(
             long,
             env = "GEWE_SKILL_EDGE_URL",
@@ -764,6 +796,13 @@ enum SyncCommand {
 
 #[derive(Debug, Subcommand)]
 enum MaintenanceCommand {
+    /// Correct stored attachment MIME columns and JSON from file headers. Defaults to dry-run.
+    AttachmentMimeBackfill {
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Summarize memory, attachment, voice transcript, identity, and chatroom event health.
     Status,
     /// Agent-oriented data readiness report with ordered maintenance actions.
@@ -1016,13 +1055,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect::<Vec<_>>();
                     response.items.retain(|item| {
                         item.chatroom_id.as_deref() == Some(chatroom_id.as_str())
+                            || item.chatroom_ids.contains(&chatroom_id)
                             || (item.entity_type == "chatroom" && item.entity_id == chatroom_id)
                     });
                     for contact_id in contact_ids {
                         let member_response = client
                             .resolve_identity(&contact_id, Some(limit.max(50)))
                             .await?;
-                        for item in member_response.items {
+                        for mut item in member_response.items {
+                            if item.entity_type != "chatroom"
+                                && item.chatroom_ids.contains(&chatroom_id)
+                            {
+                                item.entity_type = "chatroom_member".to_string();
+                                item.chatroom_id = Some(chatroom_id.clone());
+                            }
                             if item.entity_type != "chatroom_member"
                                 || item.chatroom_id.as_deref() != Some(chatroom_id.as_str())
                                 || response.items.iter().any(|existing| {
@@ -1037,6 +1083,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                response.items = gewe_skill_core::identity::merge_identity_matches(response.items);
                 print_json(response)?;
             }
             IdentityCommand::Inspect { wxid, chatroom_id } => {
@@ -1087,6 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cursor: None,
                         limit: Some(recent_messages.clamp(1, 1000)),
                         order: Some("desc".to_string()),
+                        dm: None,
                     })
                     .await?;
 
@@ -1137,28 +1185,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Query { command } => match command {
             QueryCommand::Messages { args } => {
-                print_json(agent_query_messages(&client, args).await?)?;
+                let output = args.output.clone();
+                let result = agent_query_messages(&client, args).await?;
+                message_output::print_agent(&result, &output)?;
             }
             QueryCommand::ChatroomEvents { args } => {
                 print_json(chatroom_events::agent_query_chatroom_events(&client, args).await?)?;
             }
         },
         Command::Messages { command } => match command {
-            MessagesCommand::List { filters } => {
-                print_json(client.messages(&message_query(None, filters)).await?)?;
+            MessagesCommand::List { filters, output } => {
+                message_output::print_page(&client, &message_query(None, filters), &output).await?;
             }
-            MessagesCommand::Search { q, filters } => {
-                print_json(client.messages(&message_query(Some(q), filters)).await?)?;
+            MessagesCommand::Search { q, filters, output } => {
+                message_output::print_page(&client, &message_query(Some(q), filters), &output)
+                    .await?;
             }
             MessagesCommand::Context {
                 message_key,
                 before,
                 after,
-            } => print_json(
-                client
-                    .message_context(&message_key, Some(before), Some(after))
-                    .await?,
-            )?,
+                output,
+            } => {
+                message_output::print_context(&client, &message_key, before, after, &output)
+                    .await?;
+            }
         },
         Command::Attachments { command } => match command {
             AttachmentsCommand::List {
@@ -1166,28 +1217,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 message_key,
                 kind,
             } => {
-                let mut page = client.recent_attachments(Some(limit)).await?;
-                if let Some(message_key) = message_key {
-                    page.items.retain(|item| item.message_key == message_key);
-                }
+                let mut page = if let Some(message_key) = message_key {
+                    client.attachments_by_message_keys(&[message_key]).await?
+                } else {
+                    client.recent_attachments(Some(limit)).await?
+                };
                 if let Some(kind) = kind {
                     page.items
                         .retain(|item| format!("{:?}", item.kind).eq_ignore_ascii_case(&kind));
                 }
                 print_json(page)?;
             }
-            AttachmentsCommand::Download { sha256, output } => {
-                let bytes = client.download_attachment(&sha256).await?;
-                if let Some(parent) = output.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&output, &bytes)?;
-                print_json(serde_json::json!({
-                    "ok": true,
-                    "sha256": sha256,
-                    "output": output,
-                    "size_bytes": bytes.len()
-                }))?;
+            AttachmentsCommand::Download {
+                sha256,
+                message_key,
+                index,
+                output,
+            } => {
+                download_selected_attachment(&client, sha256, message_key, index, output).await?;
             }
         },
         Command::Voice { command } => match command {
@@ -1248,7 +1295,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_json(client.sns_posts(&sns_query(filters)).await?)?;
             }
             SnsCommand::Export { args } => {
-                print_json(export_sns_analysis_package(&client, args).await?)?;
+                let stdout = args.output == Path::new("-");
+                let report = export_sns_analysis_package(&client, args).await?;
+                if !stdout {
+                    print_json(report)?;
+                }
             }
         },
         Command::Chatrooms { command } => match command {
@@ -1376,6 +1427,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_json(result)?;
             }
             SyncCommand::AttachmentRepair {
+                message_key,
+                wait_seconds,
                 edge_url,
                 admin_token,
                 asset_type,
@@ -1387,20 +1440,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cursor_file,
                 attachment_dir,
             } => {
-                let result = repair_edge_attachment_queue(
-                    &client,
-                    &edge_url,
-                    &admin_token,
-                    normalize_asset_type_filter(&asset_type),
-                    schema_version,
-                    include_existing,
-                    backfill_limit,
-                    sync_limit,
-                    settle_ms,
-                    cursor_file,
-                    attachment_dir,
-                )
-                .await?;
+                let result = if let Some(message_key) = message_key {
+                    repair_one_message_attachment(
+                        &client,
+                        &edge_url,
+                        &admin_token,
+                        &message_key,
+                        wait_seconds,
+                        &attachment_dir,
+                    )
+                    .await?
+                } else {
+                    repair_edge_attachment_queue(
+                        &client,
+                        &edge_url,
+                        &admin_token,
+                        normalize_asset_type_filter(&asset_type),
+                        schema_version,
+                        include_existing,
+                        backfill_limit,
+                        sync_limit,
+                        settle_ms,
+                        cursor_file,
+                        attachment_dir,
+                    )
+                    .await?
+                };
                 print_json(result)?;
             }
             SyncCommand::ChatroomEvents {
@@ -1433,6 +1498,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Command::Maintenance { command } => match command {
+            MaintenanceCommand::AttachmentMimeBackfill { dry_run: _, apply } => {
+                let mut cursor = 0;
+                let mut scanned = 0;
+                let mut changed = 0;
+                let mut missing_files = 0;
+                let mut concurrent_updates = 0;
+                let mut details = Vec::new();
+                loop {
+                    let report = client.attachment_mime_backfill(!apply, cursor, 200).await?;
+                    scanned += report["scanned"].as_u64().unwrap_or(0);
+                    changed += report["changed"].as_u64().unwrap_or(0);
+                    missing_files += report["missing_files"].as_u64().unwrap_or(0);
+                    concurrent_updates += report["concurrent_updates"].as_u64().unwrap_or(0);
+                    details.extend(report["changes"].as_array().cloned().unwrap_or_default());
+                    let next = report["next_after_id"].as_i64().unwrap_or(cursor);
+                    if next <= cursor || report["scanned"].as_u64().unwrap_or(0) < 200 {
+                        break;
+                    }
+                    cursor = next;
+                }
+                print_json(
+                    serde_json::json!({ "ok": true, "dry_run": !apply, "scanned": scanned, "changed": changed, "missing_files": missing_files, "concurrent_updates": concurrent_updates, "changes": details }),
+                )?;
+            }
             MaintenanceCommand::Status => {
                 print_json(client.maintenance_status().await?)?;
             }
@@ -1663,6 +1752,7 @@ fn message_query(q: Option<String>, filters: MessageFilterArgs) -> MessageQuery 
         cursor: filters.cursor,
         limit: Some(filters.limit),
         order: Some(filters.order.query_value()),
+        dm: None,
     }
 }
 
@@ -1739,10 +1829,7 @@ async fn export_sns_analysis_package(
         )?,
         SnsExportFormat::Jsonl => render_sns_jsonl(&items)?,
     };
-    if let Some(parent) = args.output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&args.output, rendered.as_bytes())?;
+    write_file_or_stdout(&args.output, rendered.as_bytes())?;
     Ok(serde_json::json!({
         "ok": true,
         "source": source,
@@ -1932,11 +2019,12 @@ async fn agent_query_messages(
     client: &GeweSkillClient,
     args: AgentMessageQueryArgs,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let conversation = resolve_conversation_for_query(
+    let conversation = resolve_conversation_for_query_mode(
         client,
         args.conversation_id.clone(),
         args.conversation.clone(),
         args.resolve_limit,
+        args.dm,
     )
     .await?;
     let sender = resolve_sender_for_query(
@@ -1948,11 +2036,15 @@ async fn agent_query_messages(
     )
     .await?;
 
-    if args.conversation.is_some() && conversation.id.is_none() && !args.allow_unresolved {
+    if (args.conversation.is_some() || args.conversation_id.is_some())
+        && conversation.id.is_none()
+        && (!args.allow_unresolved || args.dm)
+    {
         return Ok(serde_json::json!({
             "ok": false,
             "executed": false,
-            "error": "conversation_unresolved",
+            "error": if args.dm { "dm_conversation_unresolved" } else { "conversation_unresolved" },
+            "hint": if args.dm { "未找到该联系人的私聊会话；--dm 只查询已有私聊，不会解析到群。" } else { "未找到会话，请检查名称或使用 --conversation-id。" },
             "resolved": {
                 "conversation": conversation.to_json(),
                 "sender": sender.to_json(),
@@ -1982,6 +2074,7 @@ async fn agent_query_messages(
         cursor: args.cursor.clone(),
         limit: Some(args.limit),
         order: Some(args.order.query_value()),
+        dm: args.dm.then_some(true),
     };
     let messages: ApiPage<NormalizedMessage> = client.messages(&query).await?;
     let speaker_chatroom_id = conversation
@@ -2006,20 +2099,7 @@ async fn agent_query_messages(
         attachments.as_ref().map(|page| page.items.as_slice()),
     );
     let voice: Option<ApiPage<VoiceItem>> = if args.voice_transcripts {
-        Some(
-            client
-                .voices(&VoiceQuery {
-                    conversation_id: query.conversation_id.clone(),
-                    sender_wxid: query.sender_wxid.clone(),
-                    after: query.after.clone(),
-                    before: query.before.clone(),
-                    cursor: query.cursor.clone(),
-                    limit: query.limit,
-                    order: query.order.clone(),
-                    missing_only: None,
-                })
-                .await?,
-        )
+        Some(client.voices_by_message_keys(&message_keys).await?)
     } else {
         None
     };
@@ -2235,6 +2315,7 @@ fn agent_message_query_guidance(
         "summary": {
             "answer_readiness": answer_readiness,
             "returned_message_count": returned_count,
+            "pagination": messages.pagination,
             "limit": limit,
             "has_more": messages.next_cursor.is_some(),
             "next_cursor": messages.next_cursor,
@@ -2308,6 +2389,9 @@ fn agent_messages_cli(query: &MessageQuery) -> Vec<String> {
         args.push(limit.to_string());
     }
     push_cli_arg(&mut args, "--order", query.order.as_deref());
+    if query.dm == Some(true) {
+        args.push("--dm".to_string());
+    }
     args
 }
 
@@ -2454,9 +2538,7 @@ async fn agent_speaker_block(
     let messages_missing_sender_count = messages
         .iter()
         .filter(|message| {
-            message
-                .sender_wxid
-                .as_deref()
+            message_sender_id(message)
                 .map(str::trim)
                 .unwrap_or_default()
                 .is_empty()
@@ -2477,12 +2559,15 @@ async fn agent_speaker_block(
     }
 
     let mut by_wxid = serde_json::Map::new();
+    let mut by_conversation = serde_json::Map::new();
     let mut lookup_errors = Vec::new();
     let mut missing_effective_display_count = 0usize;
     let mut identity_refresh_recommended_count = 0usize;
 
-    for wxid in &speaker_wxids {
-        match client.identity_profile(wxid, chatroom_id).await {
+    for scope in collect_message_speaker_scopes(messages, chatroom_id, usize::MAX) {
+        let wxid = &scope.wxid;
+        let room = scope.chatroom_id.as_deref().or(chatroom_id);
+        match client.identity_profile(wxid, room).await {
             Ok(profile) => {
                 if profile
                     .effective_display_name
@@ -2497,7 +2582,13 @@ async fn agent_speaker_block(
                     identity_refresh_recommended_count += 1;
                 }
                 let value = agent_speaker_profile_value(&profile);
-                by_wxid.insert(profile.entity_id.clone(), value);
+                if let Some(room) = room {
+                    let room_profiles = by_conversation
+                        .entry(room.to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    room_profiles[wxid] = value.clone();
+                }
+                by_wxid.entry(profile.entity_id.clone()).or_insert(value);
             }
             Err(error) => {
                 lookup_errors.push(serde_json::json!({
@@ -2514,6 +2605,7 @@ async fn agent_speaker_block(
     Ok(serde_json::json!({
         "included": true,
         "by_wxid": by_wxid,
+        "by_conversation": by_conversation,
         "lookup_errors": lookup_errors,
         "summary": {
             "message_count": messages.len(),
@@ -2630,7 +2722,7 @@ fn collect_message_speaker_scopes(
 ) -> Vec<IdentitySpeakerScope> {
     let mut scopes = std::collections::BTreeSet::new();
     for message in messages {
-        let Some(wxid) = message.sender_wxid.as_deref().map(str::trim) else {
+        let Some(wxid) = message_sender_id(message).map(str::trim) else {
             continue;
         };
         if wxid.is_empty() || wxid.ends_with("@chatroom") {
@@ -2881,7 +2973,7 @@ fn identity_health_report_from_lookups(
 fn collect_message_speaker_wxids(messages: &[NormalizedMessage]) -> Vec<String> {
     let mut wxids = std::collections::BTreeSet::new();
     for message in messages {
-        if let Some(wxid) = message.sender_wxid.as_deref() {
+        if let Some(wxid) = message_sender_id(message) {
             let wxid = wxid.trim();
             if !wxid.is_empty() {
                 wxids.insert(wxid.to_string());
@@ -3122,33 +3214,23 @@ pub(crate) async fn resolve_conversation_for_query(
     input: Option<String>,
     limit: u32,
 ) -> Result<QueryResolution, Box<dyn std::error::Error>> {
-    if exact
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Ok(QueryResolution::exact(exact));
+    if let Some(id) = exact.filter(|v| !v.trim().is_empty()) {
+        return Ok(QueryResolution::exact(Some(id)));
     }
-    let Some(input) = input.filter(|value| !value.trim().is_empty()) else {
+    let Some(input) = input.filter(|v| !v.trim().is_empty()) else {
         return Ok(QueryResolution::missing(None, Vec::new()));
     };
     if looks_like_stable_wechat_id(&input) {
         return Ok(QueryResolution::exact(Some(input)));
     }
-
     let response = client.resolve_identity(&input, Some(limit)).await?;
-    let selected = response
-        .items
+    let candidates = gewe_skill_core::identity::merge_identity_matches(response.items);
+    let selected = candidates
         .iter()
         .find(|item| item.entity_type == "chatroom")
+        .or_else(|| candidates.iter().find(|item| item.entity_type == "contact"))
         .or_else(|| {
-            response
-                .items
-                .iter()
-                .find(|item| item.entity_type == "contact")
-        })
-        .or_else(|| {
-            response
-                .items
+            candidates
                 .iter()
                 .find(|item| item.entity_type == "chatroom_member")
         })
@@ -3160,7 +3242,134 @@ pub(crate) async fn resolve_conversation_for_query(
         Some(input),
         id,
         selected,
-        response.items,
+        candidates,
+    ))
+}
+
+fn alias_matches(input: &str, candidate: &IdentityMatch) -> bool {
+    let normalize = |s: &str| s.split_whitespace().collect::<String>().to_lowercase();
+    let input = normalize(input);
+    candidate
+        .matched_aliases
+        .iter()
+        .chain(candidate.alias.iter())
+        .chain(candidate.display_name.iter())
+        .any(|alias| normalize(alias) == input)
+}
+
+fn select_conversation_candidate(
+    input: &str,
+    candidates: &[IdentityMatch],
+    private_ids: &[String],
+    dm: bool,
+) -> Option<IdentityMatch> {
+    if !dm {
+        if let Some(room) = candidates
+            .iter()
+            .find(|item| item.entity_type == "chatroom" && alias_matches(input, item))
+        {
+            return Some(room.clone());
+        }
+    }
+    if let Some(contact) = candidates
+        .iter()
+        .find(|item| item.entity_type == "contact" && private_ids.contains(&item.entity_id))
+    {
+        return Some(contact.clone());
+    }
+    if dm {
+        return candidates
+            .iter()
+            .find(|item| item.entity_type != "chatroom" && private_ids.contains(&item.entity_id))
+            .cloned();
+    }
+    candidates
+        .iter()
+        .find(|item| item.entity_type == "chatroom")
+        .or_else(|| candidates.iter().find(|item| item.entity_type == "contact"))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|item| item.entity_type == "chatroom_member")
+        })
+        .cloned()
+}
+
+async fn resolve_conversation_for_query_mode(
+    client: &GeweSkillClient,
+    exact: Option<String>,
+    input: Option<String>,
+    limit: u32,
+    dm: bool,
+) -> Result<QueryResolution, Box<dyn std::error::Error>> {
+    let exact = exact.filter(|v| !v.trim().is_empty());
+    let input = input.filter(|v| !v.trim().is_empty());
+    let stable = exact.or_else(|| {
+        input
+            .as_ref()
+            .filter(|v| looks_like_stable_wechat_id(v))
+            .cloned()
+    });
+    if let Some(id) = stable {
+        if dm
+            && (id.ends_with("@chatroom")
+                || client
+                    .messages(&MessageQuery {
+                        conversation_id: Some(id.clone()),
+                        dm: Some(true),
+                        limit: Some(1),
+                        ..MessageQuery::default()
+                    })
+                    .await?
+                    .items
+                    .is_empty())
+        {
+            return Ok(QueryResolution::missing(Some(id), Vec::new()));
+        }
+        return Ok(QueryResolution::exact(Some(id)));
+    }
+    let Some(input) = input else {
+        return Ok(QueryResolution::missing(None, Vec::new()));
+    };
+    let response = client
+        .resolve_identity(&input, Some(limit.max(200)))
+        .await?;
+    let mut candidates = gewe_skill_core::identity::merge_identity_matches(response.items);
+    let mut private_ids = Vec::new();
+    // Check the actual conversation rather than a recent global conversation list.
+    for candidate in candidates
+        .iter()
+        .filter(|item| item.entity_type == "contact" || dm && item.entity_type == "chatroom_member")
+    {
+        let page = client
+            .messages(&MessageQuery {
+                conversation_id: Some(candidate.entity_id.clone()),
+                dm: Some(true),
+                limit: Some(1),
+                ..MessageQuery::default()
+            })
+            .await?;
+        if !page.items.is_empty() {
+            private_ids.push(candidate.entity_id.clone());
+        }
+    }
+    let selected = select_conversation_candidate(&input, &candidates, &private_ids, dm);
+    let id = selected.as_ref().and_then(|item| {
+        if dm || private_ids.contains(&item.entity_id) {
+            Some(item.entity_id.clone())
+        } else {
+            conversation_id_from_identity_match(item)
+        }
+    });
+    candidates.truncate(usize::try_from(limit.clamp(1, 200)).unwrap_or(200));
+    if id.is_none() {
+        return Ok(QueryResolution::missing(Some(input), candidates));
+    }
+    Ok(QueryResolution::from_identity(
+        Some(input),
+        id,
+        selected,
+        candidates,
     ))
 }
 
@@ -3189,7 +3398,10 @@ async fn resolve_sender_for_query(
         .items
         .iter()
         .find(|item| {
-            item.entity_type == "chatroom_member" && item.chatroom_id.as_deref() == conversation_id
+            item.entity_type != "chatroom"
+                && (item.chatroom_id.as_deref() == conversation_id
+                    || conversation_id
+                        .is_some_and(|room| item.chatroom_ids.iter().any(|id| id == room)))
         })
         .or_else(|| {
             response
@@ -4084,7 +4296,10 @@ async fn sync_one_attachment(
         object_key: Some(object_key),
         sha256: Some(sha256),
         size_bytes: Some(item.size_bytes.unwrap_or(bytes.len() as i64)),
-        mime_type: item.mime_type.clone(),
+        mime_type: Some(gewe_skill_core::mime::corrected_mime(
+            &bytes,
+            item.mime_type.as_deref(),
+        )),
         created_at: item
             .completed_at
             .clone()
@@ -4114,6 +4329,68 @@ fn print_json(value: impl serde::Serialize) -> Result<(), serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolution_candidate(entity_type: &str, id: &str, name: &str) -> IdentityMatch {
+        IdentityMatch {
+            entity_type: entity_type.to_string(),
+            entity_id: id.to_string(),
+            chatroom_id: None,
+            display_name: Some(name.to_string()),
+            alias: Some(name.to_string()),
+            source: Some("test".to_string()),
+            is_current: true,
+            score: 1.0,
+            last_seen_at: None,
+            sources: Vec::new(),
+            chatroom_ids: Vec::new(),
+            matched_aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn person_name_with_multiple_groups_selects_the_existing_private_conversation() {
+        let candidates = vec![
+            resolution_candidate("chatroom", "test_group_a@chatroom", "甲群"),
+            resolution_candidate("chatroom", "test_group_b@chatroom", "乙群"),
+            resolution_candidate("contact", "wxid_test_friend", "测试好友"),
+        ];
+        let selected = select_conversation_candidate(
+            "测试好友",
+            &candidates,
+            &["wxid_test_friend".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected.entity_id, "wxid_test_friend");
+    }
+
+    #[test]
+    fn exact_group_name_still_selects_the_group_even_when_a_friend_has_the_same_name() {
+        let candidates = vec![
+            resolution_candidate("contact", "wxid_test_friend", "测试群"),
+            resolution_candidate("chatroom", "test_group@chatroom", "测试群"),
+        ];
+        assert_eq!(
+            select_conversation_candidate(
+                "测试群",
+                &candidates,
+                &["wxid_test_friend".to_string()],
+                false
+            )
+            .unwrap()
+            .entity_type,
+            "chatroom"
+        );
+    }
+
+    #[test]
+    fn dm_without_a_private_conversation_stays_unresolved() {
+        let candidates = vec![
+            resolution_candidate("contact", "wxid_test_friend", "测试好友"),
+            resolution_candidate("chatroom", "test_group@chatroom", "测试好友所在群"),
+        ];
+        assert!(select_conversation_candidate("测试好友", &candidates, &[], true).is_none());
+    }
 
     fn test_identity_memory_status(
         refresh_recommended: bool,
@@ -4332,6 +4609,7 @@ mod tests {
         let messages = ApiPage {
             items: vec![message],
             next_cursor: None,
+            pagination: None,
         };
         let query = MessageQuery {
             conversation_id: Some("room@chatroom".to_string()),
@@ -4639,6 +4917,7 @@ mod tests {
         let messages = ApiPage {
             items: vec![first.clone(), second],
             next_cursor: Some("2026-05-26T00:59:59Z".to_string()),
+            pagination: None,
         };
         let query = MessageQuery {
             conversation_id: Some("room@chatroom".to_string()),
@@ -4660,6 +4939,7 @@ mod tests {
                 reason: Some("voice_attachment_not_synced".to_string()),
             }],
             next_cursor: None,
+            pagination: None,
         };
         let speaker_block = serde_json::json!({
             "summary": {
@@ -4719,6 +4999,7 @@ mod tests {
         let messages = ApiPage {
             items: vec![message],
             next_cursor: None,
+            pagination: None,
         };
         let query = MessageQuery {
             conversation_id: Some("room@chatroom".to_string()),
@@ -4765,6 +5046,9 @@ mod tests {
             is_current: true,
             score: 1.0,
             last_seen_at: None,
+            sources: Vec::new(),
+            chatroom_ids: Vec::new(),
+            matched_aliases: Vec::new(),
         };
         let conversation = QueryResolution::from_identity(
             Some("DuckCoding技术喝水交流群".to_string()),
@@ -4783,6 +5067,7 @@ mod tests {
         let messages = ApiPage {
             items: vec![test_message("m1", gewe_skill_types::NormalizedKind::Text)],
             next_cursor: Some("2026-05-26T00:00:00Z".to_string()),
+            pagination: None,
         };
 
         let summary = agent_query_resolution_summary(&conversation, &sender, &query, &messages);

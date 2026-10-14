@@ -16,84 +16,60 @@ Use this skill when the user wants an Agent to inspect, search, summarize, or an
 - Treat `gewe-skill-memory` as the Agent-readable memory layer.
 - Never print bearer tokens, GeWe tokens, callback secrets, or raw private payloads unless the user explicitly asks for a narrow diagnostic excerpt.
 
-## Command contract
+## 命令约定
 
-This CLI is Agent-first. Always use `--json`; stdout is the machine-readable result and stderr is for diagnostics.
-
-Start with:
+macOS 上优先使用 `gewe`：它通过 SSH 连接记忆服务器，安全透传参数并在远端加载 token；下载和导出的输出文件保存在本机。先检查连接：
 
 ```bash
-gewe-skill --json doctor
+gewe doctor
 ```
 
-The CLI reads these environment variables:
+消息阅读优先用 `--format text`。需要稳定 ID、message_key、候选、原始证据或自动处理时，省略该参数取得兼容 JSON；`--compact` 仅去掉消息中的 `raw_content` 与 `msg_source`。`gewe-skill` 本身默认也是 JSON，直接调用它时仍需配置 `GEWE_SKILL_BASE_URL`、读写 token。
+
+包装命令源码在仓库 `scripts/gewe.sh`，安装位置为 `~/.local/bin/gewe`。支持 `GEWE_SSH_TARGET`、`GEWE_SSH_KEY`、`GEWE_REMOTE_ENV`、`GEWE_REMOTE_CLI` 配置；不要把 token 写入仓库或输出到对话。新消息功能需远端 CLI 与 memory 更新，定向补拉还需新版 edge；连接诊断可继续使用旧服务。
+
+## 推荐阅读路径
+
+用户给出人名、群名和时间范围时，先用一个组合查询：
 
 ```bash
-GEWE_SKILL_BASE_URL=http://127.0.0.1:8788
-GEWE_SKILL_READ_TOKEN=...
-GEWE_SKILL_WRITE_TOKEN=...
+gewe query messages --conversation '测试好友' --dm --after '2026-10-13T00:00:00+08:00' --limit 50 --format text
+gewe query messages --conversation '测试群' --sender '测试成员' --limit 50 --format text
+gewe query messages --conversation '测试群' --q '关键词' --limit 50 --format text
 ```
 
-## Normal read path
+人名命中好友且有对应私聊时，默认优先私聊；群名精确命中仍选群。`--dm` 只解析已有私聊，无私聊时返回 `dm_conversation_unresolved`，不会转到该人所在的群。候选按实体合并，`sources` 汇集来源，`chatroom_ids` 保留群范围。未解析时用 JSON 检查候选和名称，不要自行扩大查询范围。
 
-1. Prefer the composed Agent query when the user names a group, person, time window, keyword, or media. It resolves human wording first, then reads bounded messages and returns exact attachment evidence plus voice transcript evidence for the same scope:
+`--after` 是接收时间下界，包含边界；`--before` 不包含边界。默认 `--order desc` 返回范围内**最新 N 条**；需要从起点读起时使用 `--order asc`，返回范围内**最早 N 条**。文本最后一行说明选择规则、时间范围、更早/更晚是否有未返回消息、翻页参数和附件缺失条数；更早/更晚均指同一筛选范围内的消息，翻页须保留原会话、发送者、关键词和时间条件。
 
 ```bash
-gewe-skill --json query messages --conversation '<chatroom/contact wording>' --limit 50
-gewe-skill --json query messages --conversation '<chatroom wording>' --sender '<member/contact wording>' --limit 50
-gewe-skill --json query messages --conversation '<chatroom wording>' --q '<keyword>' --after '<iso-time>' --limit 50
+gewe query messages --conversation '测试好友' --dm --after '2026-10-13T00:00:00+08:00' --order asc --limit 50 --format text
+gewe query messages --conversation-id 'wxid_test_friend' --after '2026-10-13T00:00:00+08:00' --order desc --cursor '<返回的 cursor>' --format text
 ```
 
-If `query messages` returns `conversation_unresolved` or `sender_unresolved`, show the candidates and ask for a narrower clue instead of doing a broad read.
+时间默认使用 `Asia/Shanghai`，可用 `--timezone UTC` 或本机 `TZ` 覆盖。消息时间和筛选都以 `received_at` 为准，接收时间可能晚于微信发送时间。文本每条一行，使用有效显示名，自发消息显示“我”；图片、文件、引用、语音等显示简短标记，系统入群/改名消息显示人话。语音“未转写”不代表没有音频。
 
-`query messages` also returns `agent_guidance`. Use `agent_guidance.next_actions` to decide whether to paginate with the stable `--conversation-id` cursor command, run bounded attachment repair, inspect scoped voice readiness, run scoped ASR backfill, or warm chatroom identity before answering. Treat these as bounded follow-up choices for the same resolved scope, not as permission to do broad polling. Prefer the provided `recommended_cli` exactly because it preserves stable ids and time windows whenever the maintenance command supports them. If `agent_guidance.summary.identity_refresh_recommended_count` is greater than zero, run the recommended bounded `identity warm` command before explaining current remarks, group cards, or member names.
-
-`query messages` includes `attachments.summary` and `attachments.by_message_key` by default. Use these fields before calling `attachments list`: they are exact for the returned message window and work for older messages that are no longer in the recent attachment list. If `attachments.summary.attachment_expected_missing_count` is greater than zero, explain that those media-like messages currently have no stored attachment record, then use maintenance attachment checks before claiming the media is lost.
-
-2. Use manual resolution when you need to inspect or disambiguate ids before reading messages:
+需要单条消息的稳定键或原始字段时，切到 JSON：
 
 ```bash
-gewe-skill --json identity resolve --q '<chatroom/contact/member wording>' --limit 10
-gewe-skill --json identity inspect --wxid '<wxid>' --chatroom-id '<chatroom_id>'
+gewe query messages --conversation '测试好友' --dm --kind image --limit 5 --compact
+gewe identity resolve --q '测试好友' --limit 10
+gewe identity inspect --wxid 'wxid_test_friend' --chatroom-id 'test_group@chatroom'
 ```
 
-Use `identity inspect` after resolving a person when the answer depends on current display rules. It returns the effective display name, `display_name_source`, `display_name_resolution.candidates`, `memory_status`, contact remark/nickname/alias, room-scoped member card/nickname, and historical aliases. Explain names from `display_name_resolution`: contact remark wins first, then room-scoped group card/display name, then room-scoped nickname, then contact nickname, then contact alias. If `memory_status.refresh_recommended` is true, treat the display name as usable but freshness-limited, and refresh only the needed chatroom or wxid scope before making claims about current remarks or cards.
+JSON 的 `messages.pagination.selection` 为 `latest`、`earliest`，上下文为 `context`；`has_more` 与 `next_cursor` 描述当前方向是否还有下一页。服务端返回的 cursor 为不透明字符串，原样透传，可区分同一时间戳的消息；最后一页 `next_cursor=null`。`attachments` 和 `voice.items` 精确对应返回的消息键；无需先扫描最近附件。
 
-3. Before serious analysis of a named group, warm that one chatroom. This refreshes the chatroom and only recent active speakers, instead of polling the whole contact list:
+姓名使用 `effective_display_name`：联系人备注优先，其次群名片、群昵称，再到联系人昵称、别名。跨群结果优先使用 `speakers.by_conversation[conversation_id][sender_id]`；历史 v2 私聊未填 `sender_wxid` 时显示查询使用 `from_user` 回退。确实需要当前名片或成员状态时，再按 `memory_status` 对该群/联系人做有限刷新，不要为普通读消息固定先跑维护。
 
 ```bash
-gewe-skill --json identity warm --chatroom-id '<chatroom_id>' --recent-messages 200 --max-contacts 50
+gewe identity warm --chatroom-id 'test_group@chatroom' --recent-messages 200 --max-contacts 50
+gewe identity refresh --wxids 'wxid_test_friend'
+gewe messages list --conversation-id 'wxid_test_friend' --limit 50 --format text
+gewe messages search --conversation-id 'wxid_test_friend' --q '关键词' --limit 20 --format text
+gewe messages context --message-key '<message_key>' --before 5 --after 5 --format text
 ```
 
-4. If names still look stale or missing, refresh only the needed identity scope:
-
-```bash
-gewe-skill --json identity refresh --chatroom-id '<chatroom_id>'
-gewe-skill --json identity refresh --wxids '<wxid1>,<wxid2>'
-gewe-skill --json identity refresh --recent-chatrooms 20
-```
-
-5. Read a bounded message window. Use the resolved `conversation_id` for both group chats and private chats:
-
-```bash
-gewe-skill --json messages list --conversation-id '<conversation_id>' --limit 50
-gewe-skill --json messages list --conversation-id '<conversation_id>' --after '<iso-time>' --before '<iso-time>' --limit 50
-gewe-skill --json messages list --conversation-id '<conversation_id>' --sender-wxid '<wxid>' --limit 50
-gewe-skill --json messages list --conversation-id '<conversation_id>' --kind text --direction incoming --limit 50
-```
-
-6. Search within a scoped window instead of broad global search when the user named a group/person/time:
-
-```bash
-gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --limit 20
-gewe-skill --json messages search --q '<keyword>' --conversation-id '<conversation_id>' --after '<iso-time>' --limit 20
-```
-
-7. If a specific message matters, fetch nearby context:
-
-```bash
-gewe-skill --json messages context --message-key '<message_key>' --before 5 --after 5
-```
+JSON 的 `agent_guidance.next_actions` 可用于有限翻页、身份刷新和语音检查。优先保持已解析的精确 ID；附件缺失时使用下文的按消息补拉，不能据缺失记录断言上游媒体已丢失。
 
 ## 朋友圈分析
 
@@ -115,10 +91,10 @@ Use time windows when the user asks for them:
 gewe-skill --json sns fetch --contact '<nickname-or-wechat-id>' --after '<iso-time>' --before '<iso-time>' --limit 100 --max-pages 100
 ```
 
-For analysis, export a local package and hand that file to a subagent or your analysis step:
+For analysis, export a local package for the analysis step:
 
 ```bash
-gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
+gewe sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.md --format markdown
 ```
 
 `sns export` refreshes and stores posts by default before writing the local file. Use `--no-refresh --target-wxid '<wxid>'` only when you intentionally want to export already stored posts.
@@ -126,7 +102,7 @@ gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --ou
 Markdown exports include post ids, timestamps, text, content style, media counts, and safe derived fields, but do not expand media URLs. Use JSONL only when the user explicitly needs raw records:
 
 ```bash
-gewe-skill --json sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.jsonl --format jsonl
+gewe sns export --contact '<nickname-or-wechat-id>' --limit 50 --output /tmp/gewe-sns-analysis.jsonl --format jsonl
 ```
 
 When analyzing, distinguish stored facts from inference. Likes and comments are only the visible data for the current account's social graph, so do not treat missing interaction records as proof of low popularity. Prefer content themes, posting cadence, time window, media mix, and recurring topics.
@@ -157,19 +133,39 @@ gewe-skill --json chatrooms snapshots --chatroom-id '<chatroom_id>' --limit 20
 
 Prefer `query chatroom-events` for Agent answers because it resolves the group name, enriches wxids with current identity display memory, and merges member/system events into one timeline. Keep wxid fields as stable evidence, but use `*_display_name` fields when explaining people to the user. Prefer structured system events for actor/target names. Prefer snapshot diff events for actual membership state changes. If they disagree, report the disagreement.
 
-## Attachments
+## 附件
 
-List attachment metadata first. Download bytes only when the user asks to inspect actual media or files:
+用户要求查看实际媒体时，直接按消息下载，不需要先查询 sha256：
 
 ```bash
-gewe-skill --json attachments list --limit 20
-gewe-skill --json attachments list --message-key '<message_key>' --limit 50
-gewe-skill --json attachments download --sha256 '<sha256>' --output /tmp/gewe-attachment.bin
+gewe attachments download --message-key '<message_key>' -o ./附件.jpg
+gewe attachments download --message-key '<message_key>' -o - > ./附件.jpg
 ```
 
-Mention whether media was downloaded or only detected.
+`-o -` 或省略输出路径时，stdout 只有附件字节，不夹带 JSON。指定本机文件时，包装命令先写临时文件，下载失败不覆盖已有成品。下载会校验 SHA-256；同一消息多个附件时返回选择列表，使用其中的 `--index N`（从 1 开始）：
 
-Attachments are content-deduplicated by `sha256` across images, voice, video, emoji, and files. Multiple messages may legitimately reference the same `sha256`; treat that as shared bytes, not missing data.
+```bash
+gewe attachments list --message-key '<message_key>'
+gewe attachments download --message-key '<message_key>' --index 1 -o ./附件.jpg
+```
+
+尚无附件记录且用户需要该媒体时，定向补拉这一条并等待最多 180 秒：
+
+```bash
+gewe sync attachment-repair --message-key '<message_key>' --wait-seconds 180
+gewe attachments download --message-key '<message_key>' -o ./附件.jpg
+```
+
+该命令仅补建/重排该消息的下载任务，按消息同步完成文件，不读全局统计、不改全局同步游标。保护未过期的 processing 租约；`unavailable`、`purged`、超限和非文件等终态不会反复重置，需按返回状态说明限制。超时会明确返回 `status=timeout`，edge 任务仍可继续；稍后用相同消息键重试，不需要跑全局 repair。定向补拉必须在新版 edge 上使用。
+
+附件记录与下载响应按文件头识别 MIME，魔数优先于错误的上游值。检测到附件、已同步字节、已下载到本机、已转写分别说明。多条消息共享相同 sha256 是正常的内容去重，不是缺失。
+
+MIME 回填属于维护操作，用户要求时才运行；先预览再应用：
+
+```bash
+gewe maintenance attachment-mime-backfill --dry-run
+gewe maintenance attachment-mime-backfill --apply
+```
 
 ## Voice and transcripts
 
@@ -254,7 +250,7 @@ gewe-skill --json maintenance asr-backfill --limit 20 --provider codex-asr --lan
 
 Prefer `maintenance voice-issues` before repair. It returns an Agent-readable action list:
 
-- `missing_attachment`: run `sync attachment-repair` before ASR.
+- `missing_attachment`: 优先用 `sync attachment-repair --message-key` 补拉该消息，再决定是否进行 ASR。
 - `asr_pending`: run bounded `voice transcribe` or `maintenance asr-backfill`.
 - `asr_failed`: retry only after the provider or decoder issue is fixed.
 - `asr_failed` with `retryable=false`: treat it as a known transcript gap and explain it; do not retry it in a loop.
@@ -265,7 +261,7 @@ Prefer `maintenance attachment-queue-health` when the user asks whether attachme
 
 Prefer `maintenance data-health --with-edge-queue` before broad analysis when the user cares about media, voice, freshness, or whether the archive is ready. It returns `overall_health`, `ready_for_analysis`, and ordered `next_actions` so attachment sync and queue safety happen before ASR.
 
-For `missing_attachment`, prefer the edge-backed attachment queue commands before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. `sync attachment-repair` defaults to `--asset-type all` for image, voice, video, emoji, and file jobs; narrow it with `--asset-type voice` only when you intentionally want a voice-only repair. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment repair before analyzing media.
+单条消息的 `missing_attachment` 优先使用上述定向补拉。只有用户要求整体队列维护时，再使用以下全局队列命令。 For `missing_attachment`, inspect the edge-backed attachment queue before ASR. Use `sync attachment-queue` to inspect queue state, `sync attachment-backfill` to create missing download jobs from stored messages, `sync attachment-requeue` to re-send pending or stale retryable jobs, `sync attachment-retry` only for intentional terminal retries, and `sync attachment-repair` as the Agent-friendly bounded sweep that backfills, requeues, and syncs completed files into memory. `sync attachment-repair` defaults to `--asset-type all` for image, voice, video, emoji, and file jobs; narrow it with `--asset-type voice` only when you intentionally want a voice-only repair. Treat `sync attachment-repair` `after_queue_health` as the final repair outcome summary; if `completed_not_ingested_count` is greater than zero, run another bounded attachment repair before analyzing media.
 
 When `attachment-queue-health` returns `retryable_terminal_jobs`, explain that these are failed jobs that may be retried deliberately after checking `last_error_summary`. When it returns `non_retryable_terminal_jobs`, explain unavailable/purged media as upstream or queue-retention evidence rather than as normal missing sync. Do not loop on `unavailable`, `purged`, or `skipped_not_file` unless the user explicitly asks for another upstream retry.
 

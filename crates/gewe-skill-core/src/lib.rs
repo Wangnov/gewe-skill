@@ -1,5 +1,8 @@
 //! Core normalization and event parsing for GeWe callbacks.
 
+pub mod identity;
+pub mod mime;
+
 use gewe_skill_types::{
     ChatroomEventType, ChatroomMember, ChatroomMemberEvent, ChatroomSnapshot, ChatroomSystemEvent,
     IngestEventRequest, NormalizedKind, NormalizedMessage, RawEventEnvelope, SchemaVersion,
@@ -25,6 +28,25 @@ pub struct NormalizedCallback {
     pub message: NormalizedMessage,
     pub chatroom_snapshot: Option<ChatroomSnapshot>,
     pub chatroom_system_event: Option<ChatroomSystemEvent>,
+}
+
+/// 兼容历史 v2 私聊记录未填 `sender_wxid` 的情况；群 ID 不能充当说话人。
+#[must_use]
+pub fn message_sender_id(message: &NormalizedMessage) -> Option<&str> {
+    message
+        .sender_wxid
+        .as_deref()
+        .or_else(|| {
+            if message.is_outgoing {
+                message
+                    .account_wxid
+                    .as_deref()
+                    .or(message.from_user.as_deref())
+            } else {
+                message.from_user.as_deref()
+            }
+        })
+        .filter(|id| !id.trim().is_empty() && !id.ends_with("@chatroom"))
 }
 
 impl NormalizedCallback {
@@ -367,7 +389,8 @@ fn parse_v1_chatroom_snapshot(data: &Value, received_at: &str) -> Option<Chatroo
     })
 }
 
-fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSystemEvent> {
+#[must_use]
+pub fn parse_chatroom_system_event(message: &NormalizedMessage) -> Option<ChatroomSystemEvent> {
     if !matches!(message.kind, NormalizedKind::System) {
         return None;
     }
@@ -612,7 +635,8 @@ fn sha256_hex(text: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+#[must_use]
+pub fn extract_tag(xml: &str, tag: &str) -> Option<String> {
     let pattern = format!(r"(?is)<{tag}>(.*?)</{tag}>");
     let re = Regex::new(&pattern).ok()?;
     Some(

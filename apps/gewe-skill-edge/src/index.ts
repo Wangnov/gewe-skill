@@ -121,6 +121,10 @@ async function forwardRawEventToMemory(env, body, receivedAt) {
 }
 
 async function handleAdmin(request, env, url) {
+  if (url.pathname === "/admin/repair-attachment" && request.method === "POST") {
+    return repairMessageAttachment(env, url);
+  }
+
   if (url.pathname === "/admin/retry-downloads" && request.method === "POST") {
     return retryDownloadJobs(env, url);
   }
@@ -180,6 +184,7 @@ async function handleAdmin(request, env, url) {
   if (url.pathname === "/admin/download-jobs") {
     const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
     const afterJobId = clampInt(url.searchParams.get("after_job_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const messageKey = url.searchParams.get("message_key");
     const status = url.searchParams.get("status");
     const assetType = normalizeAssetType(url.searchParams.get("asset_type"));
     const params = [afterJobId];
@@ -192,6 +197,7 @@ async function handleAdmin(request, env, url) {
       where += " AND d.asset_type = ?";
       params.push(assetType);
     }
+    if (messageKey) { where += " AND m.message_key = ?"; params.push(messageKey); }
     const rows = await env.DB.prepare(`
       SELECT d.id AS job_id, d.job_key, m.message_key, d.message_id, d.raw_event_id,
              d.appid, d.account_wxid, d.asset_type, d.variant, d.endpoint, d.status,
@@ -259,6 +265,10 @@ async function handleAdmin(request, env, url) {
   if (url.pathname === "/admin/attachments") {
     const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
     const afterJobId = clampInt(url.searchParams.get("after_job_id"), 0, Number.MAX_SAFE_INTEGER, 0);
+    const messageKey = url.searchParams.get("message_key");
+    const params = [afterJobId];
+    let where = "d.id > ?";
+    if (messageKey) { where += " AND m.message_key = ?"; params.push(messageKey); }
     const rows = await env.DB.prepare(`
       SELECT d.id AS job_id, d.job_key, m.message_key, r.dedupe_key AS raw_event_dedupe_key,
              d.message_id, d.raw_event_id, d.appid, d.account_wxid, d.asset_type, d.variant,
@@ -267,12 +277,12 @@ async function handleAdmin(request, env, url) {
       FROM download_jobs d
       LEFT JOIN messages m ON m.id = d.message_id
       LEFT JOIN raw_events r ON r.id = d.raw_event_id
-      WHERE d.id > ?
+      WHERE ${where}
         AND d.status = 'completed'
         AND COALESCE(d.r2_object_key, d.local_path) IS NOT NULL
       ORDER BY d.id ASC
       LIMIT ?
-    `).bind(afterJobId, limit).all();
+    `).bind(...params, limit).all();
     const attachments = (rows.results || []).map((row) => ({
       job_id: row.job_id,
       job_key: row.job_key,
@@ -574,6 +584,50 @@ async function handleAdminBackfillDownloadJobs(env, url) {
     queued,
     skipped
   });
+}
+
+async function repairMessageAttachment(env, url) {
+  const messageKey = url.searchParams.get("message_key");
+  if (!messageKey?.trim()) return json({ ok: false, error: "missing_message_key" }, 400);
+  const row = await env.DB.prepare(`
+    SELECT m.id AS message_id, m.message_key, m.raw_event_id, m.appid, m.account_wxid,
+           m.type_name, m.msg_id, m.new_msg_id, m.msg_type, m.appmsg_type,
+           m.content_text, m.content_xml, m.schema_version
+    FROM messages m WHERE m.message_key = ? LIMIT 1
+  `).bind(messageKey).first();
+  if (!row) return json({ ok: false, error: "message_not_found", message_key: messageKey }, 404);
+  const existing = await env.DB.prepare(`SELECT * FROM download_jobs WHERE message_id = ? ORDER BY id`).bind(row.message_id).all();
+  const jobs = existing.results || [];
+  const queued = [];
+  const skipped = [];
+  if (!jobs.length) {
+    const job = buildDownloadJob(normalizedFromMessageRow(row), row.raw_event_id, row.message_id, env);
+    if (!job) return json({ ok: false, error: "message_not_downloadable", message_key: messageKey }, 422);
+    await enqueueDownloadJob(env, job);
+    queued.push(job.jobKey);
+  } else {
+    const now = new Date().toISOString();
+    for (const job of jobs) {
+      // Compare-and-swap respects active leases and never alters an unrelated message's job.
+      const reset = await env.DB.prepare(`
+        UPDATE download_jobs SET status = 'pending',
+          attempts = CASE WHEN status = 'failed' THEN 0 ELSE attempts END,
+          next_attempt_at = NULL, locked_until = NULL, claimed_at = NULL,
+          terminal_at = NULL, last_error = NULL, updated_at = ?
+        WHERE job_key = ? AND message_id = ? AND
+          (status IN ('pending', 'retry_scheduled', 'failed') OR
+           (status = 'processing' AND COALESCE(locked_until, '1970-01-01') <= ?))
+        RETURNING job_key
+      `).bind(now, job.job_key, row.message_id, now).first();
+      if (reset) {
+        await env.ATTACHMENT_QUEUE.send({ jobKey: job.job_key });
+        queued.push(job.job_key);
+      } else {
+        skipped.push({ job_key: job.job_key, status: job.status });
+      }
+    }
+  }
+  return json({ ok: true, message_key: messageKey, queued_count: queued.length, queued, skipped });
 }
 
 function normalizedFromMessageRow(row) {
@@ -1545,7 +1599,7 @@ async function processDownloadJob(body, env) {
 
     const responseSizeBytes = Number(fileResponse.headers.get("content-length") || headSizeBytes || 0);
     const objectKey = attachmentObjectKey(job.asset_type, jobKey, fileUrl, fileResponse.headers.get("content-type") || null);
-    const mimeType = normalizeDownloadedMime(job.asset_type, fileResponse.headers.get("content-type") || head?.headers.get("content-type") || null, objectKey);
+    let mimeType = normalizeDownloadedMime(job.asset_type, fileResponse.headers.get("content-type") || head?.headers.get("content-type") || null, objectKey);
     if (!responseSizeBytes) {
       await markDownloadJob(env, jobKey, "pending_unknown_size", "Remote file GET response has no content-length", { sourceUrl: fileUrl, mimeType, terminal: true });
       return;
@@ -1555,7 +1609,9 @@ async function processDownloadJob(body, env) {
       return;
     }
 
-    await env.RAW_BUCKET.put(objectKey, fileResponse.body, {
+    const inspected = await inspectAttachmentHeader(fileResponse.body);
+    mimeType = detectAttachmentMime(inspected.header) || mimeType;
+    await env.RAW_BUCKET.put(objectKey, inspected.body, {
       httpMetadata: { contentType: mimeType || undefined },
       customMetadata: compactMetadata({ appid: job.appid, wxid: job.account_wxid, job_key: jobKey, asset_type: job.asset_type })
     });
@@ -1938,6 +1994,52 @@ function extensionFromMime(mimeType) {
   return map[base] || null;
 }
 
+// Read only a prefix; replay every consumed chunk so large attachments remain streamed.
+async function inspectAttachmentHeader(body) {
+  const reader = body.getReader();
+  const chunks = [];
+  let length = 0;
+  let ended = false;
+  while (length < 64 && !ended) {
+    const next = await reader.read();
+    ended = next.done;
+    if (next.value) { chunks.push(next.value); length += next.value.length; }
+  }
+  const header = new Uint8Array(Math.min(length, 64));
+  let offset = 0;
+  for (const chunk of chunks) {
+    const prefix = chunk.subarray(0, header.length - offset);
+    header.set(prefix, offset); offset += prefix.length;
+    if (offset === header.length) break;
+  }
+  return { header, body: new ReadableStream({
+    start(controller) { for (const chunk of chunks) controller.enqueue(chunk); if (ended) controller.close(); },
+    async pull(controller) {
+      if (ended) return;
+      const next = await reader.read();
+      if (next.done) { ended = true; controller.close(); } else { controller.enqueue(next.value); }
+    },
+    cancel(reason) { return reader.cancel(reason); }
+  }) };
+}
+
+export function detectAttachmentMime(bytes) {
+  const starts = (signature, offset = 0) => bytes.length >= offset + signature.length &&
+    [...signature].every((byte, index) => bytes[offset + index] === byte);
+  const ascii = (text, offset = 0) => starts(new TextEncoder().encode(text), offset);
+  if (starts([255, 216, 255])) return "image/jpeg";
+  if (starts([137, 80, 78, 71, 13, 10, 26, 10])) return "image/png";
+  if (ascii("GIF87a") || ascii("GIF89a")) return "image/gif";
+  if (ascii("RIFF") && ascii("WEBP", 8)) return "image/webp";
+  if (ascii("ftyp", 4) && ["isom", "iso2", "iso3", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1", "dash", "M4V ", "MSNV"].some((brand) => ascii(brand, 8))) return "video/mp4";
+  if (ascii("#!SILK_V3") || starts([2, ...new TextEncoder().encode("#!SILK_V3")])) return "audio/silk";
+  if (ascii("#!AMR-WB\n")) return "audio/amr-wb";
+  if (ascii("#!AMR\n")) return "audio/amr";
+  if (ascii("%PDF-")) return "application/pdf";
+  if (starts([80, 75, 3, 4]) || starts([80, 75, 5, 6]) || starts([80, 75, 7, 8])) return "application/zip";
+  return null;
+}
+
 function normalizeDownloadedMime(assetType, mimeType, objectKeyOrUrl) {
   const base = mimeType ? mimeType.split(";")[0].trim().toLowerCase() : "";
   if (assetType === "voice" && /\.silk(?:$|\?)/i.test(objectKeyOrUrl || "")) {
@@ -1946,7 +2048,7 @@ function normalizeDownloadedMime(assetType, mimeType, objectKeyOrUrl) {
   if (assetType === "voice" && ["application/xml", "application/octst-stream", "application/octet-stream", ""].includes(base)) {
     return "audio/silk";
   }
-  return mimeType || null;
+  return base === "application/octst-stream" ? "application/octet-stream" : (mimeType || null);
 }
 
 async function sha256Hex(text) {
