@@ -1611,10 +1611,14 @@ async function processDownloadJob(body, env) {
 
     const inspected = await inspectAttachmentHeader(fileResponse.body);
     mimeType = detectAttachmentMime(inspected.header) || mimeType;
-    await env.RAW_BUCKET.put(objectKey, inspected.body, {
-      httpMetadata: { contentType: mimeType || undefined },
-      customMetadata: compactMetadata({ appid: job.appid, wxid: job.account_wxid, job_key: jobKey, asset_type: job.asset_type })
-    });
+    const stored = fixedLengthBody(inspected.body, responseSizeBytes);
+    await Promise.all([
+      env.RAW_BUCKET.put(objectKey, stored.body, {
+        httpMetadata: { contentType: mimeType || undefined },
+        customMetadata: compactMetadata({ appid: job.appid, wxid: job.account_wxid, job_key: jobKey, asset_type: job.asset_type })
+      }),
+      stored.done
+    ]);
 
     await env.DB.prepare(`
       UPDATE download_jobs
@@ -1992,6 +1996,12 @@ function extensionFromMime(mimeType) {
     "application/pdf": ".pdf"
   };
   return map[base] || null;
+}
+
+// R2 only accepts streams of known length; the replayed stream has none, so pin it to content-length.
+function fixedLengthBody(body, length) {
+  const { readable, writable } = new FixedLengthStream(length);
+  return { body: readable, done: body.pipeTo(writable) };
 }
 
 // Read only a prefix; replay every consumed chunk so large attachments remain streamed.

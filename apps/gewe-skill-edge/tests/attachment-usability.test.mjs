@@ -4,6 +4,23 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import worker, { detectAttachmentMime } from "../src/index.ts";
 
+// 模拟 Workers 运行时：FixedLengthStream 产出长度已知的流，R2 拒收长度未知的流。
+const knownLengthStreams = new WeakSet();
+globalThis.FixedLengthStream ??= class FixedLengthStream extends TransformStream {
+  constructor(length) {
+    let seen = 0;
+    super({
+      transform(chunk, controller) {
+        seen += chunk.byteLength;
+        if (seen > length) throw new TypeError("FixedLengthStream received more bytes than declared");
+        controller.enqueue(chunk);
+      },
+      flush() { if (seen !== length) throw new TypeError("FixedLengthStream received fewer bytes than declared"); }
+    });
+    knownLengthStreams.add(this.readable);
+  }
+};
+
 // 使用真实 SQLite 执行 D1 SQL；所有身份、token 和附件均为测试数据。
 function fixture() {
   const db = new DatabaseSync(":memory:");
@@ -28,7 +45,12 @@ function fixture() {
       }
     },
     ATTACHMENT_QUEUE: { async send(value) { sent.push(value); } },
-    RAW_BUCKET: { async put(key, body, options) { objects.set(key, { bytes: new Uint8Array(await new Response(body).arrayBuffer()), options }); } }
+    RAW_BUCKET: { async put(key, body, options) {
+      if (body instanceof ReadableStream && !knownLengthStreams.has(body)) {
+        throw new TypeError("Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)");
+      }
+      objects.set(key, { bytes: new Uint8Array(await new Response(body).arrayBuffer()), options });
+    } }
   };
   const ctx = { waitUntil(promise) { pending.push(Promise.resolve(promise)); } };
   return { db, env, ctx, sent, objects, pending };
