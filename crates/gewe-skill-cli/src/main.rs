@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -623,6 +624,18 @@ enum SyncCommand {
             default_value = "/opt/gewe-skill-memory/data/edge-attachment-sync.cursor"
         )]
         cursor_file: PathBuf,
+        /// Page by completion time instead of job id, so old jobs that are downloaded again get picked up when they complete.
+        #[arg(long)]
+        by_completed: bool,
+        /// Start of the completion-time window (RFC 3339); defaults to the completed cursor file, else 7 days ago.
+        #[arg(long)]
+        completed_after: Option<String>,
+        #[arg(
+            long,
+            env = "GEWE_SKILL_ATTACHMENT_COMPLETED_CURSOR_FILE",
+            default_value = "/opt/gewe-skill-memory/data/edge-attachment-sync.completed.cursor"
+        )]
+        completed_cursor_file: PathBuf,
         #[arg(
             long,
             env = "GEWE_SKILL_ATTACHMENT_DIR",
@@ -1006,6 +1019,8 @@ struct EdgeChatroomSystemEvent {
 struct EdgeAttachmentResponse {
     attachments: Vec<EdgeAttachment>,
     next_after_job_id: i64,
+    #[serde(default)]
+    next_completed_after: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1350,18 +1365,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 after_job_id,
                 limit,
                 cursor_file,
+                by_completed,
+                completed_after,
+                completed_cursor_file,
                 attachment_dir,
             } => {
-                let result = sync_edge_attachments(
-                    &client,
-                    &edge_url,
-                    &admin_token,
-                    after_job_id,
-                    limit,
-                    cursor_file,
-                    attachment_dir,
-                )
-                .await?;
+                let result = if by_completed {
+                    sync_edge_attachments_by_completed(
+                        &client,
+                        &edge_url,
+                        &admin_token,
+                        completed_after,
+                        limit,
+                        completed_cursor_file,
+                        attachment_dir,
+                    )
+                    .await?
+                } else {
+                    sync_edge_attachments(
+                        &client,
+                        &edge_url,
+                        &admin_token,
+                        after_job_id,
+                        limit,
+                        cursor_file,
+                        attachment_dir,
+                    )
+                    .await?
+                };
                 print_json(result)?;
             }
             SyncCommand::AttachmentQueue {
@@ -3913,40 +3944,42 @@ async fn sync_edge_attachments(
         .json()
         .await?;
 
-    let mut written = 0usize;
-    let mut failed = Vec::new();
-    let mut item_results = Vec::new();
-    let mut last_job_id = after_job_id;
-    for item in &manifest.attachments {
-        last_job_id = item.job_id;
-        match sync_one_attachment(client, &http, edge_url, admin_token, item, &attachment_dir).await
-        {
-            Ok(_) => {
-                written += 1;
-                item_results.push((item.job_id, true));
-            }
-            Err(error) => {
-                item_results.push((item.job_id, false));
-                failed.push(serde_json::json!({
-                    "job_id": item.job_id,
-                    "error": error.to_string()
-                }));
-            }
-        }
-    }
+    let stored_cursor = read_cursor(&cursor_file).unwrap_or(0);
+    let batch = sync_attachment_batch(
+        client,
+        &http,
+        edge_url,
+        admin_token,
+        &manifest.attachments,
+        &attachment_dir,
+    )
+    .await;
+    let last_job_id = manifest
+        .attachments
+        .last()
+        .map_or(after_job_id, |item| item.job_id);
+    let item_results: Vec<(i64, bool)> = batch
+        .iter()
+        .map(|item| (item.job_id, item.outcome.keeps_cursor_moving()))
+        .collect();
+    // The overlap re-reads jobs below the stored cursor; a failure there must not drag the cursor backwards.
     let cursor_written =
-        attachment_sync_cursor_after_batch(after_job_id, manifest.next_after_job_id, &item_results);
+        attachment_sync_cursor_after_batch(after_job_id, manifest.next_after_job_id, &item_results)
+            .max(stored_cursor);
     write_cursor(&cursor_file, cursor_written)?;
     let cursor_blocked_by_failed_job_id = item_results
         .iter()
         .find_map(|(job_id, ok)| (!ok).then_some(*job_id));
 
+    let summary = attachment_batch_summary(&batch);
     Ok(serde_json::json!({
         "ok": true,
         "scanned": manifest.attachments.len(),
-        "written": written,
-        "failed": failed,
-        "failed_count": failed.len(),
+        "written": summary.written,
+        "skipped_existing": summary.skipped,
+        "missing_on_edge": summary.missing,
+        "failed": summary.failed,
+        "failed_count": summary.failed.len(),
         "after_job_id": after_job_id,
         "last_job_id": last_job_id,
         "next_after_job_id": manifest.next_after_job_id,
@@ -3955,6 +3988,209 @@ async fn sync_edge_attachments(
         "cursor_overlap": cursor_overlap,
         "configured_cursor_overlap": configured_cursor_overlap
     }))
+}
+
+async fn sync_edge_attachments_by_completed(
+    client: &GeweSkillClient,
+    edge_url: &str,
+    admin_token: &str,
+    completed_after: Option<String>,
+    limit: u32,
+    cursor_file: PathBuf,
+    attachment_dir: PathBuf,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let after = match completed_after {
+        Some(at) => (at, 0),
+        None => read_completed_cursor(&cursor_file).unwrap_or_else(|| {
+            let start = chrono::Utc::now() - chrono::Duration::days(7);
+            (
+                start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                0,
+            )
+        }),
+    };
+    let edge_url = edge_url.trim_end_matches('/');
+    let http = reqwest::Client::new();
+    let manifest: EdgeAttachmentResponse = http
+        .get(format!("{edge_url}/admin/attachments"))
+        .query(&[
+            ("completed_after", after.0.clone()),
+            ("after_job_id", after.1.to_string()),
+            ("limit", limit.to_string()),
+        ])
+        .bearer_auth(admin_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let batch = sync_attachment_batch(
+        client,
+        &http,
+        edge_url,
+        admin_token,
+        &manifest.attachments,
+        &attachment_dir,
+    )
+    .await;
+    let next = manifest
+        .next_completed_after
+        .clone()
+        .map(|at| (at, manifest.next_after_job_id));
+    let cursor_written = completed_cursor_after_batch(&after, next, &batch);
+    write_completed_cursor(&cursor_file, &cursor_written)?;
+    let summary = attachment_batch_summary(&batch);
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "mode": "completed_at",
+        "scanned": manifest.attachments.len(),
+        "written": summary.written,
+        "skipped_existing": summary.skipped,
+        "missing_on_edge": summary.missing,
+        "failed": summary.failed,
+        "failed_count": summary.failed.len(),
+        "completed_after": after.0,
+        "after_job_id": after.1,
+        "cursor_written": format_completed_cursor(&cursor_written)
+    }))
+}
+
+#[derive(Debug, PartialEq)]
+enum AttachmentSyncOutcome {
+    Written,
+    SkippedExisting,
+    MissingOnEdge,
+    Failed(String),
+}
+
+impl AttachmentSyncOutcome {
+    /// Only a retryable failure holds the cursor; an attachment the edge no longer has never comes back.
+    fn keeps_cursor_moving(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+}
+
+struct AttachmentBatchItem {
+    job_id: i64,
+    completed_at: Option<String>,
+    outcome: AttachmentSyncOutcome,
+}
+
+struct AttachmentBatchSummary {
+    written: usize,
+    skipped: usize,
+    missing: usize,
+    failed: Vec<Value>,
+}
+
+async fn sync_attachment_batch(
+    client: &GeweSkillClient,
+    http: &reqwest::Client,
+    edge_url: &str,
+    admin_token: &str,
+    items: &[EdgeAttachment],
+    attachment_dir: &Path,
+) -> Vec<AttachmentBatchItem> {
+    // Skip jobs memory already holds, so re-reading a window does not download every file again.
+    let job_keys: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.job_key.clone())
+        .collect();
+    let existing: HashSet<i64> = if job_keys.is_empty() {
+        HashSet::new()
+    } else {
+        client
+            .attachments_by_job_keys(&job_keys)
+            .await
+            .map(|page| {
+                page.items
+                    .iter()
+                    .filter_map(|record| record.edge_job_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let outcome = if existing.contains(&item.job_id) {
+            AttachmentSyncOutcome::SkippedExisting
+        } else {
+            match sync_one_attachment(client, http, edge_url, admin_token, item, attachment_dir)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => AttachmentSyncOutcome::Failed(error.to_string()),
+            }
+        };
+        results.push(AttachmentBatchItem {
+            job_id: item.job_id,
+            completed_at: item.completed_at.clone(),
+            outcome,
+        });
+    }
+    results
+}
+
+fn attachment_batch_summary(batch: &[AttachmentBatchItem]) -> AttachmentBatchSummary {
+    let mut summary = AttachmentBatchSummary {
+        written: 0,
+        skipped: 0,
+        missing: 0,
+        failed: Vec::new(),
+    };
+    for item in batch {
+        match &item.outcome {
+            AttachmentSyncOutcome::Written => summary.written += 1,
+            AttachmentSyncOutcome::SkippedExisting => summary.skipped += 1,
+            AttachmentSyncOutcome::MissingOnEdge => summary.missing += 1,
+            AttachmentSyncOutcome::Failed(error) => summary
+                .failed
+                .push(serde_json::json!({ "job_id": item.job_id, "error": error })),
+        }
+    }
+    summary
+}
+
+fn completed_cursor_after_batch(
+    after: &(String, i64),
+    manifest_next: Option<(String, i64)>,
+    batch: &[AttachmentBatchItem],
+) -> (String, i64) {
+    let mut cursor = after.clone();
+    for item in batch {
+        if !item.outcome.keeps_cursor_moving() {
+            return cursor;
+        }
+        if let Some(at) = &item.completed_at {
+            cursor = (at.clone(), item.job_id);
+        }
+    }
+    manifest_next.unwrap_or(cursor)
+}
+
+fn format_completed_cursor(cursor: &(String, i64)) -> String {
+    format!("{}|{}", cursor.0, cursor.1)
+}
+
+fn parse_completed_cursor(text: &str) -> Option<(String, i64)> {
+    let (at, id) = text.trim().rsplit_once('|')?;
+    if at.is_empty() {
+        return None;
+    }
+    Some((at.to_string(), id.parse().ok()?))
+}
+
+fn read_completed_cursor(path: &PathBuf) -> Option<(String, i64)> {
+    parse_completed_cursor(&fs::read_to_string(path).ok()?)
+}
+
+fn write_completed_cursor(path: &PathBuf, cursor: &(String, i64)) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{}\n", format_completed_cursor(cursor)))
 }
 
 fn attachment_sync_cursor_after_batch(
@@ -4253,14 +4489,17 @@ async fn sync_one_attachment(
     admin_token: &str,
     item: &EdgeAttachment,
     attachment_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<AttachmentSyncOutcome, Box<dyn std::error::Error>> {
     let download_url = format!("{edge_url}{}", item.download_path);
     let response = http
         .get(download_url)
         .bearer_auth(admin_token)
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(AttachmentSyncOutcome::MissingOnEdge);
+    }
+    let response = response.error_for_status()?;
     let bytes = response.bytes().await?;
     let sha256 = hex::encode(Sha256::digest(&bytes));
     let object_key = format!("sha256/{}/{}", &sha256[..2], sha256);
@@ -4307,7 +4546,7 @@ async fn sync_one_attachment(
             .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string()),
     };
     client.write_attachment(&record).await?;
-    Ok(())
+    Ok(AttachmentSyncOutcome::Written)
 }
 
 fn parse_attachment_kind(value: &str) -> AttachmentKind {
@@ -4490,6 +4729,82 @@ mod tests {
     fn attachment_cursor_does_not_advance_when_first_item_fails() {
         let cursor = attachment_sync_cursor_after_batch(100, 250, &[(120, false), (140, true)]);
         assert_eq!(cursor, 100);
+    }
+
+    #[test]
+    fn attachment_id_cursor_never_moves_below_stored_cursor() {
+        // Stored cursor 140, overlap re-read starts at 115, and the very first item fails.
+        let cursor =
+            attachment_sync_cursor_after_batch(115, 250, &[(120, false), (160, true)]).max(140);
+        assert_eq!(cursor, 140);
+    }
+
+    fn batch_item(job_id: i64, at: &str, outcome: AttachmentSyncOutcome) -> AttachmentBatchItem {
+        AttachmentBatchItem {
+            job_id,
+            completed_at: Some(at.to_string()),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn completed_cursor_passes_attachments_missing_on_edge() {
+        let after = ("2026-10-23T00:00:00.000Z".to_string(), 0);
+        let batch = [
+            batch_item(
+                9,
+                "2026-10-23T01:00:00.000Z",
+                AttachmentSyncOutcome::MissingOnEdge,
+            ),
+            batch_item(
+                5,
+                "2026-10-23T02:00:00.000Z",
+                AttachmentSyncOutcome::SkippedExisting,
+            ),
+        ];
+        let next = ("2026-10-23T02:00:00.000Z".to_string(), 5);
+        assert_eq!(
+            completed_cursor_after_batch(&after, Some(next.clone()), &batch),
+            next
+        );
+    }
+
+    #[test]
+    fn completed_cursor_stops_before_retryable_failure() {
+        let after = ("2026-10-23T00:00:00.000Z".to_string(), 0);
+        let batch = [
+            batch_item(
+                9,
+                "2026-10-23T01:00:00.000Z",
+                AttachmentSyncOutcome::Written,
+            ),
+            batch_item(
+                5,
+                "2026-10-23T02:00:00.000Z",
+                AttachmentSyncOutcome::Failed("502".into()),
+            ),
+            batch_item(
+                7,
+                "2026-10-23T03:00:00.000Z",
+                AttachmentSyncOutcome::Written,
+            ),
+        ];
+        let next = Some(("2026-10-23T03:00:00.000Z".to_string(), 7));
+        assert_eq!(
+            completed_cursor_after_batch(&after, next, &batch),
+            ("2026-10-23T01:00:00.000Z".to_string(), 9)
+        );
+    }
+
+    #[test]
+    fn completed_cursor_round_trips_through_text() {
+        let cursor = ("2026-10-24T05:12:00.000Z".to_string(), 134_781);
+        assert_eq!(
+            parse_completed_cursor(&format_completed_cursor(&cursor)),
+            Some(cursor)
+        );
+        assert_eq!(parse_completed_cursor("not-a-cursor"), None);
+        assert_eq!(parse_completed_cursor("|12"), None);
     }
 
     #[test]

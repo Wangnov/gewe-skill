@@ -24,7 +24,7 @@ globalThis.FixedLengthStream ??= class FixedLengthStream extends TransformStream
 // 使用真实 SQLite 执行 D1 SQL；所有身份、token 和附件均为测试数据。
 function fixture() {
   const db = new DatabaseSync(":memory:");
-  for (const migration of ["0001_initial.sql", "0002_download_job_queue_state.sql"]) {
+  for (const migration of ["0001_initial.sql", "0002_download_job_queue_state.sql", "0003_download_jobs_completed_index.sql"]) {
     db.exec(readFileSync(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
   }
   const sent = [];
@@ -207,5 +207,26 @@ test("暂停的积压只在北京时间凌晨分批放行，最老的先放，�
     await tick("2026-10-23T16:30:00Z"); // 当天已超限，停止放行
     assert.equal(status(rows[2]).status, "paused");
     assert.equal(status(rows[3]).status, "paused");
+  } finally { f.db.close(); }
+});
+
+test("附件清单按完成时间翻页：编号老但刚完成的任务排在后面，翻页不漏不重", async () => {
+  const f = fixture();
+  try {
+    const old = await message(f, "701");
+    const recent = await message(f, "702");
+    f.db.prepare("UPDATE download_jobs SET status='completed', r2_object_key='obj-old', completed_at='2026-10-24T01:00:00.000Z' WHERE message_id = ?").run(old.id);
+    f.db.prepare("UPDATE download_jobs SET status='completed', r2_object_key='obj-recent', completed_at='2026-10-23T12:00:00.000Z' WHERE message_id = ?").run(recent.id);
+    const page = async (after, id) => (await admin(f, `/admin/attachments?completed_after=${encodeURIComponent(after)}&after_job_id=${id}&limit=1`)).json();
+    const first = await page("2026-10-23T00:00:00.000Z", 0);
+    assert.equal(first.attachments[0].message_key, recent.message_key);
+    const second = await page(first.next_completed_after, first.next_after_job_id);
+    assert.equal(second.attachments[0].message_key, old.message_key);
+    const third = await page(second.next_completed_after, second.next_after_job_id);
+    assert.equal(third.attachments.length, 0);
+    assert.equal(third.next_completed_after, second.next_completed_after);
+    const byId = await (await admin(f, "/admin/attachments?after_job_id=0&limit=5")).json();
+    assert.equal(byId.next_completed_after, undefined);
+    assert.equal(byId.attachments[0].message_key, old.message_key);
   } finally { f.db.close(); }
 });

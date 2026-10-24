@@ -266,9 +266,12 @@ async function handleAdmin(request, env, url) {
     const limit = clampInt(url.searchParams.get("limit"), 1, 500, 100);
     const afterJobId = clampInt(url.searchParams.get("after_job_id"), 0, Number.MAX_SAFE_INTEGER, 0);
     const messageKey = url.searchParams.get("message_key");
-    const params = [afterJobId];
-    let where = "d.id > ?";
+    // completed_after pages by completion time, so a re-downloaded old job is listed again when it completes.
+    const completedAfter = url.searchParams.get("completed_after");
+    const params = completedAfter ? [completedAfter, completedAfter, afterJobId] : [afterJobId];
+    let where = completedAfter ? "(d.completed_at > ? OR (d.completed_at = ? AND d.id > ?))" : "d.id > ?";
     if (messageKey) { where += " AND m.message_key = ?"; params.push(messageKey); }
+    const order = completedAfter ? "d.completed_at ASC, d.id ASC" : "d.id ASC";
     const rows = await env.DB.prepare(`
       SELECT d.id AS job_id, d.job_key, m.message_key, r.dedupe_key AS raw_event_dedupe_key,
              d.message_id, d.raw_event_id, d.appid, d.account_wxid, d.asset_type, d.variant,
@@ -280,7 +283,7 @@ async function handleAdmin(request, env, url) {
       WHERE ${where}
         AND d.status = 'completed'
         AND COALESCE(d.r2_object_key, d.local_path) IS NOT NULL
-      ORDER BY d.id ASC
+      ORDER BY ${order}
       LIMIT ?
     `).bind(...params, limit).all();
     const attachments = (rows.results || []).map((row) => ({
@@ -302,10 +305,12 @@ async function handleAdmin(request, env, url) {
       updated_at: row.updated_at,
       download_path: `/admin/attachment?job_id=${encodeURIComponent(row.job_id)}`
     }));
+    const last = attachments[attachments.length - 1];
     return json({
       ok: true,
       attachments,
-      next_after_job_id: attachments.length ? attachments[attachments.length - 1].job_id : afterJobId
+      next_after_job_id: last ? last.job_id : afterJobId,
+      ...(completedAfter ? { next_completed_after: last ? last.completed_at : completedAfter } : {})
     });
   }
 
