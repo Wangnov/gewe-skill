@@ -13,6 +13,9 @@ bin_dir="${GEWE_DEPLOY_REMOTE_BIN_DIR:-/opt/gewe-skill-memory/bin}"
 env_file="${GEWE_REMOTE_ENV:-/opt/gewe-skill-memory/config/gewe-skill-memory.env}"
 service="gewe-skill-memory.service"
 health_url="${GEWE_DEPLOY_HEALTH_URL:-http://127.0.0.1:8788/healthz}"
+# The memory service runs a ~50 s full scan before it listens, so give the probe two minutes by default.
+health_attempts="${GEWE_DEPLOY_HEALTH_ATTEMPTS:-120}"
+[[ "$health_attempts" =~ ^[1-9][0-9]*$ ]] || { printf 'GEWE_DEPLOY_HEALTH_ATTEMPTS 必须是正整数。\n' >&2; exit 2; }
 build_target_dir="${CARGO_TARGET_DIR:-$repo_dir/target}"
 [[ "$build_target_dir" == /* ]] || build_target_dir="$repo_dir/$build_target_dir"
 artifact_dir="${GEWE_DEPLOY_ARTIFACT_DIR:-$build_target_dir/aarch64-unknown-linux-gnu/release}"
@@ -113,7 +116,7 @@ stage="$(ssh -T "${transport[@]}" "$target" 'mktemp -d /tmp/gewe-deploy-20261015
 scp "${transport[@]}" "$artifact_dir/gewe-skill" "$artifact_dir/gewe-skill-memory" "$scratch/checksums.sha256" "$target:$stage/"
 
 remote="sudo -n bash -s --"
-for value in "$stage" "$bin_dir" "$env_file" "$service" "$health_url"; do quote "$value"; remote+=" $REPLY"; done
+for value in "$stage" "$bin_dir" "$env_file" "$service" "$health_url" "$health_attempts"; do quote "$value"; remote+=" $REPLY"; done
 ssh -T "${transport[@]}" "$target" "$remote" <<'REMOTE'
 set -Eeuo pipefail
 stage="$1"
@@ -121,6 +124,7 @@ bin_dir="$2"
 env_file="$3"
 service="$4"
 health_url="$5"
+health_attempts="$6"
 [[ "$(uname -m)" == aarch64 ]] || { printf '远端架构不是 aarch64。\n' >&2; exit 2; }
 for tool in install cp mv sha256sum systemctl curl timeout; do command -v "$tool" >/dev/null; done
 [[ -r "$env_file" && -x "$bin_dir/gewe-skill" && -x "$bin_dir/gewe-skill-memory" ]]
@@ -137,8 +141,8 @@ new_memory="$bin_dir/.gewe-skill-memory-$stamp"
 mutated=0
 
 probe() {
-  for attempt in {1..20}; do
-    if systemctl is-active --quiet "$service" && curl --max-time 3 -fsS "$health_url" >/dev/null; then
+  for ((attempt = 1; attempt <= health_attempts; attempt++)); do
+    if systemctl is-active --quiet "$service" && curl --max-time 3 -fs "$health_url" >/dev/null; then
       (
         set -a
         . "$env_file"
