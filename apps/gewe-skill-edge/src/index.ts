@@ -611,11 +611,11 @@ async function repairMessageAttachment(env, url) {
       // Compare-and-swap respects active leases and never alters an unrelated message's job.
       const reset = await env.DB.prepare(`
         UPDATE download_jobs SET status = 'pending',
-          attempts = CASE WHEN status = 'failed' THEN 0 ELSE attempts END,
+          attempts = CASE WHEN status IN ('failed', 'paused') THEN 0 ELSE attempts END,
           next_attempt_at = NULL, locked_until = NULL, claimed_at = NULL,
           terminal_at = NULL, last_error = NULL, updated_at = ?
         WHERE job_key = ? AND message_id = ? AND
-          (status IN ('pending', 'retry_scheduled', 'failed') OR
+          (status IN ('pending', 'retry_scheduled', 'failed', 'paused') OR
            (status = 'processing' AND COALESCE(locked_until, '1970-01-01') <= ?))
         RETURNING job_key
       `).bind(now, job.job_key, row.message_id, now).first();
@@ -1662,6 +1662,13 @@ async function finishDownloadFailure(env, job, error) {
   const attempts = Number(job.attempts || 0);
   const maxAttempts = clampInt(env.DOWNLOAD_MAX_ATTEMPTS, 1, 50, 6);
 
+  if (isDailyQuotaError(message)) {
+    // The GeWe account's daily download quota is used up; wait for the Beijing-midnight reset and give back this attempt.
+    await env.DB.prepare(`UPDATE download_jobs SET attempts = MAX(attempts - 1, 0) WHERE job_key = ?`).bind(job.job_key).run();
+    await markDownloadJob(env, job.job_key, "retry_scheduled", message, { nextAttemptAt: quotaRetryAt(env, new Date()).toISOString() });
+    return;
+  }
+
   if (disposition.terminal) {
     await markDownloadJob(env, job.job_key, disposition.status, message, { terminal: true });
     return;
@@ -1677,8 +1684,25 @@ async function finishDownloadFailure(env, job, error) {
   await markDownloadJob(env, job.job_key, "retry_scheduled", message, { nextAttemptAt });
 }
 
+function isDailyQuotaError(message) {
+  return /当天上传下载次数超限/.test(String(message || ""));
+}
+
+// Beijing is UTC+8 with no daylight saving, so the quota resets at 16:00 UTC.
+function nextBeijingMidnight(now) {
+  const offsetMs = 8 * 3600 * 1000;
+  const local = new Date(now.getTime() + offsetMs);
+  return new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate() + 1) - offsetMs);
+}
+
+function quotaRetryAt(env, now) {
+  const spreadMinutes = clampInt(env.QUOTA_RETRY_SPREAD_MINUTES, 0, 240, 25);
+  return addSeconds(nextBeijingMidnight(now), 300 + Math.floor(Math.random() * spreadMinutes * 60));
+}
+
 function isTerminalDownloadStatus(status) {
   return [
+    "paused",
     "completed",
     "pending_large",
     "pending_unknown_size",
@@ -1758,9 +1782,45 @@ async function markDownloadJob(env, jobKey, status, error, extra = {}) {
 
 async function scheduledMaintenance(env, cron) {
   await requeueDueDownloadJobs(env);
+  await releasePausedDownloadJobs(env, new Date());
   if (cron === "37 18 * * *") {
     await cleanup(env);
   }
+}
+
+// Paused backlog is released a little at a time between Beijing 00:00 and the end hour, oldest first,
+// and only while today's quota is untouched, so daytime messages keep their share of the daily quota.
+async function releasePausedDownloadJobs(env, now) {
+  const perRun = clampInt(env.PAUSED_RELEASE_PER_RUN, 0, 200, 20);
+  const endHour = clampInt(env.PAUSED_RELEASE_END_HOUR, 0, 24, 6);
+  const beijingHour = (now.getUTCHours() + 8) % 24;
+  if (!perRun || beijingHour >= endHour) return { released_count: 0, reason: "outside_window" };
+
+  const quotaHit = await env.DB.prepare(`
+    SELECT 1 AS hit FROM download_jobs WHERE status = 'retry_scheduled' AND next_attempt_at >= ? LIMIT 1
+  `).bind(nextBeijingMidnight(now).toISOString()).first();
+  if (quotaHit) return { released_count: 0, reason: "quota_hit_today" };
+
+  const held = String(env.PAUSED_HOLD_ASSET_TYPES ?? "emoji").split(",").map((v) => v.trim()).filter(Boolean);
+  const holdSql = held.length ? ` AND asset_type NOT IN (${held.map(() => "?").join(", ")})` : "";
+  const rows = await env.DB.prepare(`
+    SELECT job_key FROM download_jobs WHERE status = 'paused'${holdSql} ORDER BY created_at ASC LIMIT ?
+  `).bind(...held, perRun).all();
+
+  const nowIso = now.toISOString();
+  let released = 0;
+  for (const row of rows.results || []) {
+    const reset = await env.DB.prepare(`
+      UPDATE download_jobs SET status = 'pending', attempts = 0, last_error = NULL, next_attempt_at = NULL,
+        locked_until = NULL, claimed_at = NULL, terminal_at = NULL, updated_at = ?
+      WHERE job_key = ? AND status = 'paused'
+      RETURNING job_key
+    `).bind(nowIso, row.job_key).first();
+    if (!reset) continue;
+    await env.ATTACHMENT_QUEUE.send({ jobKey: row.job_key });
+    released += 1;
+  }
+  return { released_count: released };
 }
 
 async function requeueDueDownloadJobs(env) {

@@ -161,3 +161,51 @@ test("queue 按魔数覆盖错误 MIME，分块读取后存入 R2 的字节完�
     assert.equal(f.objects.get(job.r2_object_key).options.httpMetadata.contentType, "image/jpeg");
   } finally { f.db.close(); }
 });
+
+test("当天下载次数超限：排到北京时间零点后重试，不扣重试次数", async (t) => {
+  const f = fixture();
+  try {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-23T11:00:00Z") }); // 北京时间 19:00
+    const first = await message(f, "501");
+    t.mock.method(globalThis, "fetch", async () => Response.json({ ret: 500, msg: "com.gewe.common.exception.base.BaseException: test-app 当天上传下载次数超限！" }));
+    await worker.queue({ messages: [{ body: { jobKey: `${first.message_key}:image` }, ack() {}, retry() {} }] }, f.env);
+    const job = f.db.prepare("SELECT * FROM download_jobs WHERE message_id = ?").get(first.id);
+    assert.equal(job.status, "retry_scheduled");
+    assert.equal(job.attempts, 0);
+    assert.ok(job.next_attempt_at >= "2026-10-23T16:05:00.000Z" && job.next_attempt_at <= "2026-10-23T16:30:00.000Z", job.next_attempt_at);
+    await worker.queue({ messages: [{ body: { jobKey: `${first.message_key}:image` }, ack() {}, retry() {} }] }, f.env);
+    assert.equal(f.db.prepare("SELECT attempts FROM download_jobs WHERE message_id = ?").get(first.id).attempts, 0);
+  } finally { f.db.close(); }
+});
+
+test("暂停的积压只在北京时间凌晨分批放行，最老的先放，表情不放，当天超限就停", async (t) => {
+  const f = fixture();
+  try {
+    f.env.PAUSED_RELEASE_PER_RUN = "2";
+    const rows = [];
+    for (const [id, created] of [["601", "2026-10-15T01:00:00Z"], ["602", "2026-10-16T01:00:00Z"], ["603", "2026-10-17T01:00:00Z"], ["604", "2026-10-14T20:00:00Z"]]) {
+      const m = await message(f, id);
+      f.db.prepare("UPDATE download_jobs SET status = 'paused', attempts = 6, created_at = ? WHERE message_id = ?").run(created, m.id);
+      rows.push(m);
+    }
+    f.db.prepare("UPDATE download_jobs SET asset_type = 'emoji' WHERE message_id = ?").run(rows[3].id);
+    const status = (m) => f.db.prepare("SELECT status, attempts FROM download_jobs WHERE message_id = ?").get(m.id);
+    const tick = async (iso) => {
+      t.mock.timers.reset(); t.mock.timers.enable({ apis: ["Date"], now: Date.parse(iso) });
+      await worker.scheduled({ cron: "*/10 * * * *" }, f.env, f.ctx); await Promise.all(f.pending);
+    };
+
+    await tick("2026-10-23T08:00:00Z"); // 北京时间 16:00，不放行
+    assert.deepEqual(rows.map((m) => status(m).status), ["paused", "paused", "paused", "paused"]);
+
+    await tick("2026-10-23T16:20:00Z"); // 北京时间 00:20，放行最老的两个非表情任务
+    assert.deepEqual(rows.map((m) => status(m).status), ["pending", "pending", "paused", "paused"]);
+    assert.equal(status(rows[0]).attempts, 0);
+
+    const deferred = await message(f, "605");
+    f.db.prepare("UPDATE download_jobs SET status = 'retry_scheduled', next_attempt_at = '2026-10-24T16:10:00Z' WHERE message_id = ?").run(deferred.id);
+    await tick("2026-10-23T16:30:00Z"); // 当天已超限，停止放行
+    assert.equal(status(rows[2]).status, "paused");
+    assert.equal(status(rows[3]).status, "paused");
+  } finally { f.db.close(); }
+});
